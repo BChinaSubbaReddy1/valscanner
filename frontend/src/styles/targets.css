@@ -1,0 +1,7 @@
+/* Target management interface specific styling */
+.meta-list dd.target-url {
+  font-family: var(--font-family-mono);
+  font-size: 0.82rem;
+  color: var(--color-info-text);
+  word-break: break-all;
+}

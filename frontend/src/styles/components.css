@@ -1,0 +1,511 @@
+/* Reusable UI Components based on scanner designs in frontend_CP and claude */
+
+/* Typography & Eyebrow */
+.eyebrow {
+  margin: 0 0 8px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 11px;
+  font-weight: 700;
+  display: inline-block;
+}
+
+.muted, .muted-copy {
+  color: var(--text-soft);
+  font-size: 0.92rem;
+  line-height: 1.5;
+}
+
+/* Brand Mark / Logo */
+.brand-mark {
+  width: 48px;
+  height: 48px;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  margin: 0 auto 18px;
+  background: #ffffff;
+  font-size: 22px;
+  font-weight: 800;
+  color: var(--primary);
+  box-shadow: 0 0 15px rgba(0, 229, 163, 0.15);
+}
+
+.brand-mark--small {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  font-size: 17px;
+  margin: 0;
+}
+
+/* Buttons - Support both .primary-button/.secondary-button and .btn variants */
+.btn,
+.primary-button,
+.secondary-button,
+.danger-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.65rem 1.25rem;
+  min-height: 44px;
+  border-radius: var(--radius-md);
+  font-weight: 600;
+  font-size: 0.92rem;
+  line-height: 1.25;
+  transition: all var(--transition);
+  border: 1px solid transparent;
+  cursor: pointer;
+}
+
+.primary-button,
+.btn--primary {
+  background: var(--primary);
+  color: var(--primary-text);
+  box-shadow: none;
+  border-color: var(--primary);
+}
+
+.primary-button:hover:not(:disabled),
+.btn--primary:hover:not(:disabled) {
+  background: var(--primary-hover);
+  box-shadow: none;
+  opacity: 0.96;
+}
+
+.primary-button:active:not(:disabled),
+.btn--primary:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.secondary-button,
+.btn--secondary {
+  background: #ffffff;
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+
+.secondary-button:hover:not(:disabled),
+.btn--secondary:hover:not(:disabled) {
+  background: var(--panel-alt);
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.secondary-button:active:not(:disabled),
+.btn--secondary:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.danger-button,
+.btn--danger {
+  background: var(--color-error-bg);
+  color: var(--color-error-text);
+  border-color: var(--color-error-border);
+}
+
+.danger-button:hover:not(:disabled),
+.btn--danger:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.28);
+  border-color: rgba(248, 113, 113, 0.6);
+  color: #fff;
+  transform: translateY(-1px);
+}
+
+.danger-button:active:not(:disabled),
+.btn--danger:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.btn--block {
+  width: 100%;
+}
+
+.btn--lg {
+  min-height: 50px;
+  font-size: 1rem;
+}
+
+button:disabled,
+.btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  transform: none !important;
+  box-shadow: none !important;
+}
+
+/* Forms & Fields */
+.form-grid,
+.auth__form {
+  display: grid;
+  gap: 1.15rem;
+}
+
+.field {
+  display: grid;
+  gap: 8px;
+}
+
+label,
+.field__label {
+  display: grid;
+  gap: 0.45rem;
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: var(--text-soft);
+}
+
+input,
+select,
+textarea,
+.field__input {
+  width: 100%;
+  min-height: 48px;
+  background-color: var(--color-bg-input);
+  color: var(--text);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 0 0.9rem;
+  font-size: 0.95rem;
+  transition: border-color var(--transition), box-shadow var(--transition);
+}
+
+select {
+  padding: 0 0.9rem;
+  font-size: 0.95rem;
+}
+
+input::placeholder,
+.field__input::placeholder {
+  color: var(--text-muted);
+}
+
+input:focus,
+select:focus,
+textarea:focus,
+.field__input:focus {
+  outline: none;
+  border-color: var(--color-border-focus);
+  box-shadow: 0 0 0 3px rgba(17, 17, 17, 0.05);
+}
+
+textarea {
+  min-height: 5rem;
+  padding: 0.7rem 0.9rem;
+  resize: vertical;
+  font: inherit;
+}
+
+/* Cards & Information Panels */
+.data-card,
+.page-card,
+.stat-card {
+  background-color: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.4rem;
+  box-shadow: var(--shadow);
+  transition: border-color var(--transition), box-shadow var(--transition);
+}
+
+.data-card:hover,
+.page-card:hover {
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-md);
+}
+
+.data-card-header,
+.section-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.75rem;
+  margin-bottom: 0.85rem;
+}
+
+/* Badges & Status Pills */
+.status-chip,
+.status-pill,
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.3rem 0.75rem;
+  border-radius: var(--radius-full);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  background-color: var(--color-warning-bg);
+  border: 1px solid var(--color-warning-border);
+  color: var(--color-warning-text);
+}
+
+/* Status-pill color variants, keyed off the data-status attribute already used by
+   TargetManagementPage (e.g. <span className="status-chip" data-status={target.status}>). */
+.status-chip[data-status='APPROVED'],
+.status-chip[data-status='ACTIVE'] {
+  background-color: var(--color-success-bg);
+  border-color: var(--color-success-border);
+  color: var(--color-success-text);
+}
+
+.status-chip[data-status='REJECTED'],
+.status-chip[data-status='DISABLED'],
+.status-chip[data-status='LOCKED'] {
+  background-color: var(--color-error-bg);
+  border-color: var(--color-error-border);
+  color: var(--color-error-text);
+}
+
+.status-chip[data-status='PENDING'],
+.status-chip[data-status='PENDING_APPROVAL'] {
+  background-color: var(--color-warning-bg);
+  border-color: var(--color-warning-border);
+  color: var(--color-warning-text);
+}
+
+.user-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.35rem 0.75rem;
+  border-radius: var(--radius-full);
+  background-color: var(--panel-alt);
+  border: 1px solid var(--border);
+  color: var(--text-soft);
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+/* Lists and Tables (from frontend_CP style) */
+.list-table {
+  display: grid;
+  gap: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--panel);
+}
+
+.table-row {
+  display: grid;
+  grid-template-columns: 1.3fr 1fr 1fr 1fr 1fr;
+  gap: 14px;
+  align-items: center;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.table-row:last-child {
+  border-bottom: none;
+}
+
+.table-row--header {
+  background: var(--panel-alt);
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 700;
+}
+
+.user-management-controls {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+  margin: 1rem 0;
+}
+
+.user-table-scroll {
+  overflow-x: auto;
+}
+
+.user-management-table {
+  min-width: 900px;
+}
+
+.user-management-row {
+  grid-template-columns: 1.15fr 0.85fr 0.9fr 0.95fr 1.65fr;
+}
+
+.user-management-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.user-management-actions button {
+  padding: 0.45rem 0.7rem;
+  min-height: 36px;
+}
+
+.user-table-pagination {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.meta-list {
+  display: grid;
+  gap: 0.65rem;
+  margin-top: 1rem;
+}
+
+.meta-list div {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-bottom: 0.45rem;
+  border-bottom: 1px solid var(--color-border-subtle);
+  font-size: 0.88rem;
+}
+
+.meta-list dt {
+  color: var(--text-muted);
+}
+
+.meta-list dd {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.stack-actions,
+.inline-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  margin-top: 1.25rem;
+}
+
+/* Alerts & Notices */
+.message-card,
+.alert,
+.notice-box {
+  padding: 0.9rem 1.15rem;
+  border-radius: var(--radius-md);
+  font-size: 0.9rem;
+  font-weight: 500;
+  line-height: 1.45;
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--color-primary);
+  background-color: var(--panel-alt);
+  color: var(--text);
+}
+
+.message-card.error,
+.alert--error {
+  background-color: var(--color-error-bg);
+  border-color: var(--color-error-border);
+  border-left-color: var(--danger);
+  color: var(--color-error-text);
+}
+
+.message-card.success,
+.alert--success {
+  background-color: var(--color-success-bg);
+  border-color: var(--color-success-border);
+  border-left-color: var(--success);
+  color: var(--color-success-text);
+}
+
+.message-card.warning,
+.alert--warning {
+  background-color: var(--color-warning-bg);
+  border-color: var(--color-warning-border);
+  border-left-color: var(--warning);
+  color: var(--color-warning-text);
+}
+
+/* Empty State */
+.empty-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3rem 1.5rem;
+  text-align: center;
+  background-color: var(--panel-alt);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-lg);
+  color: var(--text-soft);
+  font-size: 0.95rem;
+}
+
+/* Loading Panel & Spinner */
+.loading-panel {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.85rem 1.25rem;
+  border-radius: var(--radius-md);
+  background-color: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text-soft);
+  font-size: 0.9rem;
+}
+
+.spinner {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid var(--color-primary-subtle);
+  border-top-color: var(--primary);
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Modals & Dialogs */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background-color: rgba(17, 17, 17, 0.48);
+  display: grid;
+  place-items: center;
+  padding: 1.25rem;
+  z-index: 1000;
+}
+
+.modal-card {
+  width: min(100%, 460px);
+  background-color: var(--color-bg-surface-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 1.75rem;
+  box-shadow: var(--shadow-overlay);
+}
+
+.modal-card h3 {
+  margin-bottom: 0.75rem;
+}
+
+.modal-card p {
+  color: var(--text-soft);
+  font-size: 0.92rem;
+  line-height: 1.45;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  margin-top: 1.5rem;
+}
+
+@media (max-width: 640px) {
+  .user-management-controls {
+    grid-template-columns: 1fr;
+  }
+
+  .user-table-pagination {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}

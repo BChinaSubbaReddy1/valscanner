@@ -1,0 +1,4 @@
+-------------------------------------------------------------------------------
+Test set: com.vulnscanner.application.AuthSecurityIntegrationTest
+-------------------------------------------------------------------------------
+Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 25.24 s -- in com.vulnscanner.application.AuthSecurityIntegrationTest

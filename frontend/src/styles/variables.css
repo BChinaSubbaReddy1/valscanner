@@ -1,0 +1,115 @@
+/* Design Tokens - light neutral theme */
+:root {
+  /* Surfaces & Canvas */
+  --bg: #f5f5f4;
+  --panel: #ffffff;
+  --panel-alt: #f9f9f8;
+  --surface: #ffffff;
+  --surface-2: #f4f4f5;
+  --color-bg-canvas: #f5f5f4;
+  --color-bg-subtle: #f5f5f4;
+  --color-bg-surface: #ffffff;
+  --color-bg-surface-elevated: #ffffff;
+  --color-bg-surface-hover: #f0f0ef;
+  --color-bg-input: #ffffff;
+
+  /* Typography & Foreground — dark text on light backgrounds */
+  --text: #171717;
+  --text-soft: #52525b;
+  --text-muted: #71717a;
+  --color-text-primary: #171717;
+  --color-text-secondary: #52525b;
+  --color-text-muted: #71717a;
+  --color-text-inverse: #ffffff;
+
+  /* Actions & Primary — accessible blue on white */
+  --primary: #111111;
+  --primary-hover: #262626;
+  --primary-text: #ffffff;
+  --color-primary: #111111;
+  --color-primary-hover: #262626;
+  --color-primary-active: #000000;
+  --color-primary-subtle: #f4f4f5;
+  --color-primary-border: #e5e7eb;
+
+  /* Secondary & Brand */
+  --color-secondary: #52525b;
+  --color-secondary-hover: #171717;
+  --color-secondary-subtle: #f9f9f8;
+  --color-secondary-border: #e5e7eb;
+
+  /* Status & Severity Tokens */
+  --critical: #a8202c;
+  --high: #c2521a;
+  --medium: #a97913;
+  --low: #3a6ea5;
+  --info: #6b6f76;
+  --success: #2f6b45;
+  --warning: #b45309;
+  --danger: #b42318;
+
+  --color-success: #2f6b45;
+  --color-success-bg: #f0fdf4;
+  --color-success-border: #bbf7d0;
+  --color-success-text: #1f7a4b;
+
+  --color-warning: #b45309;
+  --color-warning-bg: #fffbeb;
+  --color-warning-border: #fde68a;
+  --color-warning-text: #92400e;
+
+  --color-error: #b42318;
+  --color-error-bg: #fef2f2;
+  --color-error-border: #fecaca;
+  --color-error-text: #b42318;
+
+  --color-info: #6b6f76;
+  --color-info-bg: #f4f4f5;
+  --color-info-border: #e4e4e7;
+  --color-info-text: #52525b;
+
+  /* Borders & Dividers — visible on white */
+  --border: #e5e7eb;
+  --border-strong: #d6d3d1;
+  --color-border: #e5e7eb;
+  --color-border-subtle: #f3f4f6;
+  --color-border-focus: #111111;
+
+  /* Shape & Radii */
+  --radius: 10px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+  --radius-full: 9999px;
+
+  /* Shadows — light and subtle for white cards */
+  --shadow: 0 8px 24px rgba(17, 17, 17, 0.04);
+  --shadow-overlay: 0 8px 28px rgba(23, 24, 26, 0.12);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 8px 24px rgba(17, 17, 17, 0.06);
+  --shadow-lg: 0 8px 24px rgba(17, 17, 17, 0.04);
+
+  /* Spacing Scale */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 24px;
+  --s6: 32px;
+  --s7: 48px;
+
+  /* Typography */
+  --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --font-family-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --font-family-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Layout dimensions */
+  --sidebar-w: 260px;
+  --topbar-h: 56px;
+
+  /* Transitions */
+  --transition: 0.2s ease;
+  --transition-fast: 150ms ease-in-out;
+  --transition-normal: 250ms ease-in-out;
+}
