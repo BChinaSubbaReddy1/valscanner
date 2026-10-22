@@ -253,8 +253,11 @@ public class ScanService {
 
     private ScanFindingResponse findingResponse(ScanFinding finding) {
         return new ScanFindingResponse(finding.getId(), finding.getCheckType(), finding.getSeverity(),
-                finding.getAffectedComponent(), finding.getEvidence(), finding.getRationale(),
-                finding.getRemediation(), finding.getDetectionSource(), finding.getVerificationStatus(),
+                FindingSanitizer.sanitize(finding.getAffectedComponent()),
+                FindingSanitizer.sanitize(finding.getEvidence()),
+                FindingSanitizer.sanitize(finding.getRationale()),
+                FindingSanitizer.sanitize(finding.getRemediation()),
+                finding.getDetectionSource(), finding.getVerificationStatus(),
                 finding.getDetectedAt());
     }
 

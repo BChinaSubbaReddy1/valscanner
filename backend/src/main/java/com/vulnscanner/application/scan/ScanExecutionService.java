@@ -7,10 +7,10 @@ import com.vulnscanner.application.audit.AuditEventRepository;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.ByteArrayOutputStream;
 import java.net.*;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -22,6 +22,7 @@ import java.util.concurrent.ConcurrentHashMap;
 
 @Service
 public class ScanExecutionService {
+    private static final Logger LOG = LoggerFactory.getLogger(ScanExecutionService.class);
     private static final int MAX_RESPONSE_BYTES = 1_048_576;
     private static final int MAX_PARAMETERS_PER_URL = 3;
     private static final int MAX_CRAWL_DEPTH = 2;
@@ -44,6 +45,7 @@ public class ScanExecutionService {
     private final ZapClientService zapClientService;
     private final ZapScanAdapter zapScanAdapter;
     private final boolean zapFallbackToNative;
+    private final Duration zapMaxDuration;
 
     @org.springframework.beans.factory.annotation.Autowired
     public ScanExecutionService(ScanJobRepository scanJobRepository,
@@ -58,14 +60,15 @@ public class ScanExecutionService {
                                 org.springframework.beans.factory.ObjectProvider<NvdCveService> nvdCveServiceProvider,
                                 org.springframework.beans.factory.ObjectProvider<ZapClientService> zapClientServiceProvider,
                                 org.springframework.beans.factory.ObjectProvider<ZapScanAdapter> zapScanAdapterProvider,
-                                @Value("${scanner.zap.fallback-to-native:true}") boolean zapFallbackToNative) {
+                                @Value("${scanner.zap.fallback-to-native:false}") boolean zapFallbackToNative,
+                                @Value("${scanner.zap.max-duration-seconds:90}") int zapMaxDurationSeconds) {
         this(scanJobRepository, findingRepository, allowPrivateTargets, transactionTemplate,
                 auditEventRepository, crawlPageRepository, maxRequests, maxDetectionRequests,
                 requestTimeoutSeconds, null,
                 nvdCveServiceProvider != null ? nvdCveServiceProvider.getIfAvailable() : null,
                 zapClientServiceProvider != null ? zapClientServiceProvider.getIfAvailable() : null,
                 zapScanAdapterProvider != null ? zapScanAdapterProvider.getIfAvailable() : null,
-                zapFallbackToNative);
+                zapFallbackToNative, zapMaxDurationSeconds);
     }
 
     public ScanExecutionService(ScanJobRepository scanJobRepository,
@@ -79,7 +82,7 @@ public class ScanExecutionService {
                                 @Value("${scanner.request-timeout-seconds:15}") int requestTimeoutSeconds) {
         this(scanJobRepository, findingRepository, allowPrivateTargets, transactionTemplate,
                 auditEventRepository, crawlPageRepository, maxRequests, maxDetectionRequests,
-                requestTimeoutSeconds, null, null, null, null, true);
+                requestTimeoutSeconds, null, null, null, null, false);
     }
 
     ScanExecutionService(ScanJobRepository scanJobRepository,
@@ -95,7 +98,7 @@ public class ScanExecutionService {
                          NvdCveService nvdCveService) {
         this(scanJobRepository, findingRepository, allowPrivateTargets, transactionTemplate,
                 auditEventRepository, crawlPageRepository, maxRequests, maxDetectionRequests,
-                requestTimeoutSeconds, httpClient, nvdCveService, null, null, true);
+                requestTimeoutSeconds, httpClient, nvdCveService, null, null, false);
     }
 
     public ScanExecutionService(ScanJobRepository scanJobRepository,
@@ -112,6 +115,27 @@ public class ScanExecutionService {
                                 ZapClientService zapClientService,
                                 ZapScanAdapter zapScanAdapter,
                                 boolean zapFallbackToNative) {
+        this(scanJobRepository, findingRepository, allowPrivateTargets, transactionTemplate,
+                auditEventRepository, crawlPageRepository, maxRequests, maxDetectionRequests,
+                requestTimeoutSeconds, httpClient, nvdCveService, zapClientService, zapScanAdapter,
+                zapFallbackToNative, 90);
+    }
+
+    public ScanExecutionService(ScanJobRepository scanJobRepository,
+                                ScanFindingRepository findingRepository,
+                                boolean allowPrivateTargets,
+                                TransactionTemplate transactionTemplate,
+                                AuditEventRepository auditEventRepository,
+                                ScanCrawlPageRepository crawlPageRepository,
+                                int maxRequests,
+                                int maxDetectionRequests,
+                                int requestTimeoutSeconds,
+                                HttpClient httpClient,
+                                NvdCveService nvdCveService,
+                                ZapClientService zapClientService,
+                                ZapScanAdapter zapScanAdapter,
+                                boolean zapFallbackToNative,
+                                int zapMaxDurationSeconds) {
         this.scanJobRepository = scanJobRepository;
         this.findingRepository = findingRepository;
         this.allowPrivateTargets = allowPrivateTargets;
@@ -126,6 +150,8 @@ public class ScanExecutionService {
         this.zapClientService = zapClientService;
         this.zapScanAdapter = zapScanAdapter != null ? zapScanAdapter : new ZapScanAdapter();
         this.zapFallbackToNative = zapFallbackToNative;
+        this.zapMaxDuration = Duration.ofSeconds(requirePositive(zapMaxDurationSeconds,
+                "scanner.zap.max-duration-seconds"));
         this.httpClient = httpClient != null ? httpClient : HttpClient.newBuilder()
                 .version(HttpClient.Version.HTTP_1_1)
                 .connectTimeout(this.requestTimeout)
@@ -157,16 +183,15 @@ public class ScanExecutionService {
             return;
         }
         try {
-            transactionTemplate.executeWithoutResult(status -> runClaimed(scanId));
+            runClaimed(scanId);
         } finally {
             CLAIMED.remove(scanId);
         }
     }
 
     protected void runClaimed(Long scanId) {
-        ScanJob job = scanJobRepository.findByIdForExecutionUpdate(scanId).orElse(null);
-        if (job == null || (job.getStatus() != ScanStatus.QUEUED && job.getStatus() != ScanStatus.CREATED)
-                || job.isCancellationRequested()) {
+        ScanJob job = claimForExecution(scanId);
+        if (job == null) {
             return;
         }
         if (job.getRequestedBy() == null || job.getRequestedBy().getStatus() != com.vulnscanner.application.user.UserStatus.ACTIVE
@@ -179,6 +204,7 @@ public class ScanExecutionService {
             fail(job, ScanFailureReason.TARGET_URL_INVALID, "Requesting analyst is no longer eligible");
             return;
         }
+
         if (job.getReviewedBy() == null || job.getReviewedAt() == null
                 || job.getTarget().getStatus() != TargetStatus.APPROVED
                 || job.getTarget().getOrganization().getId() == null
@@ -196,31 +222,55 @@ public class ScanExecutionService {
         } catch (ScanExecutionException exception) {
             fail(job, exception.reason(), exception.getMessage());
         } catch (Exception exception) {
+            LOG.warn("Scan worker failed for scan {} with {}", scanId, exception.getClass().getSimpleName());
             fail(job, ScanFailureReason.OUTBOUND_REQUEST_FAILED, "Scan could not inspect the target");
         }
+    }
+
+    private ScanJob claimForExecution(Long scanId) {
+        ScanJob[] claimed = new ScanJob[1];
+        Runnable claim = () -> {
+            ScanJob candidate = scanJobRepository.findByIdForExecutionUpdate(scanId).orElse(null);
+            if (candidate == null
+                    || (candidate.getStatus() != ScanStatus.QUEUED && candidate.getStatus() != ScanStatus.CREATED)
+                    || candidate.isCancellationRequested()) {
+                return;
+            }
+            candidate.transitionTo(ScanStatus.RUNNING, Math.max(candidate.getProgress(), 1),
+                    "Scan worker claimed the job", null);
+            ScanJob saved = scanJobRepository.save(candidate);
+            claimed[0] = saved == null ? candidate : saved;
+        };
+        if (transactionTemplate == null) {
+            claim.run();
+        } else {
+            transactionTemplate.executeWithoutResult(status -> claim.run());
+        }
+        return claimed[0];
     }
 
     private void runNativeScan(ScanJob job) throws ScanExecutionException {
         if (job.getStatus() == ScanStatus.CREATED) {
             job.transitionTo(ScanStatus.QUEUED, 0, "Queued for passive scanning", null);
-            scanJobRepository.saveAndFlush(job);
+            persistExecutionState(job);
         }
         job.transitionTo(ScanStatus.CRAWLING, 10, "Discovering same-origin pages", null);
-        scanJobRepository.saveAndFlush(job);
+        persistExecutionState(job);
 
         CrawlResult crawl = crawl(job);
-        if (job.isCancellationRequested()) {
+        if (cancellationRequested(job)) {
             job.transitionTo(ScanStatus.CANCELLED, job.getProgress(), "Scan cancelled during execution", null);
-            scanJobRepository.save(job);
+            persistExecutionState(job);
             audit(job, "SCAN_JOB_CANCELLED", "Scan cancelled during execution");
             return;
         }
         job.transitionTo(ScanStatus.SCANNING, 70, "Running passive response checks", null);
-        scanJobRepository.saveAndFlush(job);
+        persistExecutionState(job);
         persistFindings(job, crawl.initialResponse());
         job.transitionTo(ScanStatus.COMPLETED, 100, "Passive header scan completed", null);
-        scanJobRepository.save(job);
-        audit(job, "SCAN_JOB_COMPLETED", "Passive header scan completed");
+        persistExecutionState(job);
+        audit(job, job.getStatus() == ScanStatus.COMPLETED ? "SCAN_JOB_COMPLETED" : "SCAN_JOB_CANCELLED",
+                job.getStatusMessage());
     }
 
     private void runZapScan(ScanJob job) throws ScanExecutionException {
@@ -236,7 +286,7 @@ public class ScanExecutionService {
         }
 
         if (zapClientService == null || !zapClientService.isAvailable()) {
-            if (zapFallbackToNative) {
+            if (zapFallbackToNative && job.getScanType() == ScanType.ZAP_PASSIVE) {
                 audit(job, "ZAP_FALLBACK_TO_NATIVE", "OWASP ZAP is unavailable; falling back to native scanner");
                 runNativeScan(job);
                 return;
@@ -247,26 +297,41 @@ public class ScanExecutionService {
 
         if (job.getStatus() == ScanStatus.CREATED) {
             job.transitionTo(ScanStatus.QUEUED, 0, "Queued for OWASP ZAP scanning", null);
-            scanJobRepository.saveAndFlush(job);
+            persistExecutionState(job);
         }
 
         String targetUrl = job.getTarget().getUrl();
         String spiderScanId = null;
         String activeScanId = null;
+        boolean spiderFinished = false;
+        boolean activeFinished = false;
+        ZapClientService.ScopeContext context = null;
 
         try {
+            context = zapClientService.createTargetContext(origin, "scanner-" + job.getId() + "-" + UUID.randomUUID());
+            long deadline = System.nanoTime() + zapMaxDuration.toNanos();
             // Spider phase
             job.transitionTo(ScanStatus.CRAWLING, 10, "OWASP ZAP spider discovering pages", null);
-            scanJobRepository.saveAndFlush(job);
-            spiderScanId = zapClientService.startSpider(targetUrl);
+            persistExecutionState(job);
+            if (job.getScanType() == ScanType.ZAP_ACTIVE) {
+                crawl(job);
+                if (cancelIfRequested(job, "Scan cancelled during native active checks")) {
+                    return;
+                }
+            }
+            if (cancelIfRequested(job, "Scan cancelled before OWASP ZAP spider")) {
+                return;
+            }
+            spiderScanId = zapClientService.startSpider(targetUrl, context.name());
 
             int spiderProgress = 0;
             int pollCount = 0;
-            while (spiderProgress < 100 && pollCount < 60) {
-                if (job.isCancellationRequested()) {
+            while (spiderProgress < 100 && pollCount < 60 && System.nanoTime() < deadline) {
+                if (cancellationRequested(job)) {
                     zapClientService.stopSpider(spiderScanId);
+                    spiderFinished = true;
                     job.transitionTo(ScanStatus.CANCELLED, job.getProgress(), "Scan cancelled during ZAP spider", null);
-                    scanJobRepository.save(job);
+                    persistExecutionState(job);
                     audit(job, "SCAN_JOB_CANCELLED", "Scan cancelled during ZAP spider");
                     return;
                 }
@@ -279,23 +344,32 @@ public class ScanExecutionService {
                 spiderProgress = zapClientService.getSpiderProgress(spiderScanId);
                 int calculatedProgress = Math.max(job.getProgress(), 10 + (int) (spiderProgress * 0.35)); // 10% -> 45%
                 job.updateProgress(calculatedProgress, "OWASP ZAP spider discovering pages (" + spiderProgress + "%)");
-                scanJobRepository.save(job);
+                persistExecutionState(job);
                 pollCount++;
             }
+            if (spiderProgress < 100 || System.nanoTime() > deadline) {
+                throw new ScanExecutionException(ScanFailureReason.TIME_BUDGET_EXCEEDED,
+                        "OWASP ZAP spider did not complete within its time budget");
+            }
+            spiderFinished = true;
 
             // Active Scan phase if requested
             if (job.getScanType() == ScanType.ZAP_ACTIVE) {
+                if (cancelIfRequested(job, "Scan cancelled before OWASP ZAP active scan")) {
+                    return;
+                }
                 job.transitionTo(ScanStatus.SCANNING, 50, "OWASP ZAP running active vulnerability scan", null);
-                scanJobRepository.saveAndFlush(job);
-                activeScanId = zapClientService.startActiveScan(targetUrl);
+                persistExecutionState(job);
+                activeScanId = zapClientService.startActiveScan(targetUrl, context);
 
                 int ascanProgress = 0;
                 pollCount = 0;
-                while (ascanProgress < 100 && pollCount < 120) {
-                    if (job.isCancellationRequested()) {
+                while (ascanProgress < 100 && pollCount < 120 && System.nanoTime() < deadline) {
+                    if (cancellationRequested(job)) {
                         zapClientService.stopActiveScan(activeScanId);
+                        activeFinished = true;
                         job.transitionTo(ScanStatus.CANCELLED, job.getProgress(), "Scan cancelled during ZAP active scan", null);
-                        scanJobRepository.save(job);
+                        persistExecutionState(job);
                         audit(job, "SCAN_JOB_CANCELLED", "Scan cancelled during ZAP active scan");
                         return;
                     }
@@ -308,26 +382,54 @@ public class ScanExecutionService {
                     ascanProgress = zapClientService.getActiveScanProgress(activeScanId);
                     int calculatedProgress = Math.max(job.getProgress(), 50 + (int) (ascanProgress * 0.35)); // 50% -> 85%
                     job.updateProgress(calculatedProgress, "OWASP ZAP active vulnerability scan (" + ascanProgress + "%)");
-                    scanJobRepository.save(job);
+                    persistExecutionState(job);
                     pollCount++;
                 }
+                if (ascanProgress < 100 || System.nanoTime() > deadline) {
+                    throw new ScanExecutionException(ScanFailureReason.TIME_BUDGET_EXCEEDED,
+                            "OWASP ZAP active scan did not complete within its time budget");
+                }
+                activeFinished = true;
             } else {
                 job.transitionTo(ScanStatus.SCANNING, 70, "OWASP ZAP passive alerts processing", null);
-                scanJobRepository.saveAndFlush(job);
+                persistExecutionState(job);
             }
 
             // Process alerts
+            if (System.nanoTime() > deadline) {
+                throw new ScanExecutionException(ScanFailureReason.TIME_BUDGET_EXCEEDED,
+                        "OWASP ZAP scan exceeded its time budget");
+            }
+            if (cancelIfRequested(job, "Scan cancelled before OWASP ZAP alert processing")) {
+                return;
+            }
             List<ZapAlert> alerts = zapClientService.getAlerts(targetUrl);
+            if (System.nanoTime() > deadline) {
+                throw new ScanExecutionException(ScanFailureReason.TIME_BUDGET_EXCEEDED,
+                        "OWASP ZAP scan exceeded its time budget");
+            }
+            if (cancelIfRequested(job, "Scan cancelled during OWASP ZAP alert processing")) {
+                return;
+            }
             persistZapFindings(job, alerts);
 
             job.transitionTo(ScanStatus.COMPLETED, 100, "OWASP ZAP scan completed successfully", null);
-            scanJobRepository.save(job);
-            audit(job, "SCAN_JOB_COMPLETED", "OWASP ZAP scan completed successfully");
+            persistExecutionState(job);
+            audit(job, job.getStatus() == ScanStatus.COMPLETED ? "SCAN_JOB_COMPLETED" : "SCAN_JOB_CANCELLED",
+                    job.getStatusMessage());
         } catch (IOException e) {
             throw new ScanExecutionException(ScanFailureReason.OUTBOUND_REQUEST_FAILED, "OWASP ZAP API communication error");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new ScanExecutionException(ScanFailureReason.TIME_BUDGET_EXCEEDED, "Scan interrupted");
+        } finally {
+            if (activeScanId != null && !activeFinished) {
+                zapClientService.stopActiveScan(activeScanId);
+            }
+            if (spiderScanId != null && !spiderFinished) {
+                zapClientService.stopSpider(spiderScanId);
+            }
+            zapClientService.removeContext(context);
         }
     }
 
@@ -374,7 +476,7 @@ public class ScanExecutionService {
         queue.add(new CrawlRequest(origin, 0));
         ScanResponse initial = null;
         while (!queue.isEmpty() && visited.size() < maxRequests) {
-            if (job.isCancellationRequested()) {
+            if (cancellationRequested(job)) {
                 break;
             }
             CrawlRequest next = queue.removeFirst();
@@ -388,11 +490,11 @@ public class ScanExecutionService {
             }
             boolean htmlDocument = isHtmlDocument(response);
             List<URI> links = htmlDocument ? discoverLinks(origin, uri, response.body()) : List.of();
-            if (!job.isCancellationRequested() && crawlPageRepository != null && htmlDocument) {
+            if (!cancellationRequested(job) && crawlPageRepository != null && htmlDocument) {
                 crawlPageRepository.save(new ScanCrawlPage(job, uri.toString(), next.depth(),
                         response.statusCode(), response.body().length, links.size()));
             }
-            if (!job.isCancellationRequested()) {
+            if (!cancellationRequested(job) && job.getScanType() == ScanType.ZAP_ACTIVE) {
                 persistParameterFindings(job, uri, response, context);
             }
             if (next.depth() < MAX_CRAWL_DEPTH) {
@@ -425,34 +527,21 @@ public class ScanExecutionService {
             if (!context.tryConsumeRequest(detectionRequest)) {
                 throw new ScanExecutionException(ScanFailureReason.OUTBOUND_REQUEST_FAILED, "Request budget is exhausted");
             }
-            HttpResponse<InputStream> response = this.httpClient.send(request, HttpResponse.BodyHandlers.ofInputStream());
-            byte[] body = readBounded(response.body());
+            HttpResponse<byte[]> response = BoundedHttpResponse.send(
+                    this.httpClient, request, MAX_RESPONSE_BYTES, requestTimeout);
+            byte[] body = response.body();
             return new ScanResponse(response.statusCode(), response.headers(), body);
         } catch (java.net.http.HttpTimeoutException exception) {
             throw new ScanExecutionException(ScanFailureReason.TIME_BUDGET_EXCEEDED, "Target request timed out");
         } catch (IOException exception) {
+            if (exception instanceof BoundedHttpResponse.ResponseTooLargeException) {
+                throw new ScanExecutionException(ScanFailureReason.RESPONSE_LIMIT_EXCEEDED,
+                        "Target response exceeded the permitted size");
+            }
             throw new ScanExecutionException(ScanFailureReason.OUTBOUND_REQUEST_FAILED, "Target request failed");
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
             throw new ScanExecutionException(ScanFailureReason.TIME_BUDGET_EXCEEDED, "Scan interrupted");
-        }
-    }
-
-    private byte[] readBounded(InputStream input) throws IOException, ScanExecutionException {
-        try (InputStream body = input) {
-            byte[] buffer = new byte[8192];
-            int total = 0;
-            int read;
-            ByteArrayOutputStream output = new ByteArrayOutputStream();
-            while ((read = body.read(buffer)) != -1) {
-                total += read;
-                if (total > MAX_RESPONSE_BYTES) {
-                    throw new ScanExecutionException(ScanFailureReason.RESPONSE_LIMIT_EXCEEDED,
-                            "Target response exceeded the permitted size");
-                }
-                output.write(buffer, 0, read);
-            }
-            return output.toByteArray();
         }
     }
 
@@ -560,7 +649,7 @@ public class ScanExecutionService {
         Set<String> keys = new HashSet<>();
         int tested = 0;
         for (QueryParameter parameter : parameters) {
-            if (tested++ >= MAX_PARAMETERS_PER_URL || job.isCancellationRequested()) {
+            if (tested++ >= MAX_PARAMETERS_PER_URL || cancellationRequested(job)) {
                 break;
             }
             if (isSensitiveParameter(parameter.name())) {
@@ -681,30 +770,17 @@ public class ScanExecutionService {
                         List<CveMatch> matches = nvdCveService.findCves(sv.software(), sv.version());
                         for (CveMatch match : matches) {
                             String cveComponent = header + ": " + sv.software() + "/" + sv.version() + " [" + match.cveId() + "]";
-                            String cveEvidence = String.format("Software '%s' version '%s' disclosed in '%s' matches %s (CVSS score: %.1f, severity: %s, vector: %s): %s",
-                                    sv.software(), sv.version(), header, match.cveId(), match.cvssScore(), match.cvssSeverity(), match.cvssVector(), bounded(match.description()));
-                            String localSeverity = mapCvssToLocalSeverity(match.cvssScore(), match.cvssSeverity());
-                            addFinding(job, keys, "KNOWN_VULNERABILITY_CVE", cveComponent, localSeverity,
-                                    cveEvidence, "Upgrade " + sv.software() + " to a supported, patched version.",
+                            String cveEvidence = String.format("NVD keyword-search candidate only: '%s' version '%s' disclosed in '%s' was returned with %s. Product and version applicability are not verified. NVD CVSS: %.1f (%s; %s). %s",
+                                    sv.software(), sv.version(), header, match.cveId(), match.cvssScore(),
+                                    match.cvssSeverity(), match.cvssVector(), bounded(match.description()));
+                            addFinding(job, keys, "CVE_KEYWORD_CANDIDATE", cveComponent, "LOW",
+                                    cveEvidence, "Verify product identity and affected-version ranges against the vendor advisory before remediation.",
                                     "NVD_CVE_LOOKUP", "POTENTIAL");
                         }
                     }
                 }
             }
         }
-    }
-
-    private String mapCvssToLocalSeverity(double cvssScore, String cvssSeverity) {
-        if ("CRITICAL".equalsIgnoreCase(cvssSeverity) || cvssScore >= 9.0) {
-            return "HIGH";
-        }
-        if ("HIGH".equalsIgnoreCase(cvssSeverity) || cvssScore >= 7.0) {
-            return "HIGH";
-        }
-        if ("MEDIUM".equalsIgnoreCase(cvssSeverity) || cvssScore >= 4.0) {
-            return "MEDIUM";
-        }
-        return "LOW";
     }
 
     private String extractSqlErrorSnippet(byte[] body) {
@@ -745,8 +821,56 @@ public class ScanExecutionService {
         String key = type + "|" + component;
         if (keys.add(key)) {
             findingRepository.save(new ScanFinding(job, type, severity,
-                    bounded(component), bounded(evidence), "Observed in the target HTTP response",
-                    bounded(remediation), source, verificationStatus));
+                    bounded(FindingSanitizer.sanitize(component)),
+                    bounded(FindingSanitizer.sanitize(evidence)),
+                    "Observed in the target HTTP response",
+                    bounded(FindingSanitizer.sanitize(remediation)), source, verificationStatus));
+        }
+    }
+
+    private boolean cancellationRequested(ScanJob job) {
+        if (job.isCancellationRequested()) {
+            return true;
+        }
+        if (job.getId() == null) {
+            return false;
+        }
+        Optional<Boolean> requestedState = scanJobRepository.findCancellationRequestedById(job.getId());
+        boolean requested = requestedState != null && requestedState.orElse(false);
+        if (requested) {
+            job.requestCancellation();
+        }
+        return requested;
+    }
+
+    private boolean cancelIfRequested(ScanJob job, String message) {
+        if (!cancellationRequested(job)) {
+            return false;
+        }
+        if (job.getStatus() == ScanStatus.CRAWLING || job.getStatus() == ScanStatus.SCANNING
+                || job.getStatus() == ScanStatus.RUNNING) {
+            job.transitionTo(ScanStatus.CANCELLED, job.getProgress(), message, null);
+            persistExecutionState(job);
+            audit(job, "SCAN_JOB_CANCELLED", message);
+        }
+        return true;
+    }
+
+    private void persistExecutionState(ScanJob job) {
+        if (transactionTemplate == null || job.getId() == null) {
+            scanJobRepository.save(job);
+            return;
+        }
+        ScanJob[] persistedState = new ScanJob[1];
+        transactionTemplate.executeWithoutResult(status -> {
+            ScanJob persisted = scanJobRepository.findByIdForExecutionUpdate(job.getId())
+                    .orElseThrow(() -> new IllegalStateException("Scan job disappeared during execution"));
+            persisted.mergeExecutionState(job);
+            ScanJob saved = scanJobRepository.save(persisted);
+            persistedState[0] = saved == null ? persisted : saved;
+        });
+        if (persistedState[0] != null) {
+            job.copyExecutionStateFrom(persistedState[0]);
         }
     }
 
@@ -759,8 +883,9 @@ public class ScanExecutionService {
                 || job.getStatus() == ScanStatus.SCANNING || job.getStatus() == ScanStatus.QUEUED
                 || job.getStatus() == ScanStatus.CREATED) {
             job.transitionTo(ScanStatus.FAILED, job.getProgress(), message, reason);
-            scanJobRepository.save(job);
-            audit(job, "SCAN_JOB_FAILED", message);
+            persistExecutionState(job);
+            audit(job, job.getStatus() == ScanStatus.FAILED ? "SCAN_JOB_FAILED" : "SCAN_JOB_CANCELLED",
+                    job.getStatusMessage());
         }
     }
 

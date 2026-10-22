@@ -2,7 +2,7 @@
 
 ## Scope inspected
 
-The workspace contains a Spring Boot 3.3.5 / Java 21 Maven backend with JWT authentication, registration and approval, organizations, user/role persistence, password reset, audit-event persistence, and bounded scan execution. Persistent organization-scoped target management, approval-gated scan jobs, passive checks, findings, and same-origin crawl-page discovery are implemented. Reports, exports, active checks, and schedules are not implemented. There is no separate `TargetUrlValidator`; target URL syntax validation is currently implemented in `TargetService`, while execution-time scheme, credential, DNS, and network-address checks are enforced by `ScanExecutionService`. The audit and changes apply only to the backend present here.
+The workspace contains a Spring Boot 3.3.5 / Java 21 Maven backend with JWT authentication, registration and approval, organizations, user/role persistence, audit-event persistence, and bounded scan execution. Password-reset endpoints are unavailable until a real delivery integration exists. Organization-scoped targets, approval-gated scan jobs, passive checks, findings, same-origin crawl-page discovery, report endpoints, and JSON/CSV/PDF exports are implemented. Native active checks and schedules are not implemented; explicit `ZAP_ACTIVE` requests use the scoped ZAP integration. There is no separate `TargetUrlValidator`; target URL syntax validation is currently implemented in `TargetService`, while execution-time scheme, credential, DNS, and network-address checks are enforced by `ScanExecutionService`. The audit and changes apply only to the backend present here.
 
 ## Existing registration and security behavior
 
@@ -15,7 +15,7 @@ The workspace contains a Spring Boot 3.3.5 / Java 21 Maven backend with JWT auth
 - `CUSTOMER` is no longer seeded or accepted by public registration. The enum value remains solely for reading legacy role rows; Customer-only accounts cannot authenticate, and their assignments are not returned by Analyst-specific management/approval APIs.
 - Method security protects the platform and organization endpoints; organization service checks also compare the authenticated admin's persisted organization to the requested tenant.
 - The JWT filter reloads the user and roles from the database on every request. Only active users in an approved organization are enabled, so non-active accounts and suspended organizations cannot use existing JWT sessions.
-- Existing Super Admin bootstrap is a platform-only identity without a synthetic organization. Password reset preserves account status.
+- Existing Super Admin bootstrap is a platform-only identity without a synthetic organization. Password reset is unavailable until a delivery mechanism is implemented and does not issue tokens.
 
 ## Findings and changes in this implementation
 
@@ -94,7 +94,7 @@ mutation was performed.
 
 ## Remaining scope and risks
 
-- Persistent tenant-scoped scan requests, analyst-owned access, organization-admin approval/rejection, post-commit queueing, cancellation, findings storage/retrieval, bounded passive execution, same-origin endpoint discovery, authorized crawl-page retrieval, and bounded query-parameter SQLi/reflection checks are implemented. Only GET query parameters discovered within the authorized target origin are eligible for active checks. POST bodies, forms, browser execution, authenticated test accounts, reports, exports, robots policy, and schedules are not implemented.
+- Persistent tenant-scoped scan requests, analyst-owned access, organization-admin approval/rejection, post-commit queueing, cancellation, findings storage/retrieval, bounded passive execution, same-origin endpoint discovery, authorized crawl-page retrieval, and report exports are implemented. `PASSIVE_HEADERS` makes passive requests only. `ZAP_ACTIVE` is the only active scan type and requires an available, origin-scoped ZAP service; there is no native active fallback for it. POST-body and authenticated-test-account coverage, browser execution, robots policy, and schedules are not implemented.
 
 ## Phase capability status
 
@@ -105,12 +105,12 @@ mutation was performed.
 | Passive response-header and cookie checks | VERIFIED | Bounded worker tests controlled responses and persists evidence-backed findings; each `Set-Cookie` is parsed independently, values are redacted, and missing attributes are `OBSERVED` rather than verified exploitability |
 | Same-origin crawler and SSRF controls | VERIFIED | Depth/request/response/time limits, redirects disabled, target-origin scheme/host/effective-port comparison, address restrictions, DNS-set pinning, fragment normalization, HTML-only crawl-page records, and cancellation |
 | Dashboard aggregates | VERIFIED | Organization and analyst counts use persisted tenant-scoped repository queries; platform dashboard exposes organization metadata counts only |
-| SQL injection detection | PARTIAL | Quote-based differential checks run only against same-origin GET query parameters, with database-error signatures, a baseline, and a bounded active request budget. Findings are `SQL_INJECTION_SUSPECTED`; no data extraction or destructive payloads are used. POST/body/form and authenticated flows are unsupported. |
-| Reflected XSS detection | PARTIAL | A unique harmless SVG marker is tested in same-origin GET query parameters and reported only when the raw payload is reflected in an HTML tag context. Findings are `REFLECTED_XSS_POTENTIAL`; JavaScript is never executed and manual verification is required. |
+| SQL injection detection | PARTIAL | Native passive mode does not probe parameters. Active vulnerability requests are delegated to explicitly selected `ZAP_ACTIVE` and are restricted to the temporary same-origin context and configured scan/time budgets. Native bounded SQLi differential probes are not active in the current worker route; applicability and false negatives remain ZAP-dependent. |
+| Reflected XSS detection | PARTIAL | `PASSIVE_HEADERS` does not submit test strings. `ZAP_ACTIVE` delegates active detection to scoped ZAP; ZAP alerts are mapped to potential/observed/verified according to reported confidence, with sanitized evidence. No browser execution is performed by the native scanner. |
 | Access-control vulnerability probing | MISSING | Existing RBAC tests verify this backend's authorization, but the scanner does not probe target applications with test accounts |
-| Reports, exports, schedules, active checks | MISSING | No endpoints or persistence model |
+| Reports and JSON/CSV/PDF exports | PARTIAL | Existing persisted findings are exported; CSV formula-leading fields are neutralized and one-page PDF exports report the omitted count. Schedules are not implemented. |
 
-The unsupported active checks are deliberate: implementing POST/form coverage, authenticated test accounts, browser execution, or access-control probing without an explicit target request model and authorization workflow would create unsafe requests and false positives. They are prioritized follow-up work rather than represented as completed scanner capabilities.
+Native POST/form coverage, authenticated test accounts, browser execution, and access-control probing remain unsupported; they require explicit target request models and authorization workflows to avoid unsafe requests and false positives.
 
 ## Phase 6A security configuration result
 
@@ -275,12 +275,13 @@ The final regression commands for this continuation were:
 
 ## Active detector limits
 
-- `scanner.max-requests` controls the crawler budget and defaults to 10.
-- `scanner.max-detection-requests` controls additional SQLi/XSS requests and defaults to 6 per scan.
-- `scanner.request-timeout-seconds` controls connect/request timeouts and defaults to 15 seconds.
+- `PASSIVE_HEADERS` does not submit SQLi/XSS payloads.
+- The explicit `ZAP_ACTIVE` route runs native bounded GET-parameter probes and ZAP active scan; `ZAP_PASSIVE` only spiders and imports passive alerts.
+- `scanner.max-requests` controls the native crawler budget (default 10); `scanner.max-detection-requests` limits native active probes (default 6); `scanner.request-timeout-seconds` (default 15) is an explicit full-response deadline with a 1 MiB response cap.
 - At most three non-sensitive query parameters are considered per crawled URL. Password, secret, token, session, cookie, auth, and key-like parameter names are skipped.
 - Each eligible parameter receives two quote-based SQL checks and one unique-marker reflection check. Requests remain GET-only, same-origin, redirect-free, DNS-pinned, response-size bounded, and cancellation-aware.
 - SQLi findings require a clean baseline plus database-error evidence and a differential signal. XSS findings require raw marker reflection in the tested SVG-tag context; encoded reflection is not reported.
+- ZAP uses a temporary context restricted to the exact target origin, spider depth 2 / 10 children per node, active-scan duration/rule limits, an alert cap, and a 90-second worker deadline. ZAP `ZAP_ACTIVE` never falls back to native-only scanning.
 - Crawl scope is the configured target origin: scheme, host, and effective port must all match. Relative URLs are normalized and fragments removed. Redirects are not followed, so a `Location` destination is never requested. `discoveredLinks` counts accepted normalized links extracted from HTML documents only; CSS, JavaScript, image, font, and other non-HTML responses are requested only within the normal budget and are not persisted as crawl-page records.
 
 ## Frontend integration requirements
@@ -352,3 +353,17 @@ The final regression commands for this continuation were:
 - `BACKEND_SECURITY_REPORT.md`
 
 Removed obsolete invitation runtime types: `OrganizationInvitation.java`, `OrganizationInvitationRepository.java`, `OrganizationInvitationRequest.java`, `OrganizationInvitationResponse.java`, and `OrganizationInvitationToken.java`. Flyway `V4__Add_organization_invitations.sql` was not edited or deleted.
+
+## Current backend security hardening pass
+
+- Bootstrap Super Admin provisioning has no email or password fallback. No email skips provisioning; a configured email without a nonblank password fails startup; an explicitly configured account is saved with a password hash.
+- `PASSIVE_HEADERS` is passive-only. Native bounded SQLi/XSS probes run only for explicit `ZAP_ACTIVE` jobs; the ZAP active scan uses a temporary exact-origin context. Active ZAP requests do not fall back to native-only scanning.
+- Worker claiming and state/progress writes use short transactions; the target HTTP, ZAP polling, and NVD requests execute outside scan-row-lock transactions. Workers re-read the persisted cancellation flag between requests and polling operations.
+- ZAP missing IDs/status, malformed alert responses, polling failures, and incomplete/time-expired scans fail rather than completing successfully. Scoped ZAP spider/active work has bounded depth, response size, alert count, API read deadline, and worker time budget; the integration does not enforce a strict aggregate outbound-request-count quota.
+- Native and ZAP findings are sanitized before storage; finding and report responses also redact historical sensitive strings. CSV formula-leading fields are neutralized. The one-page PDF summary reports the exact count omitted when its display budget is reached.
+- Password-reset delivery is not implemented. Both reset endpoints return `503 Service Unavailable` and do not persist raw reset tokens.
+- NVD results are cached in a 256-entry LRU only after valid successful responses. Keyword-search results are labeled low-severity candidates with unverified applicability, not confirmed affected-product findings.
+- Native and ZAP/NVD HTTP response reads have explicit deadlines and response-size caps. Unexpected scan-worker logs include only scan ID and exception class, not exception text or target response content.
+- No database schema migration was added. The API change is limited to password-reset requests returning `503`; scan and finding response shapes are unchanged.
+- Current verification: `mvn compile` **BUILD SUCCESS**; `mvn test` **75 tests, 0 failures, 0 errors, 0 skipped**; `mvn package` **BUILD SUCCESS** with the same 75-test result. Tests use H2 and controlled local HTTP/ZAP fixtures.
+- Live MySQL/Flyway, live OWASP ZAP, live NVD, and restart persistence are not established by the local regression tests in this pass. ZAP API behavior and parameter compatibility are also not verified against a live ZAP instance.

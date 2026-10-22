@@ -154,6 +154,16 @@ public class ScanReportService {
             return "";
         }
         String sanitized = value.replace("\r", " ").replace("\n", " ");
+        int firstVisible = 0;
+        while (firstVisible < sanitized.length()
+                && (Character.isWhitespace(sanitized.charAt(firstVisible))
+                || Character.isISOControl(sanitized.charAt(firstVisible)))) {
+            firstVisible++;
+        }
+        if (firstVisible < sanitized.length()
+                && "=+-@".indexOf(sanitized.charAt(firstVisible)) >= 0) {
+            sanitized = "'" + sanitized;
+        }
         if (sanitized.contains(",") || sanitized.contains("\"") || sanitized.contains("\n")) {
             return "\"" + sanitized.replace("\"", "\"\"") + "\"";
         }
@@ -165,10 +175,10 @@ public class ScanReportService {
                 finding.getId(),
                 finding.getCheckType(),
                 finding.getSeverity(),
-                sanitize(finding.getAffectedComponent()),
-                sanitize(finding.getEvidence()),
-                sanitize(finding.getRationale()),
-                sanitize(finding.getRemediation()),
+                FindingSanitizer.sanitize(finding.getAffectedComponent()),
+                FindingSanitizer.sanitize(finding.getEvidence()),
+                FindingSanitizer.sanitize(finding.getRationale()),
+                FindingSanitizer.sanitize(finding.getRemediation()),
                 finding.getDetectionSource(),
                 finding.getVerificationStatus(),
                 finding.getDetectedAt()

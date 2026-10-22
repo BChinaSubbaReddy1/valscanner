@@ -19,10 +19,12 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -140,11 +142,60 @@ class ZapIntegrationTest {
     }
 
     @Test
+    void unavailableZapNeverSubstitutesNativeScanningForAnActiveRequest() {
+        String targetUrl = "http://127.0.0.1:" + targetServer.getAddress().getPort();
+        ScanJob job = createApprovedJob(9L, ScanType.ZAP_ACTIVE, targetUrl);
+        ScanJobRepository jobRepo = mock(ScanJobRepository.class);
+        when(jobRepo.findByIdForExecutionUpdate(9L)).thenReturn(Optional.of(job));
+        ScanFindingRepository findingRepo = mock(ScanFindingRepository.class);
+        TransactionTemplate tx = mock(TransactionTemplate.class);
+        doAnswer(invocation -> {
+            ((java.util.function.Consumer<org.springframework.transaction.TransactionStatus>)
+                    invocation.getArgument(0)).accept(null);
+            return null;
+        }).when(tx).executeWithoutResult(any());
+        ZapClientService zapClient = mock(ZapClientService.class);
+        when(zapClient.isAvailable()).thenReturn(false);
+
+        ScanExecutionService service = new ScanExecutionService(
+                jobRepo, findingRepo, true, tx, null, null,
+                10, 6, 15, null, null, zapClient, new ZapScanAdapter(), true);
+        service.execute(9L);
+
+        assertEquals(ScanStatus.FAILED, job.getStatus());
+        assertEquals(ScanFailureReason.EXECUTOR_UNAVAILABLE.name(), job.getFailureReason());
+        verify(findingRepo, never()).save(any());
+    }
+
+    @Test
     void testZapScanSuccessWithAlertMappingAndDeduplication() throws Exception {
         // Setup mock ZAP HTTP server
         zapMockServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         zapMockServer.createContext("/JSON/core/view/version/", exchange -> {
             byte[] body = "{\"version\":\"2.14.0\"}".getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, body.length);
+            try (OutputStream os = exchange.getResponseBody()) { os.write(body); }
+        });
+        AtomicBoolean activeScanWasScoped = new AtomicBoolean();
+        AtomicBoolean targetOriginWasConfigured = new AtomicBoolean();
+        zapMockServer.createContext("/JSON/context/action/newContext/", exchange -> {
+            byte[] body = "{\"contextId\":\"7\"}".getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, body.length);
+            try (OutputStream os = exchange.getResponseBody()) { os.write(body); }
+        });
+        zapMockServer.createContext("/JSON/context/action/includeInContext/", exchange -> {
+            String query = URLDecoder.decode(exchange.getRequestURI().getRawQuery(), StandardCharsets.UTF_8);
+            targetOriginWasConfigured.set(query.contains("http://127.0.0.1")
+                    && query.contains("\\Q") && query.contains("\\E"));
+            byte[] body = "{\"Result\":\"OK\"}".getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, body.length);
+            try (OutputStream os = exchange.getResponseBody()) { os.write(body); }
+        });
+        zapMockServer.createContext("/JSON/context/action/removeContext/", exchange -> {
+            byte[] body = "{\"Result\":\"OK\"}".getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().add("Content-Type", "application/json");
             exchange.sendResponseHeaders(200, body.length);
             try (OutputStream os = exchange.getResponseBody()) { os.write(body); }
@@ -162,6 +213,9 @@ class ZapIntegrationTest {
             try (OutputStream os = exchange.getResponseBody()) { os.write(body); }
         });
         zapMockServer.createContext("/JSON/ascan/action/scan/", exchange -> {
+            String query = exchange.getRequestURI().getRawQuery();
+            activeScanWasScoped.set(query != null && query.contains("inScopeOnly=true")
+                    && query.contains("contextId=7"));
             byte[] body = "{\"scan\":\"2\"}".getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().add("Content-Type", "application/json");
             exchange.sendResponseHeaders(200, body.length);
@@ -175,8 +229,8 @@ class ZapIntegrationTest {
         });
         zapMockServer.createContext("/JSON/core/view/alerts/", exchange -> {
             String alertsJson = "{\"alerts\":[" +
-                    "{\"alert\":\"Cross Site Scripting (Reflected)\",\"risk\":\"High\",\"confidence\":\"High\",\"url\":\"http://127.0.0.1/test\",\"param\":\"q\",\"evidence\":\"<script>alert(1)</script>\",\"description\":\"XSS description\",\"solution\":\"Sanitize input\"}," +
-                    "{\"alert\":\"Cross Site Scripting (Reflected)\",\"risk\":\"High\",\"confidence\":\"High\",\"url\":\"http://127.0.0.1/test\",\"param\":\"q\",\"evidence\":\"<script>alert(1)</script>\",\"description\":\"Duplicate duplicate\",\"solution\":\"Sanitize input\"}," +
+                    "{\"alert\":\"Cross Site Scripting (Reflected)\",\"risk\":\"High\",\"confidence\":\"High\",\"url\":\"http://127.0.0.1/test\",\"param\":\"q\",\"evidence\":\"<script>alert(1)</script> Bearer zap.synthetic-token\",\"description\":\"XSS description\",\"solution\":\"Sanitize input\"}," +
+                    "{\"alert\":\"Cross Site Scripting (Reflected)\",\"risk\":\"High\",\"confidence\":\"High\",\"url\":\"http://127.0.0.1/test\",\"param\":\"q\",\"evidence\":\"<script>alert(1)</script> Bearer zap.synthetic-token\",\"description\":\"Duplicate duplicate\",\"solution\":\"Sanitize input\"}," +
                     "{\"alert\":\"Missing Anti-clickjacking Header\",\"risk\":\"Medium\",\"confidence\":\"Medium\",\"url\":\"http://127.0.0.1/test\",\"evidence\":\"\",\"description\":\"Missing X-Frame-Options\",\"solution\":\"Add X-Frame-Options\"}" +
                     "]}";
             byte[] body = alertsJson.getBytes(StandardCharsets.UTF_8);
@@ -212,6 +266,8 @@ class ZapIntegrationTest {
         assertEquals(ScanStatus.COMPLETED, job.getStatus());
         assertEquals(100, job.getProgress());
         assertEquals("OWASP ZAP scan completed successfully", job.getStatusMessage());
+        assertTrue(activeScanWasScoped.get());
+        assertTrue(targetOriginWasConfigured.get());
 
         ArgumentCaptor<ScanFinding> findingCaptor = ArgumentCaptor.forClass(ScanFinding.class);
         verify(findingRepo, times(2)).save(findingCaptor.capture());
@@ -226,6 +282,7 @@ class ZapIntegrationTest {
         assertEquals("VERIFIED", xssFinding.getVerificationStatus());
         assertEquals("OWASP_ZAP", xssFinding.getDetectionSource());
         assertTrue(xssFinding.getAffectedComponent().contains("[q]"));
+        assertFalse(xssFinding.getEvidence().contains("zap.synthetic-token"));
 
         ScanFinding clickjackingFinding = savedFindings.stream()
                 .filter(f -> f.getCheckType().equals("MISSING_FRAME_PROTECTION"))
@@ -316,5 +373,53 @@ class ZapIntegrationTest {
         // Cancellation checked during spider loop or runClaimed guard
         // Because cancellation was requested before runClaimed, runClaimed returns early
         assertNotEquals(ScanStatus.COMPLETED, job.getStatus());
+    }
+
+    @Test
+    void incompleteZapActiveScanIsPersistedAsFailed() throws Exception {
+        zapMockServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        respond("/JSON/core/view/version/", "{\"version\":\"2.14.0\"}");
+        respond("/JSON/context/action/newContext/", "{\"contextId\":\"9\"}");
+        respond("/JSON/context/action/includeInContext/", "{\"Result\":\"OK\"}");
+        respond("/JSON/context/action/removeContext/", "{\"Result\":\"OK\"}");
+        respond("/JSON/spider/action/scan/", "{\"scan\":\"1\"}");
+        respond("/JSON/spider/view/status/", "{\"status\":\"100\"}");
+        respond("/JSON/ascan/action/scan/", "{\"scan\":\"2\"}");
+        respond("/JSON/ascan/view/status/", "{\"status\":\"0\"}");
+        zapMockServer.start();
+
+        ZapClientService zapClient = new ZapClientService(
+                "http://127.0.0.1:" + zapMockServer.getAddress().getPort(), "", true, 1, 1, new ObjectMapper());
+        String targetUrl = "http://127.0.0.1:" + targetServer.getAddress().getPort();
+        ScanJob job = createApprovedJob(8L, ScanType.ZAP_ACTIVE, targetUrl);
+        ScanJobRepository jobRepo = mock(ScanJobRepository.class);
+        when(jobRepo.findByIdForExecutionUpdate(8L)).thenReturn(Optional.of(job));
+        ScanFindingRepository findingRepo = mock(ScanFindingRepository.class);
+        TransactionTemplate tx = mock(TransactionTemplate.class);
+        doAnswer(invocation -> {
+            ((java.util.function.Consumer<org.springframework.transaction.TransactionStatus>)
+                    invocation.getArgument(0)).accept(null);
+            return null;
+        }).when(tx).executeWithoutResult(any());
+
+        ScanExecutionService executionService = new ScanExecutionService(
+                jobRepo, findingRepo, true, tx, null, null,
+                10, 6, 15, null, null, zapClient, new ZapScanAdapter(), false, 1);
+        executionService.execute(8L);
+
+        assertEquals(ScanStatus.FAILED, job.getStatus());
+        assertEquals(ScanFailureReason.TIME_BUDGET_EXCEEDED.name(), job.getFailureReason());
+        assertTrue(job.getStatusMessage().contains("did not complete"));
+    }
+
+    private void respond(String path, String content) {
+        zapMockServer.createContext(path, exchange -> {
+            byte[] body = content.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, body.length);
+            try (OutputStream output = exchange.getResponseBody()) {
+                output.write(body);
+            }
+        });
     }
 }

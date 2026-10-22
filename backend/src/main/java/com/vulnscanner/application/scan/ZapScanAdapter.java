@@ -33,10 +33,10 @@ public class ZapScanAdapter {
                 job,
                 bounded(checkType, 64),
                 severity,
-                bounded(component, 2048),
-                bounded(evidence, 1000),
-                bounded(rationale, 1000),
-                bounded(remediation, 1000),
+                bounded(FindingSanitizer.sanitize(component), 2048),
+                bounded(FindingSanitizer.sanitize(evidence), 1000),
+                bounded(FindingSanitizer.sanitize(rationale), 1000),
+                bounded(FindingSanitizer.sanitize(remediation), 1000),
                 "OWASP_ZAP",
                 verificationStatus
         );

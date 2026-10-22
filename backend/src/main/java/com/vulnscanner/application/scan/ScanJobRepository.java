@@ -15,8 +15,16 @@ public interface ScanJobRepository extends JpaRepository<ScanJob, Long> {
     Optional<ScanJob> findByIdAndRequestedBy_Id(Long id, Long requestedById);
 
     @org.springframework.data.jpa.repository.Lock(jakarta.persistence.LockModeType.PESSIMISTIC_WRITE)
+    @org.springframework.data.jpa.repository.EntityGraph(attributePaths = {
+            "target", "target.organization", "organization", "requestedBy",
+            "requestedBy.organization", "requestedBy.roles", "reviewedBy"
+    })
     @org.springframework.data.jpa.repository.Query("SELECT s FROM ScanJob s WHERE s.id = :id")
     Optional<ScanJob> findByIdForExecutionUpdate(
+            @org.springframework.data.repository.query.Param("id") Long id);
+
+    @org.springframework.data.jpa.repository.Query("SELECT s.cancellationRequested FROM ScanJob s WHERE s.id = :id")
+    Optional<Boolean> findCancellationRequestedById(
             @org.springframework.data.repository.query.Param("id") Long id);
 
     @org.springframework.data.jpa.repository.Lock(jakarta.persistence.LockModeType.PESSIMISTIC_WRITE)

@@ -122,6 +122,15 @@ class ScanReportIntegrationTest {
                 "Content-Security-Policy", "Header absent with token Bearer secret-123456", "Rationale", "Add CSP",
                 "PASSIVE_HEADERS", "VERIFIED"));
 
+        scanFindingRepository.save(new ScanFinding(job, "FORMULA_FIXTURE", "LOW",
+                "=HYPERLINK(\"https://attacker.invalid\")", "controlled fixture", "Test fixture", "Review",
+                "TEST", "OBSERVED"));
+        for (int index = 0; index < 30; index++) {
+            scanFindingRepository.save(new ScanFinding(job, "TEST_FINDING_" + index, "LOW",
+                    "component-" + index, "controlled fixture", "Test fixture", "Review",
+                    "TEST", "OBSERVED"));
+        }
+
         String token = login(analyst.getEmail());
 
         // JSON export
@@ -150,6 +159,7 @@ class ScanReportIntegrationTest {
         assertTrue(csvBody.startsWith("# Scan ID,"));
         assertTrue(csvBody.contains("Finding ID,Check Type,Severity"));
         assertTrue(csvBody.contains("MISSING_CONTENT_SECURITY_POLICY"));
+        assertTrue(csvBody.contains("'=HYPERLINK("));
         assertFalse(csvBody.contains("secret-123456"));
 
         // PDF export
@@ -166,6 +176,7 @@ class ScanReportIntegrationTest {
         assertTrue(pdfHeader.startsWith("%PDF-1.4"));
         String pdfTail = new String(pdfBytes, pdfBytes.length - 10, 10, StandardCharsets.ISO_8859_1);
         assertTrue(pdfTail.contains("%%EOF"));
+        assertTrue(new String(pdfBytes, StandardCharsets.ISO_8859_1).contains("PDF summary limit:"));
     }
 
     @Test

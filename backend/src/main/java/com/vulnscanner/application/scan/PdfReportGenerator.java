@@ -76,16 +76,16 @@ public final class PdfReportGenerator {
                 content.append("0 -15 Td\n");
                 content.append("(No vulnerabilities identified for this scan.) Tj\n");
             } else {
+                int includedFindings = 0;
                 for (ScanFindingResponse finding : report.findings()) {
                     if (lineBudget <= 0) {
-                        content.append("0 -15 Td\n");
-                        content.append("(... additional findings truncated in PDF summary view ...) Tj\n");
                         break;
                     }
                     content.append("0 -15 Td\n");
                     content.append(String.format("([%s] %s - Component: %s) Tj\n",
                             escapePdf(finding.severity()), escapePdf(finding.checkType()),
                             escapePdf(truncate(finding.affectedComponent(), 60))));
+                    includedFindings++;
                     lineBudget--;
 
                     if (lineBudget > 0 && finding.remediation() != null && !finding.remediation().isBlank()) {
@@ -94,6 +94,12 @@ public final class PdfReportGenerator {
                                 escapePdf(truncate(finding.remediation(), 80))));
                         lineBudget--;
                     }
+                }
+                int omittedFindings = report.findings().size() - includedFindings;
+                if (omittedFindings > 0) {
+                    content.append("0 -15 Td\n");
+                    content.append(String.format("(PDF summary limit: %d of %d findings shown; %d omitted.) Tj\n",
+                            includedFindings, report.findings().size(), omittedFindings));
                 }
             }
 

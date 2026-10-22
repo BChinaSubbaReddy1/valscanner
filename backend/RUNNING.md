@@ -22,7 +22,9 @@ This will:
 4. Optionally bootstrap a `SUPER_ADMIN` account using
    `INITIAL_SUPER_ADMIN_EMAIL` / `INITIAL_SUPER_ADMIN_PASSWORD`. Both values
    are blank by default; set them through an untracked `.env` file or a
-   deployment secret manager when bootstrap provisioning is required.
+   deployment secret manager when bootstrap provisioning is required. Both must
+   be explicitly set and nonblank; startup fails if an email is configured without
+   a password.
 5. Expose the API on `http://localhost:8080`.
 
 Health check:
@@ -58,11 +60,22 @@ and rejects private or cloud-metadata destinations by default. For a controlled 
 test target only, set `SCANNER_ALLOW_PRIVATE_TARGETS=true`; approval and organization
 authorization are still mandatory.
 
-Active query-parameter checks are bounded by `SCANNER_MAX_DETECTION_REQUESTS` (default
-6) and use `SCANNER_REQUEST_TIMEOUT_SECONDS` (default 15). The crawler budget remains
-`SCANNER_MAX_REQUESTS` (default 10). These checks are limited to same-origin GET query
-parameters; POST bodies, forms, authenticated test accounts, and browser execution are
-not supported.
+`PASSIVE_HEADERS` performs passive checks only and does not send SQL injection or XSS
+test inputs. `ZAP_PASSIVE` and `ZAP_ACTIVE` require the configured ZAP service;
+`ZAP_ACTIVE` never falls back to the native passive scanner. ZAP runs in a temporary
+context restricted to the exact target origin. Spidering is limited to depth 2 and
+10 children per node; active scanning is limited by ZAP rule/scan duration settings,
+10 alerts per rule, a 90-second worker budget, and configured ZAP API timeouts.
+There is no strict aggregate outbound-request-count quota, and live ZAP API behavior
+has not been verified in this environment.
+POST-body, authenticated-account, and browser-execution coverage is not provided by
+the native scanner.
+
+Password-reset endpoints return `503 Service Unavailable` until a delivery integration
+is configured. They do not create or store reset tokens in this configuration.
+NVD keyword lookups are displayed only as low-severity candidates; product/version
+applicability must be verified independently. PDF exports are one-page summaries and
+include the omitted-finding count when the 25-line findings budget is reached.
 
 ## Running without Docker
 
@@ -72,6 +85,9 @@ If you already have MySQL 8 running locally:
 export DB_USERNAME=root
 export DB_PASSWORD=your_password
 export JWT_SECRET=replace_with_a_strong_secret_at_least_32_chars
+# Optional only when intentionally provisioning a new Super Admin:
+export INITIAL_SUPER_ADMIN_EMAIL=admin@example.com
+export INITIAL_SUPER_ADMIN_PASSWORD=use_a_unique_random_password
 mvn spring-boot:run
 ```
 

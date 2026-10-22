@@ -58,6 +58,14 @@ class AuthSecurityIntegrationTest {
     }
 
     @Test
+    void passwordResetEndpointReportsUnavailableWhenDeliveryIsNotConfigured() throws Exception {
+        mockMvc.perform(post("/api/auth/forgot-password")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"user@example.com\"}"))
+                .andExpect(status().isServiceUnavailable());
+    }
+
+    @Test
     void legacyCustomerRoleIsNotProvisionedForNewInstall() {
         org.junit.jupiter.api.Assertions.assertTrue(roleRepository.findByName(RoleName.CUSTOMER).isEmpty());
     }

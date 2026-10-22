@@ -24,6 +24,7 @@ import java.util.regex.Pattern;
 @Service
 public class NvdCveService {
     private static final Logger log = LoggerFactory.getLogger(NvdCveService.class);
+    private static final int MAX_NVD_RESPONSE_BYTES = 2_097_152;
     private static final Pattern SOFTWARE_VERSION_PATTERN =
             Pattern.compile("(?i)^([a-zA-Z0-9_-]+)/(\\d+(?:\\.\\d+)*(?:[a-zA-Z0-9_.-]+)?)$");
 
@@ -33,7 +34,14 @@ public class NvdCveService {
     private final Duration timeout;
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
-    private final Map<String, List<CveMatch>> cache = new ConcurrentHashMap<>();
+    private static final int MAX_CACHE_ENTRIES = 256;
+    private final Map<String, List<CveMatch>> cache = Collections.synchronizedMap(
+            new LinkedHashMap<>(32, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, List<CveMatch>> eldest) {
+                    return size() > MAX_CACHE_ENTRIES;
+                }
+            });
 
     @org.springframework.beans.factory.annotation.Autowired
     public NvdCveService(
@@ -87,7 +95,16 @@ public class NvdCveService {
         }
 
         String cacheKey = (software + ":" + version).toLowerCase(Locale.ROOT);
-        return cache.computeIfAbsent(cacheKey, key -> queryNvd(software, version));
+        List<CveMatch> cached = cache.get(cacheKey);
+        if (cached != null) {
+            return cached;
+        }
+        List<CveMatch> result = queryNvd(software, version);
+        if (result != null) {
+            cache.put(cacheKey, result);
+            return result;
+        }
+        return List.of();
     }
 
     private List<CveMatch> queryNvd(String software, String version) {
@@ -107,36 +124,42 @@ public class NvdCveService {
                 requestBuilder.header("apiKey", apiKey);
             }
 
-            HttpResponse<String> response = httpClient.send(requestBuilder.build(),
-                    HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            HttpResponse<byte[]> response = BoundedHttpResponse.send(
+                    httpClient, requestBuilder.build(), MAX_NVD_RESPONSE_BYTES, timeout);
 
             if (response.statusCode() == 429) {
                 log.warn("NVD API rate limit exceeded (HTTP 429) querying {}:{}", software, version);
-                return List.of();
+                return null;
             }
             if (response.statusCode() >= 500) {
                 log.warn("NVD API service unavailable (HTTP {}) querying {}:{}", response.statusCode(), software, version);
-                return List.of();
+                return null;
             }
             if (response.statusCode() != 200) {
                 log.warn("NVD API query for {}:{} returned unexpected HTTP {}", software, version, response.statusCode());
-                return List.of();
+                return null;
             }
-
-            return parseNvdResponse(response.body(), software, version);
+            String responseBody = new String(response.body(), StandardCharsets.UTF_8);
+            JsonNode responseRoot = objectMapper.readTree(responseBody);
+            if (!responseRoot.path("vulnerabilities").isArray()) {
+                log.warn("NVD API returned an invalid response querying {}:{}", software, version);
+                return null;
+            }
+            return parseNvdResponse(responseBody, software, version);
 
         } catch (HttpTimeoutException exception) {
             log.warn("NVD API request timed out querying {}:{}", software, version);
-            return List.of();
+            return null;
         } catch (IOException | InterruptedException exception) {
             if (exception instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
-            log.warn("NVD API query failed for {}:{}: {}", software, version, exception.getMessage());
-            return List.of();
+            log.warn("NVD API query failed for {}:{} ({})", software, version, exception.getClass().getSimpleName());
+            return null;
         } catch (Exception exception) {
-            log.warn("Unexpected error during NVD query for {}:{}: {}", software, version, exception.getMessage());
-            return List.of();
+            log.warn("Unexpected NVD query failure for {}:{} ({})", software, version,
+                    exception.getClass().getSimpleName());
+            return null;
         }
     }
 

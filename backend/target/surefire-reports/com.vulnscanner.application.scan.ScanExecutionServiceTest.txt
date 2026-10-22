@@ -1,4 +1,0 @@
--------------------------------------------------------------------------------
-Test set: com.vulnscanner.application.scan.ScanExecutionServiceTest
--------------------------------------------------------------------------------
-Tests run: 13, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 2.093 s -- in com.vulnscanner.application.scan.ScanExecutionServiceTest

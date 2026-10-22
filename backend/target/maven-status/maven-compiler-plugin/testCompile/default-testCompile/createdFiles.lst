@@ -1,6 +1,0 @@
-com\vulnscanner\application\TargetManagementIntegrationTest.class
-com\vulnscanner\application\ScanManagementIntegrationTest.class
-com\vulnscanner\application\AuthSecurityIntegrationTest.class
-com\vulnscanner\application\OrganizationManagementIntegrationTest.class
-com\vulnscanner\application\RegistrationApprovalTenantIntegrationTest.class
-com\vulnscanner\application\scan\ScanExecutionServiceTest.class

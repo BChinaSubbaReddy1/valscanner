@@ -23,7 +23,8 @@ public class ScanJob {
             ScanStatus.QUEUED, EnumSet.of(ScanStatus.RUNNING, ScanStatus.CRAWLING, ScanStatus.CANCELLED, ScanStatus.FAILED),
             ScanStatus.CRAWLING, EnumSet.of(ScanStatus.SCANNING, ScanStatus.CANCELLED, ScanStatus.FAILED),
             ScanStatus.SCANNING, EnumSet.of(ScanStatus.COMPLETED, ScanStatus.CANCELLED, ScanStatus.FAILED),
-            ScanStatus.RUNNING, EnumSet.of(ScanStatus.COMPLETED, ScanStatus.CANCELLED, ScanStatus.FAILED),
+            ScanStatus.RUNNING, EnumSet.of(ScanStatus.CRAWLING, ScanStatus.SCANNING,
+                    ScanStatus.COMPLETED, ScanStatus.CANCELLED, ScanStatus.FAILED),
             ScanStatus.COMPLETED, EnumSet.noneOf(ScanStatus.class),
             ScanStatus.FAILED, EnumSet.noneOf(ScanStatus.class),
             ScanStatus.CANCELLED, EnumSet.noneOf(ScanStatus.class),
@@ -134,6 +135,35 @@ public class ScanJob {
         }
         this.progress = nextProgress;
         this.statusMessage = safeMessage;
+    }
+
+    void mergeExecutionState(ScanJob update) {
+        if (EnumSet.of(ScanStatus.COMPLETED, ScanStatus.FAILED, ScanStatus.CANCELLED, ScanStatus.REJECTED)
+                .contains(status)) {
+            return;
+        }
+        if (cancellationRequested && update.status != ScanStatus.CANCELLED) {
+            requestCancellation();
+            if (status != ScanStatus.CANCELLED) {
+                transitionTo(ScanStatus.CANCELLED, progress, "Scan cancelled during execution", null);
+            }
+        } else if (status == update.status) {
+            updateProgress(update.progress, update.statusMessage);
+        } else {
+            ScanFailureReason reason = update.failureReason == null
+                    ? null : ScanFailureReason.valueOf(update.failureReason);
+            transitionTo(update.status, update.progress, update.statusMessage, reason);
+        }
+    }
+
+    void copyExecutionStateFrom(ScanJob source) {
+        status = source.status;
+        progress = source.progress;
+        statusMessage = source.statusMessage;
+        failureReason = source.failureReason;
+        cancellationRequested = source.cancellationRequested;
+        startedAt = source.startedAt;
+        completedAt = source.completedAt;
     }
 
     public void requestCancellation() {

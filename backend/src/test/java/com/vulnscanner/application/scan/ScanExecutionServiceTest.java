@@ -17,11 +17,17 @@ import org.springframework.test.util.ReflectionTestUtils;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.*;
 
@@ -46,6 +52,7 @@ class ScanExecutionServiceTest {
             exchange.getResponseHeaders().add("Content-Type", "text/plain");
             exchange.getResponseHeaders().add("X-Content-Type-Options", "nosniff");
             exchange.getResponseHeaders().add("Referrer-Policy", "no-referrer");
+            exchange.getResponseHeaders().add("Server", "Apache/2.4 token=synthetic-value");
             exchange.getResponseHeaders().add("Set-Cookie", "session=abc; HttpOnly; SameSite=Lax");
             exchange.getResponseHeaders().add("Set-Cookie", "preference=dark mode; SameSite=Lax");
             byte[] body = "controlled".getBytes();
@@ -76,9 +83,9 @@ class ScanExecutionServiceTest {
         ScanExecutionService service = new ScanExecutionService(jobs, findings, true, null);
         service.runClaimed(1L);
 
+        assertEquals(ScanStatus.COMPLETED, job.getStatus(), job.getStatusMessage());
         ArgumentCaptor<ScanFinding> captor = ArgumentCaptor.forClass(ScanFinding.class);
         verify(findings, atLeastOnce()).save(captor.capture());
-        assertEquals(ScanStatus.COMPLETED, job.getStatus());
         assertEquals("MISSING_CONTENT_SECURITY_POLICY", captor.getAllValues().stream()
                 .map(ScanFinding::getCheckType).filter("MISSING_CONTENT_SECURITY_POLICY"::equals)
                 .findFirst().orElseThrow());
@@ -89,6 +96,10 @@ class ScanExecutionServiceTest {
         assertTrue(cookieFinding.getEvidence().contains("preference"));
         assertTrue(!cookieFinding.getEvidence().contains("dark mode"));
         assertTrue(!cookieFinding.getEvidence().contains("abc"));
+        ScanFinding serverFinding = captor.getAllValues().stream()
+                .filter(finding -> "INFORMATION_DISCLOSURE_SERVER".equals(finding.getCheckType()))
+                .findFirst().orElseThrow();
+        assertFalse(serverFinding.getEvidence().contains("synthetic-value"));
         verify(findings, never()).save(argThat(finding ->
                 "MISSING_CONTENT_TYPE_OPTIONS".equals(finding.getCheckType())));
         verify(findings, never()).save(argThat(finding ->
@@ -245,10 +256,107 @@ class ScanExecutionServiceTest {
     }
 
     @Test
-    void detectsSqlErrorsAndPotentialReflectedXssOnlyForAQueryParameter() throws Exception {
+    void appliesRequestDeadlineToResponseBodyAfterHeaders() throws Exception {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/", exchange -> {
+            exchange.sendResponseHeaders(200, 0);
+            try {
+                Thread.sleep(2_000);
+                exchange.getResponseBody().write("late".getBytes(StandardCharsets.UTF_8));
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            } finally {
+                exchange.close();
+            }
+        });
+        server.start();
+
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        ScanFindingRepository findings = mock(ScanFindingRepository.class);
+        Organization organization = approvedOrganization(24L);
+        ScanJob job = approvedJob(organization, approvedTarget(organization,
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/"));
+        when(jobs.findByIdForExecutionUpdate(anyLong())).thenReturn(Optional.of(job));
+
+        ScanExecutionService service = new ScanExecutionService(
+                jobs, findings, true, null, null, null, 10, 6, 1,
+                null, null, null, null, false);
+        long startedAt = System.nanoTime();
+        service.runClaimed(8L);
+
+        assertEquals(ScanStatus.FAILED, job.getStatus());
+        assertEquals(ScanFailureReason.TIME_BUDGET_EXCEEDED.name(), job.getFailureReason());
+        assertTrue(TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - startedAt) < 4);
+    }
+
+    @Test
+    void honorsCancellationRequestedWhileTheTargetBodyIsBeingRead() throws Exception {
+        CountDownLatch requestReceived = new CountDownLatch(1);
+        CountDownLatch finishResponse = new CountDownLatch(1);
+        AtomicBoolean cancellationRequested = new AtomicBoolean(false);
+        AtomicBoolean transactionOpen = new AtomicBoolean(false);
+        AtomicBoolean targetRequestedInsideTransaction = new AtomicBoolean(false);
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            targetRequestedInsideTransaction.set(transactionOpen.get());
+            requestReceived.countDown();
+            try {
+                finishResponse.await(5, TimeUnit.SECONDS);
+                byte[] body = "safe".getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, body.length);
+                exchange.getResponseBody().write(body);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            } finally {
+                exchange.close();
+            }
+        });
+        server.start();
+
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        ScanFindingRepository findings = mock(ScanFindingRepository.class);
+        Organization organization = approvedOrganization(25L);
+        ScanJob job = approvedJob(organization, approvedTarget(organization,
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/"));
+        setId(job, 25L);
+        when(jobs.findByIdForExecutionUpdate(25L)).thenReturn(Optional.of(job));
+        when(jobs.findCancellationRequestedById(25L))
+                .thenAnswer(invocation -> Optional.of(cancellationRequested.get()));
+        org.springframework.transaction.support.TransactionTemplate tx =
+                mock(org.springframework.transaction.support.TransactionTemplate.class);
+        doAnswer(invocation -> {
+            transactionOpen.set(true);
+            try {
+                ((java.util.function.Consumer<org.springframework.transaction.TransactionStatus>)
+                        invocation.getArgument(0)).accept(null);
+            } finally {
+                transactionOpen.set(false);
+            }
+            return null;
+        }).when(tx).executeWithoutResult(any());
+
+        ScanExecutionService service = new ScanExecutionService(
+                jobs, findings, true, tx, null, null, 10, 6, 10,
+                null, null, null, null, false);
+        var worker = java.util.concurrent.CompletableFuture.runAsync(() -> service.execute(25L));
+        assertTrue(requestReceived.await(3, TimeUnit.SECONDS));
+        cancellationRequested.set(true);
+        finishResponse.countDown();
+        worker.get(5, TimeUnit.SECONDS);
+
+        assertEquals(ScanStatus.CANCELLED, job.getStatus());
+        assertFalse(targetRequestedInsideTransaction.get());
+    }
+
+    @Test
+    void passiveHeadersModeNeverSendsSqlInjectionOrXssProbes() throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        List<String> queries = new CopyOnWriteArrayList<>();
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            requests.incrementAndGet();
             String query = exchange.getRequestURI().getRawQuery();
+            queries.add(query == null ? "" : query);
             String decoded = URLDecoder.decode(query == null ? "" : query, StandardCharsets.UTF_8);
             String body;
             if (decoded.contains("' OR '1'='1") || decoded.contains("' OR '1'='2")) {
@@ -276,13 +384,73 @@ class ScanExecutionServiceTest {
         ScanExecutionService service = new ScanExecutionService(jobs, findings, true, null);
         service.runClaimed(5L);
 
+        assertEquals(ScanStatus.COMPLETED, job.getStatus());
+        assertEquals(1, requests.get());
+        assertEquals(List.of("id=1"), queries);
+        verify(findings, never()).save(argThat(finding ->
+                "SQL_INJECTION_SUSPECTED".equals(finding.getCheckType())
+                        || "REFLECTED_XSS_POTENTIAL".equals(finding.getCheckType())));
+    }
+
+    @Test
+    void explicitActiveModeRunsBoundedSqlAndXssChecks() throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            String decoded = URLDecoder.decode(
+                    exchange.getRequestURI().getRawQuery() == null ? ""
+                            : exchange.getRequestURI().getRawQuery(),
+                    StandardCharsets.UTF_8);
+            String body;
+            int status = 200;
+            if (decoded.contains("' OR '1'='1")) {
+                body = "Database error: SQL syntax near query";
+                status = 500;
+            } else if (decoded.contains("vscanxss")) {
+                body = "<html>" + decoded.substring(decoded.indexOf('=') + 1) + "</html>";
+            } else {
+                body = "<html>safe</html>";
+            }
+            byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "text/html");
+            exchange.sendResponseHeaders(status, bytes.length);
+            exchange.getResponseBody().write(bytes);
+            exchange.close();
+        });
+        server.start();
+
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        ScanFindingRepository findings = mock(ScanFindingRepository.class);
+        Organization organization = approvedOrganization(26L);
+        Target target = approvedTarget(organization,
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/?id=1");
+        ScanJob job = approvedJob(organization, target);
+        ReflectionTestUtils.setField(job, "scanType", ScanType.ZAP_ACTIVE);
+        when(jobs.findByIdForExecutionUpdate(anyLong())).thenReturn(Optional.of(job));
+        ZapClientService zap = mock(ZapClientService.class);
+        when(zap.isAvailable()).thenReturn(true);
+        when(zap.createTargetContext(any(), anyString()))
+                .thenReturn(new ZapClientService.ScopeContext("test-context", "1"));
+        when(zap.startSpider(anyString(), anyString())).thenReturn("spider-1");
+        when(zap.getSpiderProgress("spider-1")).thenReturn(100);
+        when(zap.startActiveScan(anyString(), any())).thenReturn("active-1");
+        when(zap.getActiveScanProgress("active-1")).thenReturn(100);
+        when(zap.getAlerts(anyString())).thenReturn(List.of());
+
+        ScanExecutionService service = new ScanExecutionService(
+                jobs, findings, true, null, null, null, 10, 6, 5,
+                null, null, zap, new ZapScanAdapter(), false);
+        service.runClaimed(26L);
+
+        assertEquals(ScanStatus.COMPLETED, job.getStatus(), job.getStatusMessage());
         ArgumentCaptor<ScanFinding> captor = ArgumentCaptor.forClass(ScanFinding.class);
         verify(findings, atLeastOnce()).save(captor.capture());
-        assertEquals(ScanStatus.COMPLETED, job.getStatus());
         assertTrue(captor.getAllValues().stream()
                 .anyMatch(finding -> "SQL_INJECTION_SUSPECTED".equals(finding.getCheckType())));
         assertTrue(captor.getAllValues().stream()
                 .anyMatch(finding -> "REFLECTED_XSS_POTENTIAL".equals(finding.getCheckType())));
+        assertEquals(4, requests.get());
     }
 
     @Test
@@ -313,7 +481,7 @@ class ScanExecutionServiceTest {
     }
 
     @Test
-    void capsAdditionalDetectionRequestsWithoutFailingTheScan() throws Exception {
+    void passiveHeadersScanUsesOnlyTheCrawlRequestBudget() throws Exception {
         AtomicInteger requests = new AtomicInteger();
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/", exchange -> {
@@ -336,7 +504,7 @@ class ScanExecutionServiceTest {
         new ScanExecutionService(jobs, findings, true, null).runClaimed(7L);
 
         assertEquals(ScanStatus.COMPLETED, job.getStatus());
-        assertEquals(7, requests.get());
+        assertEquals(1, requests.get());
     }
 
     @Test
@@ -465,14 +633,14 @@ class ScanExecutionServiceTest {
         ArgumentCaptor<ScanFinding> captor = ArgumentCaptor.forClass(ScanFinding.class);
         verify(findings, atLeastOnce()).save(captor.capture());
         ScanFinding cveFinding = captor.getAllValues().stream()
-                .filter(f -> "KNOWN_VULNERABILITY_CVE".equals(f.getCheckType()))
+                .filter(f -> "CVE_KEYWORD_CANDIDATE".equals(f.getCheckType()))
                 .findFirst().orElseThrow();
-
-        assertEquals("HIGH", cveFinding.getSeverity());
+        assertEquals("LOW", cveFinding.getSeverity());
         assertEquals("NVD_CVE_LOOKUP", cveFinding.getDetectionSource());
         assertEquals("POTENTIAL", cveFinding.getVerificationStatus());
         assertTrue(cveFinding.getEvidence().contains("CVE-2021-41773"));
-        assertTrue(cveFinding.getEvidence().contains("CVSS score: 7.5"));
+        assertTrue(cveFinding.getEvidence().contains("Product and version applicability are not verified"));
+        assertTrue(cveFinding.getEvidence().contains("NVD CVSS: 7.5"));
         assertTrue(cveFinding.getEvidence().contains("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"));
     }
 

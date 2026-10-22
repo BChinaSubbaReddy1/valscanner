@@ -40,7 +40,7 @@ public class AuthController {
     public ResponseEntity<ApiResponse<String>> forgotPassword(@Valid @RequestBody ForgotPasswordRequest request) {
         authService.requestPasswordReset(request);
         // Always return the same message to avoid account enumeration
-        return ResponseEntity.ok(ApiResponse.success("If the account exists, a reset link has been sent.", null));
+        return ResponseEntity.ok(ApiResponse.success("Password reset is unavailable because delivery is not configured.", null));
     }
 
     @PostMapping("/reset-password")

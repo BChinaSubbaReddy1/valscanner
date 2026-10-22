@@ -1,4 +1,0 @@
--------------------------------------------------------------------------------
-Test set: com.vulnscanner.application.RegistrationApprovalTenantIntegrationTest
--------------------------------------------------------------------------------
-Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 5.316 s -- in com.vulnscanner.application.RegistrationApprovalTenantIntegrationTest

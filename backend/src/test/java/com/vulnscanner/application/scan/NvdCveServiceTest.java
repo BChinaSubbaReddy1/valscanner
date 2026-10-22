@@ -7,7 +7,10 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
@@ -94,10 +97,8 @@ class NvdCveServiceTest {
     @Test
     void handlesRateLimitGracefullyWithoutThrowing() throws Exception {
         HttpClient client = mock(HttpClient.class);
-        @SuppressWarnings("unchecked")
-        HttpResponse<String> response = (HttpResponse<String>) mock(HttpResponse.class);
-        when(response.statusCode()).thenReturn(429);
-        doReturn(response).when(client).send(any(), any());
+        HttpResponse<byte[]> response = response(429, "");
+        whenSend(client, CompletableFuture.completedFuture(response));
 
         NvdCveService service = new NvdCveService(
                 "https://services.nvd.nist.gov/rest/json/cves/2.0", "", true, 5, objectMapper, client);
@@ -109,7 +110,7 @@ class NvdCveServiceTest {
     @Test
     void handlesServiceUnavailableAndTimeoutGracefully() throws Exception {
         HttpClient client = mock(HttpClient.class);
-        doThrow(new HttpTimeoutException("Connection timed out")).when(client).send(any(), any());
+        whenSend(client, CompletableFuture.failedFuture(new HttpTimeoutException("Connection timed out")));
 
         NvdCveService service = new NvdCveService(
                 "https://services.nvd.nist.gov/rest/json/cves/2.0", "", true, 5, objectMapper, client);
@@ -121,11 +122,8 @@ class NvdCveServiceTest {
     @Test
     void cachesSuccessfulLookupsToPreventRedundantOutboundRequests() throws Exception {
         HttpClient client = mock(HttpClient.class);
-        @SuppressWarnings("unchecked")
-        HttpResponse<String> response = (HttpResponse<String>) mock(HttpResponse.class);
-        when(response.statusCode()).thenReturn(200);
-        when(response.body()).thenReturn("{\"vulnerabilities\": []}");
-        doReturn(response).when(client).send(any(), any());
+        HttpResponse<byte[]> response = response(200, "{\"vulnerabilities\": []}");
+        whenSend(client, CompletableFuture.completedFuture(response));
 
         NvdCveService service = new NvdCveService(
                 "https://services.nvd.nist.gov/rest/json/cves/2.0", "", true, 5, objectMapper, client);
@@ -134,6 +132,54 @@ class NvdCveServiceTest {
         List<CveMatch> second = service.findCves("nginx", "1.18.0");
 
         assertSame(first, second);
-        verify(client, times(1)).send(any(), any());
+        verify(client, times(1)).sendAsync(any(), any());
+    }
+
+    @Test
+    void doesNotCacheRateLimitedResponses() throws Exception {
+        HttpClient client = mock(HttpClient.class);
+        HttpResponse<byte[]> rateLimited = response(429, "");
+        HttpResponse<byte[]> recovered = response(200, "{\"vulnerabilities\": []}");
+        whenSend(client, CompletableFuture.completedFuture(rateLimited),
+                CompletableFuture.completedFuture(recovered));
+
+        NvdCveService service = new NvdCveService(
+                "https://services.nvd.nist.gov/rest/json/cves/2.0", "", true, 5, objectMapper, client);
+
+        assertTrue(service.findCves("Apache", "2.4.49").isEmpty());
+        assertTrue(service.findCves("Apache", "2.4.49").isEmpty());
+
+        verify(client, times(2)).sendAsync(any(), any());
+    }
+
+    @Test
+    void boundsSuccessfulResponseCache() throws Exception {
+        HttpClient client = mock(HttpClient.class);
+        HttpResponse<byte[]> response = response(200, "{\"vulnerabilities\": []}");
+        whenSend(client, CompletableFuture.completedFuture(response));
+
+        NvdCveService service = new NvdCveService(
+                "https://services.nvd.nist.gov/rest/json/cves/2.0", "", true, 5, objectMapper, client);
+        for (int index = 0; index < 257; index++) {
+            service.findCves("software" + index, "1.0");
+        }
+        service.findCves("software0", "1.0");
+
+        verify(client, times(258)).sendAsync(any(), any());
+    }
+
+    private HttpResponse<byte[]> response(int status, String body) {
+        @SuppressWarnings("unchecked")
+        HttpResponse<byte[]> response = (HttpResponse<byte[]>) mock(HttpResponse.class);
+        when(response.statusCode()).thenReturn(status);
+        when(response.body()).thenReturn(body.getBytes(StandardCharsets.UTF_8));
+        return response;
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private void whenSend(HttpClient client, CompletableFuture<HttpResponse<byte[]>>... responses) {
+        AtomicInteger responseIndex = new AtomicInteger();
+        doAnswer(invocation -> responses[Math.min(responseIndex.getAndIncrement(), responses.length - 1)])
+                .when(client).sendAsync(any(), any());
     }
 }

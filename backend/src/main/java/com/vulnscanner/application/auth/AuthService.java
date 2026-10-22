@@ -8,42 +8,35 @@ import com.vulnscanner.application.organization.OrganizationRepository;
 import com.vulnscanner.application.role.RoleName;
 import com.vulnscanner.application.security.JwtService;
 import com.vulnscanner.application.role.RoleRepository;
-import com.vulnscanner.application.user.PasswordResetToken;
-import com.vulnscanner.application.user.PasswordResetTokenRepository;
 import com.vulnscanner.application.user.User;
 import com.vulnscanner.application.user.UserRepository;
 import com.vulnscanner.application.user.UserStatus;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.server.ResponseStatusException;
 
-import java.security.SecureRandom;
-import java.time.Instant;
-import java.util.Base64;
 import java.util.Locale;
 import java.util.Set;
 
 @Service
 public class AuthService {
-    private static final int RESET_TOKEN_TTL_MINUTES = 30;
     private final AuthenticationManager authenticationManager;
     private final UserRepository userRepository;
     private final PasswordEncoder passwordEncoder;
     private final RoleRepository roleRepository;
     private final OrganizationRepository organizationRepository;
-    private final PasswordResetTokenRepository resetTokenRepository;
     private final AuditEventRepository auditEventRepository;
     private final JwtService jwtService;
-    private final SecureRandom secureRandom = new SecureRandom();
 
     public AuthService(AuthenticationManager authenticationManager,
                        UserRepository userRepository,
                        PasswordEncoder passwordEncoder,
                        RoleRepository roleRepository,
                        OrganizationRepository organizationRepository,
-                       PasswordResetTokenRepository resetTokenRepository,
                        AuditEventRepository auditEventRepository,
                        JwtService jwtService) {
         this.authenticationManager = authenticationManager;
@@ -51,7 +44,6 @@ public class AuthService {
         this.passwordEncoder = passwordEncoder;
         this.roleRepository = roleRepository;
         this.organizationRepository = organizationRepository;
-        this.resetTokenRepository = resetTokenRepository;
         this.auditEventRepository = auditEventRepository;
         this.jwtService = jwtService;
     }
@@ -163,45 +155,16 @@ public class AuthService {
 
     @Transactional
     public void requestPasswordReset(ForgotPasswordRequest request) {
-        userRepository.findByEmail(request.email().trim().toLowerCase(Locale.ROOT)).ifPresent(user -> {
-            resetTokenRepository.deleteByUser(user);
-            String rawToken = generateToken();
-            PasswordResetToken token = new PasswordResetToken(rawToken, user, Instant.now().plusSeconds(RESET_TOKEN_TTL_MINUTES * 60L));
-            resetTokenRepository.save(token);
-            AuditEvent event = new AuditEvent();
-            event.setEventType("PASSWORD_RESET_REQUESTED");
-            event.setEventLevel("INFO");
-            event.setTargetUser(user);
-            event.setMessage("Password reset requested for user " + user.getEmail());
-            auditEventRepository.save(event);
-        });
+        throw passwordResetUnavailable();
     }
 
     @Transactional
     public void resetPassword(ResetPasswordRequest request) {
-        PasswordResetToken tokenEntity = resetTokenRepository.findByToken(request.token())
-                .orElseThrow(() -> new IllegalArgumentException("Invalid or expired reset token"));
-        if (tokenEntity.isUsed() || tokenEntity.getExpiryTime().isBefore(Instant.now())) {
-            throw new IllegalArgumentException("Invalid or expired reset token");
-        }
-
-        User user = tokenEntity.getUser();
-        user.setPassword(passwordEncoder.encode(request.password()));
-        userRepository.save(user);
-        tokenEntity.setUsed(true);
-        resetTokenRepository.save(tokenEntity);
-
-        AuditEvent event = new AuditEvent();
-        event.setEventType("PASSWORD_RESET_COMPLETED");
-        event.setEventLevel("INFO");
-        event.setTargetUser(user);
-        event.setMessage("Password reset completed for user " + user.getEmail());
-        auditEventRepository.save(event);
+        throw passwordResetUnavailable();
     }
 
-    private String generateToken() {
-        byte[] bytes = new byte[32];
-        secureRandom.nextBytes(bytes);
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    private ResponseStatusException passwordResetUnavailable() {
+        return new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+                "Password reset delivery is not configured");
     }
 }
