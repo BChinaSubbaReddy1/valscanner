@@ -1,0 +1,3 @@
+# Local configuration and diagnostic logs
+/frontend/.env
+/backend/security-trace.log

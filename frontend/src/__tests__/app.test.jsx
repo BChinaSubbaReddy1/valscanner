@@ -77,6 +77,31 @@ describe('Authentication, Access Control and IAM Views', () => {
     });
   });
 
+  it('does not send a stored bearer token with public registration requests', async () => {
+    localStorage.setItem('scanner-auth-session', JSON.stringify({
+      token: 'expired-token',
+      user: { roles: ['ADMIN'] },
+    }));
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 201,
+      headers: { get: () => 'application/json' },
+      json: async () => ({ success: true, data: { email: 'admin@example.com' } }),
+    });
+
+    await client.authApi.register({
+      firstName: 'Jordan',
+      lastName: 'Admin',
+      email: 'admin@example.com',
+      password: 'LongPassword123',
+      role: 'ADMIN',
+      organizationName: 'Northstar',
+    });
+
+    expect(fetchSpy.mock.calls[0][1].headers.has('Authorization')).toBe(false);
+    expect(localStorage.getItem('scanner-auth-session')).not.toBeNull();
+  });
+
   it('uses backend organization and membership decision routes', async () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
       ok: true,

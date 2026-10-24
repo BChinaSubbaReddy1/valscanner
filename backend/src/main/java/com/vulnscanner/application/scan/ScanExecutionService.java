@@ -34,6 +34,8 @@ public class ScanExecutionService {
     private final ScanJobRepository scanJobRepository;
     private final ScanFindingRepository findingRepository;
     private final boolean allowPrivateTargets;
+    @Value("${scanner.allowed-private-target-origins:}")
+    private String allowedPrivateTargetOrigins = "";
     private final TransactionTemplate transactionTemplate;
     private final AuditEventRepository auditEventRepository;
     private final ScanCrawlPageRepository crawlPageRepository;
@@ -152,6 +154,9 @@ public class ScanExecutionService {
         this.zapFallbackToNative = zapFallbackToNative;
         this.zapMaxDuration = Duration.ofSeconds(requirePositive(zapMaxDurationSeconds,
                 "scanner.zap.max-duration-seconds"));
+        if (httpClient != null && httpClient.followRedirects() != HttpClient.Redirect.NEVER) {
+            throw new IllegalArgumentException("Scanner HTTP client must not follow redirects");
+        }
         this.httpClient = httpClient != null ? httpClient : HttpClient.newBuilder()
                 .version(HttpClient.Version.HTTP_1_1)
                 .connectTimeout(this.requestTimeout)
@@ -545,7 +550,7 @@ public class ScanExecutionService {
         }
     }
 
-    private void validateResolvedAddresses(URI uri, Map<String, Set<String>> resolvedAddressesByHost)
+    void validateResolvedAddresses(URI uri, Map<String, Set<String>> resolvedAddressesByHost)
             throws IOException, UnknownHostException, ScanExecutionException {
         if (!"http".equalsIgnoreCase(uri.getScheme()) && !"https".equalsIgnoreCase(uri.getScheme())) {
             throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID, "Only HTTP and HTTPS targets are supported");
@@ -556,8 +561,10 @@ public class ScanExecutionService {
         }
         InetAddress[] addresses = InetAddress.getAllByName(uri.getHost());
         Set<String> resolvedAddresses = new HashSet<>();
+        boolean explicitlyAllowedPrivateTarget = isAllowedPrivateTargetOrigin(uri);
         for (InetAddress address : addresses) {
-            if (isCloudMetadata(address) || (!allowPrivateTargets && isPrivate(address))) {
+            if (isCloudMetadata(address) ||
+                    (!allowPrivateTargets && isPrivate(address) && !explicitlyAllowedPrivateTarget)) {
                 throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID,
                         "Target resolves to a disallowed network address");
             }
@@ -571,11 +578,60 @@ public class ScanExecutionService {
         }
     }
 
-    private boolean isCloudMetadata(InetAddress address) {
-        String hostAddress = address.getHostAddress();
-        return "169.254.169.254".equals(hostAddress)
-                || "169.254.170.2".equals(hostAddress)
-                || "fd00:ec2::254".equalsIgnoreCase(hostAddress);
+    private boolean isAllowedPrivateTargetOrigin(URI target) {
+        if (allowedPrivateTargetOrigins == null || allowedPrivateTargetOrigins.isBlank()) {
+            return false;
+        }
+        int targetPort = target.getPort() == -1
+                ? ("https".equalsIgnoreCase(target.getScheme()) ? 443 : 80)
+                : target.getPort();
+        boolean matchesTarget = false;
+        for (String configuredOrigin : allowedPrivateTargetOrigins.split(",")) {
+            if (configuredOrigin.isBlank()) {
+                continue;
+            }
+            URI allowedOrigin;
+            try {
+                allowedOrigin = URI.create(configuredOrigin.trim());
+            } catch (IllegalArgumentException exception) {
+                throw new IllegalStateException("Invalid scanner.allowed-private-target-origins entry", exception);
+            }
+            String allowedScheme = allowedOrigin.getScheme();
+            int configuredPort = allowedOrigin.getPort();
+            if (!allowedOrigin.isAbsolute() || allowedOrigin.getHost() == null ||
+                    allowedOrigin.getRawUserInfo() != null ||
+                    (allowedOrigin.getRawPath() != null && !allowedOrigin.getRawPath().isEmpty()
+                            && !"/".equals(allowedOrigin.getRawPath())) ||
+                    allowedOrigin.getRawQuery() != null || allowedOrigin.getRawFragment() != null ||
+                    (configuredPort != -1 && (configuredPort < 1 || configuredPort > 65535)) ||
+                    (!"http".equalsIgnoreCase(allowedScheme) && !"https".equalsIgnoreCase(allowedScheme))) {
+                throw new IllegalStateException(
+                        "scanner.allowed-private-target-origins entries must be HTTP(S) origins");
+            }
+            int allowedPort = allowedOrigin.getPort() == -1
+                    ? ("https".equalsIgnoreCase(allowedScheme) ? 443 : 80)
+                    : allowedOrigin.getPort();
+            if (target.getScheme().equalsIgnoreCase(allowedScheme) &&
+                    target.getHost().equalsIgnoreCase(allowedOrigin.getHost()) &&
+                    targetPort == allowedPort) {
+                matchesTarget = true;
+            }
+        }
+        return matchesTarget;
+    }
+
+    boolean isCloudMetadata(InetAddress address) {
+        byte[] bytes = address.getAddress();
+        if (bytes.length == 4) {
+            return (bytes[0] & 0xff) == 169 && (bytes[1] & 0xff) == 254
+                    && (((bytes[2] & 0xff) == 169 && (bytes[3] & 0xff) == 254)
+                    || ((bytes[2] & 0xff) == 170 && (bytes[3] & 0xff) == 2));
+        }
+        byte[] ipv6MetadataAddress = {
+                (byte) 0xfd, 0x00, 0x0e, (byte) 0xc2,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02, 0x54
+        };
+        return Arrays.equals(bytes, ipv6MetadataAddress);
     }
 
     private boolean isPrivate(InetAddress address) {
@@ -1038,7 +1094,7 @@ public class ScanExecutionService {
         }
     }
 
-    private static final class ScanExecutionException extends Exception {
+    static final class ScanExecutionException extends Exception {
         private final ScanFailureReason reason;
         private ScanExecutionException(ScanFailureReason reason, String message) {
             super(message);

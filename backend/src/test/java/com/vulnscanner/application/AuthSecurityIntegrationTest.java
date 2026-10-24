@@ -3,6 +3,8 @@ package com.vulnscanner.application;
 import com.vulnscanner.application.organization.*;
 import com.vulnscanner.application.role.*;
 import com.vulnscanner.application.user.*;
+import jakarta.servlet.DispatcherType;
+import jakarta.servlet.RequestDispatcher;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -55,6 +57,49 @@ class AuthSecurityIntegrationTest {
     void unauthenticatedRequestsAreRejected() throws Exception {
         mockMvc.perform(get("/api/users/me"))
                 .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void registrationIsPublicAndIgnoresStaleBearerTokensWithoutOpeningProtectedRoutes() throws Exception {
+        mockMvc.perform(post("/api/auth/register")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isBadRequest());
+
+        mockMvc.perform(post("/api/auth/register")
+                        .header("Authorization", "Bearer stale-invalid-token")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isBadRequest());
+
+        mockMvc.perform(post("/api/auth/register")
+                        .header("Authorization", "Bearer stale-invalid-token")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"firstName":"Public","lastName":"Applicant",
+                                 "email":"public-applicant@example.com","password":"SecurePassword123!",
+                                 "role":"ADMIN","organizationName":"Public Applicant Organization"}
+                                """))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.email").value("public-applicant@example.com"));
+
+        mockMvc.perform(get("/api/auth/register"))
+                .andExpect(status().isUnauthorized());
+
+        mockMvc.perform(get("/api/users/me")
+                        .header("Authorization", "Bearer stale-invalid-token"))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void anonymousErrorDispatchReturnsOriginalValidationStatusInsteadOfUnauthorized() throws Exception {
+        mockMvc.perform(get("/error").with(request -> {
+                    request.setDispatcherType(DispatcherType.ERROR);
+                    request.setAttribute(RequestDispatcher.ERROR_STATUS_CODE, 400);
+                    request.setAttribute(RequestDispatcher.ERROR_REQUEST_URI, "/api/auth/register");
+                    return request;
+                }))
+                .andExpect(status().isBadRequest());
     }
 
     @Test

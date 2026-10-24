@@ -15,6 +15,8 @@ import org.mockito.ArgumentCaptor;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.http.HttpClient;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -28,6 +30,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.*;
 
@@ -80,7 +83,9 @@ class ScanExecutionServiceTest {
         job.approve(analyst);
         when(jobs.findByIdForExecutionUpdate(anyLong())).thenReturn(Optional.of(job));
 
-        ScanExecutionService service = new ScanExecutionService(jobs, findings, true, null);
+        ScanExecutionService service = new ScanExecutionService(jobs, findings, false, null);
+        ReflectionTestUtils.setField(service, "allowedPrivateTargetOrigins",
+                "HTTP://127.0.0.1:" + server.getAddress().getPort());
         service.runClaimed(1L);
 
         assertEquals(ScanStatus.COMPLETED, job.getStatus(), job.getStatusMessage());
@@ -194,7 +199,68 @@ class ScanExecutionServiceTest {
     }
 
     @Test
-    void doesNotFollowRedirectsToAnotherOrigin() throws Exception {
+    void privateTargetAllowlistRequiresExactOriginPort() {
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        ScanFindingRepository findings = mock(ScanFindingRepository.class);
+        Organization organization = approvedOrganization(20L);
+        Target target = approvedTarget(organization, "http://127.0.0.1:1/");
+        ScanJob job = approvedJob(organization, target);
+        when(jobs.findByIdForExecutionUpdate(anyLong())).thenReturn(Optional.of(job));
+
+        ScanExecutionService service = new ScanExecutionService(jobs, findings, false, null);
+        ReflectionTestUtils.setField(service, "allowedPrivateTargetOrigins", "http://127.0.0.1:2");
+        service.runClaimed(4L);
+
+        assertEquals(ScanStatus.FAILED, job.getStatus());
+        verify(findings, never()).save(any());
+    }
+
+    @Test
+    void rejectsInvalidPrivateTargetOriginConfiguration() {
+        ScanExecutionService service = new ScanExecutionService(
+                mock(ScanJobRepository.class), mock(ScanFindingRepository.class), false, null);
+        ReflectionTestUtils.setField(service, "allowedPrivateTargetOrigins", "http://127.0.0.1:99999");
+
+        assertThrows(IllegalStateException.class, () -> service.validateResolvedAddresses(
+                URI.create("http://127.0.0.1:8080/"), new java.util.HashMap<>()));
+    }
+
+    @Test
+    void rejectsChangedDnsResolutionDuringScan() {
+        ScanExecutionService service = new ScanExecutionService(
+                mock(ScanJobRepository.class), mock(ScanFindingRepository.class), false, null);
+        ReflectionTestUtils.setField(service, "allowedPrivateTargetOrigins", "http://127.0.0.1:8080");
+        java.util.Map<String, java.util.Set<String>> priorResolution = new java.util.HashMap<>();
+        priorResolution.put("127.0.0.1", java.util.Set.of("192.0.2.1"));
+
+        assertThrows(ScanExecutionService.ScanExecutionException.class,
+                () -> service.validateResolvedAddresses(
+                        URI.create("http://127.0.0.1:8080/"), priorResolution));
+    }
+
+    @Test
+    void rejectsCloudMetadataAddressesEvenWhenPrivateTargetsAreAllowed() throws Exception {
+        ScanExecutionService service = new ScanExecutionService(
+                mock(ScanJobRepository.class), mock(ScanFindingRepository.class), true, null);
+
+        assertTrue(service.isCloudMetadata(java.net.InetAddress.getByName("169.254.169.254")));
+        assertTrue(service.isCloudMetadata(java.net.InetAddress.getByName("169.254.170.2")));
+        assertTrue(service.isCloudMetadata(java.net.InetAddress.getByName("fd00:ec2:0:0:0:0:0:254")));
+    }
+
+    @Test
+    void rejectsHttpClientsConfiguredToFollowRedirects() {
+        HttpClient redirectingClient = HttpClient.newBuilder()
+                .followRedirects(HttpClient.Redirect.ALWAYS)
+                .build();
+
+        assertThrows(IllegalArgumentException.class, () -> new ScanExecutionService(
+                mock(ScanJobRepository.class), mock(ScanFindingRepository.class), false,
+                null, null, null, 10, 6, 15, redirectingClient, null));
+    }
+
+    @Test
+    void doesNotFollowRedirectsToUnapprovedPrivateOrigin() throws Exception {
         AtomicInteger redirectedRequests = new AtomicInteger();
         secondaryServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         secondaryServer.createContext("/", exchange -> {
@@ -223,7 +289,10 @@ class ScanExecutionServiceTest {
         ScanJob job = approvedJob(organization, target);
         when(jobs.findByIdForExecutionUpdate(anyLong())).thenReturn(Optional.of(job));
 
-        new ScanExecutionService(jobs, findings, true, null).runClaimed(8L);
+        ScanExecutionService service = new ScanExecutionService(jobs, findings, false, null);
+        ReflectionTestUtils.setField(service, "allowedPrivateTargetOrigins",
+                "http://127.0.0.1:" + server.getAddress().getPort());
+        service.runClaimed(8L);
 
         assertEquals(ScanStatus.COMPLETED, job.getStatus());
         assertEquals(0, redirectedRequests.get());

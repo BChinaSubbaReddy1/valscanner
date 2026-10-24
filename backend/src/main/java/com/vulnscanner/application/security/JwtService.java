@@ -11,6 +11,7 @@ import io.jsonwebtoken.security.Keys;
 import jakarta.annotation.PostConstruct;
 import org.springframework.stereotype.Service;
 
+import java.nio.charset.StandardCharsets;
 import java.security.Key;
 import java.time.Instant;
 import java.util.Date;
@@ -33,7 +34,11 @@ public class JwtService {
         if (properties.getSecret() == null || properties.getSecret().isBlank()) {
             throw new IllegalStateException("JWT secret must be configured");
         }
-        this.signingKey = Keys.hmacShaKeyFor(properties.getSecret().getBytes());
+        byte[] secretBytes = properties.getSecret().getBytes(StandardCharsets.UTF_8);
+        if (secretBytes.length < 32) {
+            throw new IllegalStateException("JWT secret must be at least 32 UTF-8 bytes for HS256");
+        }
+        this.signingKey = Keys.hmacShaKeyFor(secretBytes);
     }
 
     public String generateToken(User user) {

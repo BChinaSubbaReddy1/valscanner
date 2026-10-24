@@ -1,6 +1,6 @@
 const STORAGE_KEY = 'scanner-auth-session';
 
-export const BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8080';
+export const BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:1080';
 
 function readSession() {
   try {
@@ -35,32 +35,35 @@ function parseResponse(response) {
 }
 
 export async function apiRequest(endpoint, options = {}) {
-  const session = readSession();
-  const headers = new Headers(options.headers || {});
+  const { skipAuth = false, ...requestOptions } = options;
+  const session = skipAuth ? null : readSession();
+  const headers = new Headers(requestOptions.headers || {});
   const requestInit = {
-    ...options,
-    credentials: options.credentials ?? 'include',
+    ...requestOptions,
+    credentials: requestOptions.credentials ?? 'include',
     headers,
   };
 
-  if (!(options.body instanceof FormData) && !(options.body instanceof URLSearchParams)) {
-    if (!headers.has('Content-Type') && typeof options.body !== 'undefined') {
+  if (!(requestOptions.body instanceof FormData) && !(requestOptions.body instanceof URLSearchParams)) {
+    if (!headers.has('Content-Type') && typeof requestOptions.body !== 'undefined') {
       headers.set('Content-Type', 'application/json');
     }
   }
 
-  if (session?.token && !headers.has('Authorization')) {
+  if (skipAuth) {
+    headers.delete('Authorization');
+  } else if (session?.token && !headers.has('Authorization')) {
     headers.set('Authorization', `Bearer ${session.token}`);
   }
 
   if (
-    options.body &&
-    typeof options.body !== 'string' &&
-    !(options.body instanceof FormData) &&
-    !(options.body instanceof URLSearchParams) &&
-    !(options.body instanceof Blob)
+    requestOptions.body &&
+    typeof requestOptions.body !== 'string' &&
+    !(requestOptions.body instanceof FormData) &&
+    !(requestOptions.body instanceof URLSearchParams) &&
+    !(requestOptions.body instanceof Blob)
   ) {
-    requestInit.body = JSON.stringify(options.body);
+    requestInit.body = JSON.stringify(requestOptions.body);
   }
 
   let response;
@@ -107,6 +110,7 @@ export const authApi = {
     return apiRequest('/api/auth/login', {
       method: 'POST',
       body: { email: credentials.email, password: credentials.password },
+      skipAuth: true,
     });
   },
 
@@ -114,6 +118,7 @@ export const authApi = {
     return apiRequest('/api/auth/register', {
       method: 'POST',
       body: payload,
+      skipAuth: true,
     });
   },
 
@@ -121,6 +126,7 @@ export const authApi = {
     return apiRequest('/api/auth/forgot-password', {
       method: 'POST',
       body: payload,
+      skipAuth: true,
     });
   },
 
@@ -128,6 +134,7 @@ export const authApi = {
     return apiRequest('/api/auth/reset-password', {
       method: 'POST',
       body: payload,
+      skipAuth: true,
     });
   },
 

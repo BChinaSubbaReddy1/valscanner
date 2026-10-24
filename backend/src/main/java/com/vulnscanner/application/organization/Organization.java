@@ -26,6 +26,9 @@ public class Organization {
     @Column(nullable = false, length = 32)
     private OrganizationStatus status = OrganizationStatus.PENDING;
 
+    @Column(nullable = false, updatable = false)
+    private boolean active;
+
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "approved_by_user_id")
     private User approvedBy;

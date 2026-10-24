@@ -14,7 +14,19 @@ import java.util.List;
 
 public interface UserRepository extends JpaRepository<User, Long> {
     Optional<User> findByEmail(String email);
+    Optional<User> findByEmailIgnoreCase(String email);
     boolean existsByEmail(String email);
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT u FROM User u WHERE u.email = :email")
+    Optional<User> findByEmailForUpdate(@Param("email") String email);
+
+    @Modifying(flushAutomatically = true, clearAutomatically = true)
+    @Query("UPDATE User u SET u.email = :email, u.password = :password WHERE u.id = :id")
+    int updateEmailAndPassword(@Param("id") Long id,
+                               @Param("email") String email,
+                               @Param("password") String password);
+
     List<User> findByOrganization_IdAndStatus(Long organizationId, UserStatus status);
 
     @Query("""

@@ -84,12 +84,36 @@ If you already have MySQL 8 running locally:
 ```bash
 export DB_USERNAME=root
 export DB_PASSWORD=your_password
-export JWT_SECRET=replace_with_a_strong_secret_at_least_32_chars
+export JWT_SECRET=your_persistent_random_secret
 # Optional only when intentionally provisioning a new Super Admin:
 export INITIAL_SUPER_ADMIN_EMAIL=admin@example.com
 export INITIAL_SUPER_ADMIN_PASSWORD=use_a_unique_random_password
 mvn spring-boot:run
 ```
+
+On Windows PowerShell, generate a strong key once and persist it in your user
+environment before starting the backend:
+
+```powershell
+$bytes = New-Object byte[] 32
+$rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+$jwtSecret = [Convert]::ToBase64String($bytes)
+[Environment]::SetEnvironmentVariable('JWT_SECRET', $jwtSecret, 'User')
+$env:JWT_SECRET = $jwtSecret
+
+$env:DB_USERNAME = 'root'
+$env:DB_PASSWORD = 'your_mysql_password'
+mvn spring-boot:run
+```
+
+The application uses the `app.security.jwt.secret` property, supplied by the
+`JWT_SECRET` environment variable. Its current HS256 implementation treats the
+value as literal UTF-8 bytes; it does not Base64-decode it. The generated
+Base64-encoded random key is therefore used as a stable 44-byte UTF-8 string.
+Keep the same value across restarts to preserve validation of unexpired tokens.
+The user-scoped environment variable is available in newly opened terminals;
+do not generate a new key on each start or commit it to the repository.
 
 Make sure a `scanner` database exists (or change
 `spring.datasource.url` in `src/main/resources/application.properties`);
@@ -121,6 +145,28 @@ mvn test
 
 This uses the H2 in-memory database (`src/test/resources/application-test.yml`),
 which is why it doesn't need MySQL installed.
+
+## Recovering existing local accounts
+
+The dedicated recovery utility updates the existing Super Admin, Lab
+Organization Admin, and Docker Organization Admin accounts in one transaction.
+It changes only each account's email and BCrypt password hash, verifies role and
+account associations before and after the update, and aborts if an account or
+requested email conflicts. If the old Super Admin email is absent, it can
+recover an existing account already at the requested Super Admin email, after
+verifying its role; it never creates a user. It accepts only loopback MySQL or
+in-memory H2 databases. The utility is not part of normal application startup.
+
+Run it from an interactive terminal in this directory:
+
+```bash
+mvn spring-boot:run -Dspring-boot.run.main-class=com.vulnscanner.localrecovery.LocalOrganizationAdminRecoveryApplication
+```
+
+It requires a real console and prompts without echo for each new password and
+confirmation. Set `DB_USERNAME` and `DB_PASSWORD` in the current process
+environment as needed; do not pass passwords as command-line arguments. The
+utility does not print passwords or password hashes.
 
 Security Analyst registration supplies an approved `organizationName`; no
 organization ID or invitation token is required. The Super Admin registry is

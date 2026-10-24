@@ -97,6 +97,34 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+                <executions>
+                    <!-- Main application jar: target/backend-check-0.0.1-SNAPSHOT.jar
+                         (Start-Class = VulnScannerApplication, the default mainClass). -->
+                    <execution>
+                        <id>repackage</id>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                    </execution>
+                    <!-- Second, dedicated fat jar for the local account-recovery CLI tool:
+                         target/backend-check-0.0.1-SNAPSHOT-recovery.jar
+                         (Start-Class = LocalOrganizationAdminRecoveryApplication).
+                         Running "java -jar ...-recovery.jar" launches the recovery tool
+                         directly: no spring.main.sources flag or PropertiesLauncher trick
+                         needed, since that flag has no effect on which main() a repackaged
+                         jar launches (that is fixed at build time by the jar's manifest
+                         Start-Class). -->
+                    <execution>
+                        <id>repackage-local-recovery</id>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                        <configuration>
+                            <classifier>recovery</classifier>
+                            <mainClass>com.vulnscanner.localrecovery.LocalOrganizationAdminRecoveryApplication</mainClass>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
