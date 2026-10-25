@@ -85,6 +85,21 @@ public class ScanJob {
     @Column(name = "rejection_reason", length = 1000)
     private String rejectionReason;
 
+    @Column(name = "native_engine_status", nullable = false, length = 24)
+    private String nativeEngineStatus = "NOT_STARTED";
+
+    @Column(name = "zap_engine_status", nullable = false, length = 24)
+    private String zapEngineStatus = "UNKNOWN";
+
+    @Column(name = "discovered_page_count")
+    private Integer discoveredPageCount;
+
+    @Column(name = "visited_page_count")
+    private Integer visitedPageCount;
+
+    @Column(name = "tested_passive_page_count")
+    private Integer testedPassivePageCount;
+
     protected ScanJob() {
     }
 
@@ -93,6 +108,7 @@ public class ScanJob {
         this.organization = organization;
         this.requestedBy = requestedBy;
         this.scanType = scanType;
+        this.zapEngineStatus = scanType == ScanType.PASSIVE_HEADERS ? "NOT_REQUESTED" : "NOT_STARTED";
     }
 
     public void transitionTo(ScanStatus nextStatus, int nextProgress, String safeMessage,
@@ -142,6 +158,7 @@ public class ScanJob {
                 .contains(status)) {
             return;
         }
+        copyExecutionDetailsFrom(update);
         if (cancellationRequested && update.status != ScanStatus.CANCELLED) {
             requestCancellation();
             if (status != ScanStatus.CANCELLED) {
@@ -164,6 +181,40 @@ public class ScanJob {
         cancellationRequested = source.cancellationRequested;
         startedAt = source.startedAt;
         completedAt = source.completedAt;
+        copyExecutionDetailsFrom(source);
+    }
+
+    private void copyExecutionDetailsFrom(ScanJob source) {
+        nativeEngineStatus = source.nativeEngineStatus;
+        zapEngineStatus = source.zapEngineStatus;
+        discoveredPageCount = source.discoveredPageCount;
+        visitedPageCount = source.visitedPageCount;
+        testedPassivePageCount = source.testedPassivePageCount;
+    }
+
+    public void updateNativeEngineStatus(String nextStatus) {
+        nativeEngineStatus = requireEngineStatus(nextStatus);
+    }
+
+    public void updateZapEngineStatus(String nextStatus) {
+        zapEngineStatus = requireEngineStatus(nextStatus);
+    }
+
+    public void updateCrawlCounts(int discovered, int visited, int passiveTested) {
+        if (discovered < 0 || visited < 0 || passiveTested < 0
+                || visited > discovered || passiveTested > visited) {
+            throw new IllegalArgumentException("Scan page counts must be non-negative and internally consistent");
+        }
+        discoveredPageCount = discovered;
+        visitedPageCount = visited;
+        testedPassivePageCount = passiveTested;
+    }
+
+    private String requireEngineStatus(String value) {
+        if (value == null || value.isBlank() || value.length() > 24) {
+            throw new IllegalArgumentException("A valid engine status is required");
+        }
+        return value;
     }
 
     public void requestCancellation() {
@@ -222,4 +273,9 @@ public class ScanJob {
     public User getReviewedBy() { return reviewedBy; }
     public Instant getReviewedAt() { return reviewedAt; }
     public String getRejectionReason() { return rejectionReason; }
+    public String getNativeEngineStatus() { return nativeEngineStatus; }
+    public String getZapEngineStatus() { return zapEngineStatus; }
+    public Integer getDiscoveredPageCount() { return discoveredPageCount; }
+    public Integer getVisitedPageCount() { return visitedPageCount; }
+    public Integer getTestedPassivePageCount() { return testedPassivePageCount; }
 }

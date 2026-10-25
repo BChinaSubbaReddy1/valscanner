@@ -1,0 +1,41 @@
+services:
+  backend:
+    depends_on:
+      zap:
+        condition: service_healthy
+    environment:
+      SCANNER_ZAP_ENABLED: "true"
+      SCANNER_ZAP_BASE_URL: http://zap:8090
+      SCANNER_ZAP_API_KEY: ${SCANNER_ZAP_API_KEY:?Set SCANNER_ZAP_API_KEY in .env}
+
+  zap:
+    image: zaproxy/zap-stable:2.16.1
+    container_name: vulnscanner-zap
+    command:
+      - zap.sh
+      - -daemon
+      - -host
+      - 0.0.0.0
+      - -port
+      - "8090"
+      - -config
+      - api.addrs.addr.name=.*
+      - -config
+      - api.addrs.addr.regex=true
+      - -config
+      - api.key=${SCANNER_ZAP_API_KEY:?Set SCANNER_ZAP_API_KEY in .env}
+      - -config
+      - api.disablekey=false
+    ports:
+      - "127.0.0.1:${ZAP_HOST_PORT:-8090}:8090"
+    restart: unless-stopped
+    networks:
+      - vulnscanner-lab
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "curl -fsS -H 'X-ZAP-API-Key: ${SCANNER_ZAP_API_KEY:?Set SCANNER_ZAP_API_KEY in .env}' http://127.0.0.1:8090/JSON/core/view/version/ > /dev/null"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s

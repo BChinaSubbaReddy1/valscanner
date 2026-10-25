@@ -1176,6 +1176,15 @@ describe('Authentication, Access Control and IAM Views', () => {
         scanType: 'PASSIVE_HEADERS',
         status: 'COMPLETED',
         progress: 100,
+        executionSummary: {
+          nativeEngineStatus: 'COMPLETED',
+          zapEngineStatus: 'NOT_REQUESTED',
+          discoveredPageCount: 2,
+          visitedPageCount: 2,
+          testedPassivePageCount: 2,
+          checksInScope: ['Cookie attribute observations'],
+          checksOutOfScope: ['OWASP ZAP spider or passive analysis'],
+        },
       },
     });
     vi.spyOn(client.scanApi, 'listCrawlPages').mockResolvedValue({ data: [] });
@@ -1211,7 +1220,10 @@ describe('Authentication, Access Control and IAM Views', () => {
     renderApp('/analyst/scans/97');
 
     expect((await screen.findAllByText('Native Header Engine')).length).toBeGreaterThan(0);
-    expect(screen.getByText('OWASP ZAP')).toBeInTheDocument();
+    expect(screen.getByText('NOT_REQUESTED')).toBeInTheDocument();
+    expect(screen.getAllByText(/Discovered same-origin pages/i).length).toBeGreaterThan(0);
+    expect(screen.getByText(/OWASP ZAP spider or passive analysis/i)).toBeInTheDocument();
+    expect(screen.getAllByText('OWASP ZAP').length).toBeGreaterThan(0);
     expect(screen.getAllByText('X_FRAME_OPTIONS').length).toBeGreaterThan(0);
     expect(screen.getAllByText('SQL_INJECTION_ACTIVE').length).toBeGreaterThan(0);
   });

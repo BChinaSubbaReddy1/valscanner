@@ -10,6 +10,7 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class ZapClientServiceTest {
@@ -44,6 +45,22 @@ class ZapClientServiceTest {
         ZapClientService client = client();
 
         assertThrows(IOException.class, () -> client.startActiveScan("http://127.0.0.1/"));
+    }
+
+    @Test
+    void passiveScanQueueCountCanBeRead() throws Exception {
+        server = startServer("/JSON/pscan/view/recordsToScan/", "{\"recordsToScan\":\"0\"}");
+        ZapClientService client = client();
+
+        assertEquals(0, client.getPassiveScanRecordsToScan());
+    }
+
+    @Test
+    void invalidPassiveScanQueueCountIsAnError() throws Exception {
+        server = startServer("/JSON/pscan/view/recordsToScan/", "{\"recordsToScan\":\"pending\"}");
+        ZapClientService client = client();
+
+        assertThrows(IOException.class, client::getPassiveScanRecordsToScan);
     }
 
     private ZapClientService client() {

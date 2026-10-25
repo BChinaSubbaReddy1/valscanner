@@ -17,6 +17,7 @@ public record ScanJobResponse(
         Instant completedAt,
         Long reviewedByUserId,
         Instant reviewedAt,
-        String rejectionReason
+        String rejectionReason,
+        ScanExecutionSummary executionSummary
 ) {
 }

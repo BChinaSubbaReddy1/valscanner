@@ -6,6 +6,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
+import java.util.List;
 
 @Entity
 @Table(name = "scan_crawl_pages", indexes = {
@@ -39,6 +40,10 @@ public class ScanCrawlPage {
     @Column(nullable = false)
     private int discoveredLinks;
 
+    @Convert(converter = DiscoveredFormsConverter.class)
+    @Column(name = "discovered_forms_json", columnDefinition = "TEXT")
+    private List<DiscoveredForm> discoveredForms = List.of();
+
     @Column(nullable = false, updatable = false)
     private Instant discoveredAt = Instant.now();
 
@@ -47,6 +52,11 @@ public class ScanCrawlPage {
 
     public ScanCrawlPage(ScanJob scanJob, String url, int depth, int statusCode,
                          int responseBytes, int discoveredLinks) {
+        this(scanJob, url, depth, statusCode, responseBytes, discoveredLinks, List.of());
+    }
+
+    public ScanCrawlPage(ScanJob scanJob, String url, int depth, int statusCode,
+                         int responseBytes, int discoveredLinks, List<DiscoveredForm> discoveredForms) {
         this.scanJob = scanJob;
         this.url = url;
         this.urlHash = hashUrl(url);
@@ -54,6 +64,7 @@ public class ScanCrawlPage {
         this.statusCode = statusCode;
         this.responseBytes = responseBytes;
         this.discoveredLinks = discoveredLinks;
+        this.discoveredForms = discoveredForms == null ? List.of() : List.copyOf(discoveredForms);
     }
 
     public Long getId() { return id; }
@@ -62,6 +73,7 @@ public class ScanCrawlPage {
     public int getStatusCode() { return statusCode; }
     public int getResponseBytes() { return responseBytes; }
     public int getDiscoveredLinks() { return discoveredLinks; }
+    public List<DiscoveredForm> getDiscoveredForms() { return List.copyOf(discoveredForms); }
     public Instant getDiscoveredAt() { return discoveredAt; }
 
     @PrePersist

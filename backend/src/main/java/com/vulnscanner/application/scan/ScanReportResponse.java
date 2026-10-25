@@ -22,6 +22,7 @@ public record ScanReportResponse(
         SeveritySummary severitySummary,
         int totalFindings,
         int totalCrawlPages,
+        ScanExecutionSummary executionSummary,
         List<ScanFindingResponse> findings
 ) {
     public record SeveritySummary(long high, long medium, long low, long total) {}

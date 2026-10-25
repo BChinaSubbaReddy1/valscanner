@@ -71,6 +71,8 @@ class ScanReportIntegrationTest {
         job.transitionTo(ScanStatus.QUEUED, 0, "Queued", null);
         job.transitionTo(ScanStatus.RUNNING, 20, "Running", null);
         job.transitionTo(ScanStatus.COMPLETED, 100, "Done", null);
+        job.updateNativeEngineStatus("COMPLETED");
+        job.updateCrawlCounts(3, 2, 2);
         scanJobRepository.saveAndFlush(job);
 
         scanFindingRepository.save(new ScanFinding(job, "SQL_INJECTION_SUSPECTED", "HIGH",
@@ -95,6 +97,13 @@ class ScanReportIntegrationTest {
                 .andExpect(jsonPath("$.data.status").value("COMPLETED"))
                 .andExpect(jsonPath("$.data.totalFindings").value(3))
                 .andExpect(jsonPath("$.data.totalCrawlPages").value(1))
+                .andExpect(jsonPath("$.data.executionSummary.nativeEngineStatus").value("COMPLETED"))
+                .andExpect(jsonPath("$.data.executionSummary.zapEngineStatus").value("NOT_REQUESTED"))
+                .andExpect(jsonPath("$.data.executionSummary.discoveredPageCount").value(3))
+                .andExpect(jsonPath("$.data.executionSummary.visitedPageCount").value(2))
+                .andExpect(jsonPath("$.data.executionSummary.testedPassivePageCount").value(2))
+                .andExpect(jsonPath("$.data.executionSummary.checksOutOfScope").value(
+                        org.hamcrest.Matchers.hasItem("OWASP ZAP spider or passive analysis")))
                 .andExpect(jsonPath("$.data.severitySummary.high").value(1))
                 .andExpect(jsonPath("$.data.severitySummary.medium").value(1))
                 .andExpect(jsonPath("$.data.severitySummary.low").value(1))
@@ -116,6 +125,8 @@ class ScanReportIntegrationTest {
         job.transitionTo(ScanStatus.QUEUED, 0, "Queued", null);
         job.transitionTo(ScanStatus.RUNNING, 20, "Running", null);
         job.transitionTo(ScanStatus.COMPLETED, 100, "Done", null);
+        job.updateNativeEngineStatus("COMPLETED");
+        job.updateCrawlCounts(4, 3, 3);
         scanJobRepository.saveAndFlush(job);
 
         scanFindingRepository.save(new ScanFinding(job, "MISSING_CONTENT_SECURITY_POLICY", "MEDIUM",
@@ -143,6 +154,13 @@ class ScanReportIntegrationTest {
                 .andReturn();
         String jsonBody = jsonResult.getResponse().getContentAsString();
         assertTrue(jsonBody.contains("MISSING_CONTENT_SECURITY_POLICY"));
+        assertTrue(jsonBody.contains("\"nativeEngineStatus\" : \"COMPLETED\""));
+        assertTrue(jsonBody.contains("\"zapEngineStatus\" : \"NOT_REQUESTED\""));
+        assertTrue(jsonBody.contains("\"discoveredPageCount\" : 4"));
+        assertTrue(jsonBody.contains("\"totalFindings\" : 32"));
+        assertTrue(jsonBody.contains("\"medium\" : 1"));
+        assertTrue(jsonBody.contains("\"low\" : 31"));
+        assertTrue(jsonBody.contains("\"detectionSource\" : \"PASSIVE_HEADERS\""));
         // Check redaction
         assertFalse(jsonBody.contains("secret-123456"));
         assertTrue(jsonBody.contains("[REDACTED]"));
@@ -159,6 +177,12 @@ class ScanReportIntegrationTest {
         assertTrue(csvBody.startsWith("# Scan ID,"));
         assertTrue(csvBody.contains("Finding ID,Check Type,Severity"));
         assertTrue(csvBody.contains("MISSING_CONTENT_SECURITY_POLICY"));
+        assertTrue(csvBody.contains("# OWASP ZAP Status,NOT_REQUESTED"));
+        assertTrue(csvBody.contains("# Discovered Same-Origin Pages,4"));
+        assertTrue(csvBody.contains("# Passively Tested Pages,3"));
+        assertTrue(csvBody.contains("# Persisted HTML Crawl Records,0"));
+        assertTrue(csvBody.contains("# High,0,Medium,1,Low,31,Total,32"));
+        assertTrue(csvBody.contains("PASSIVE_HEADERS"));
         assertTrue(csvBody.contains("'=HYPERLINK("));
         assertFalse(csvBody.contains("secret-123456"));
 
@@ -176,7 +200,14 @@ class ScanReportIntegrationTest {
         assertTrue(pdfHeader.startsWith("%PDF-1.4"));
         String pdfTail = new String(pdfBytes, pdfBytes.length - 10, 10, StandardCharsets.ISO_8859_1);
         assertTrue(pdfTail.contains("%%EOF"));
-        assertTrue(new String(pdfBytes, StandardCharsets.ISO_8859_1).contains("PDF summary limit:"));
+        String pdfBody = new String(pdfBytes, StandardCharsets.ISO_8859_1);
+        assertTrue(pdfBody.contains("OWASP ZAP: NOT_REQUESTED"));
+        assertTrue(pdfBody.contains("Severity totals: High 0, Medium 1, Low 31, Total 32"));
+        assertTrue(pdfBody.contains("Evidence:"));
+        assertTrue(pdfBody.contains("Header absent"));
+        assertTrue(pdfBody.contains("Detection source: PASSIVE_HEADERS"));
+        assertTrue(pdfBody.contains("TEST_FINDING_29"));
+        assertFalse(pdfBody.contains("PDF summary limit:"));
     }
 
     @Test

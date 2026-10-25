@@ -86,6 +86,7 @@ public class ScanReportService {
                 new ScanReportResponse.SeveritySummary(high, medium, low, total),
                 (int) total,
                 crawlPagesCount,
+                ScanExecutionSummary.from(job),
                 sanitizedFindings
         );
     }
@@ -118,16 +119,25 @@ public class ScanReportService {
             writer.println("# Scan ID," + report.scanId());
             writer.println("# Target," + escapeCsv(report.targetName()) + "," + escapeCsv(report.targetUrl()));
             writer.println("# Status," + report.status());
+            writer.println("# Scan Type," + report.scanType());
+            writer.println("# Native Engine Status," + report.executionSummary().nativeEngineStatus());
+            writer.println("# OWASP ZAP Status," + report.executionSummary().zapEngineStatus());
+            writer.println("# Discovered Same-Origin Pages," + reportCount(report.executionSummary().discoveredPageCount()));
+            writer.println("# Visited Pages," + reportCount(report.executionSummary().visitedPageCount()));
+            writer.println("# Passively Tested Pages," + reportCount(report.executionSummary().testedPassivePageCount()));
+            writer.println("# Persisted HTML Crawl Records," + report.totalCrawlPages());
+            writer.println("# Checks In Scope," + escapeCsv(String.join("; ", report.executionSummary().checksInScope())));
+            writer.println("# Checks Out Of Scope," + escapeCsv(String.join("; ", report.executionSummary().checksOutOfScope())));
             writer.println("# Created At," + report.createdAt());
             writer.println("# Completed At," + (report.completedAt() != null ? report.completedAt().toString() : ""));
             writer.println("# High," + report.severitySummary().high() + ",Medium," + report.severitySummary().medium()
                     + ",Low," + report.severitySummary().low() + ",Total," + report.totalFindings());
             writer.println();
 
-            writer.println("Finding ID,Check Type,Severity,Affected Component,Evidence,Rationale,Remediation,Detection Source,Verification Status,Detected At");
+            writer.println("Finding ID,Check Type,Severity,Affected Component,Evidence,Rationale,Remediation,Detection Source,Verification Status,Detected At,Source Rule ID,Source Confidence,Source Reference,Source CWE ID,Source WASC ID");
 
             for (ScanFindingResponse finding : report.findings()) {
-                writer.printf("%d,%s,%s,%s,%s,%s,%s,%s,%s,%s%n",
+                writer.printf("%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s%n",
                         finding.id(),
                         escapeCsv(finding.checkType()),
                         escapeCsv(finding.severity()),
@@ -137,7 +147,12 @@ public class ScanReportService {
                         escapeCsv(finding.remediation()),
                         escapeCsv(finding.detectionSource()),
                         escapeCsv(finding.verificationStatus()),
-                        escapeCsv(finding.detectedAt() != null ? finding.detectedAt().toString() : "")
+                        escapeCsv(finding.detectedAt() != null ? finding.detectedAt().toString() : ""),
+                        escapeCsv(finding.sourceRuleId()),
+                        escapeCsv(finding.sourceConfidence()),
+                        escapeCsv(finding.sourceReference()),
+                        escapeCsv(finding.sourceCweId()),
+                        escapeCsv(finding.sourceWascId())
                 );
             }
             writer.flush();
@@ -170,6 +185,10 @@ public class ScanReportService {
         return sanitized;
     }
 
+    private String reportCount(Integer count) {
+        return count == null ? "Not reported" : count.toString();
+    }
+
     private ScanFindingResponse toSanitizedFindingResponse(ScanFinding finding) {
         return new ScanFindingResponse(
                 finding.getId(),
@@ -181,7 +200,12 @@ public class ScanReportService {
                 FindingSanitizer.sanitize(finding.getRemediation()),
                 finding.getDetectionSource(),
                 finding.getVerificationStatus(),
-                finding.getDetectedAt()
+                finding.getDetectedAt(),
+                finding.getSourceRuleId(),
+                finding.getSourceConfidence(),
+                finding.getSourceReference(),
+                finding.getSourceCweId(),
+                finding.getSourceWascId()
         );
     }
 

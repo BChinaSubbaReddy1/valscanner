@@ -29,7 +29,7 @@ public class ZapScanAdapter {
                 ? alert.solution()
                 : "Review OWASP security guidance for " + alert.alert() + ".";
 
-        return new ScanFinding(
+        ScanFinding finding = new ScanFinding(
                 job,
                 bounded(checkType, 64),
                 severity,
@@ -40,6 +40,14 @@ public class ZapScanAdapter {
                 "OWASP_ZAP",
                 verificationStatus
         );
+        finding.setSourceMetadata(
+                bounded(FindingSanitizer.sanitize(alert.pluginId()), 64),
+                bounded(FindingSanitizer.sanitize(alert.confidence()), 16),
+                bounded(FindingSanitizer.sanitize(alert.reference()), 2048),
+                bounded(FindingSanitizer.sanitize(alert.cweid()), 16),
+                bounded(FindingSanitizer.sanitize(alert.wascid()), 16)
+        );
+        return finding;
     }
 
     public String mapSeverity(String risk) {
@@ -59,7 +67,7 @@ public class ZapScanAdapter {
             return "POTENTIAL";
         }
         return switch (confidence.trim().toLowerCase(Locale.ROOT)) {
-            case "high" -> "VERIFIED";
+            case "high" -> "OBSERVED";
             case "medium" -> "OBSERVED";
             default -> "POTENTIAL";
         };

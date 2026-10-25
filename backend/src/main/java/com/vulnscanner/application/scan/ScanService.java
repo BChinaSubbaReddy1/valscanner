@@ -181,7 +181,7 @@ public class ScanService {
                 .stream()
                 .map(page -> new ScanCrawlPageResponse(page.getId(), page.getUrl(), page.getDepth(),
                         page.getStatusCode(), page.getResponseBytes(), page.getDiscoveredLinks(),
-                        page.getDiscoveredAt()))
+                        page.getDiscoveredForms(), page.getDiscoveredAt()))
                 .toList();
     }
 
@@ -248,7 +248,7 @@ public class ScanService {
                 job.getFailureReason(), job.isCancellationRequested(), job.getCreatedAt(),
                 job.getStartedAt(), job.getCompletedAt(),
                 job.getReviewedBy() == null ? null : job.getReviewedBy().getId(),
-                job.getReviewedAt(), job.getRejectionReason());
+                job.getReviewedAt(), job.getRejectionReason(), ScanExecutionSummary.from(job));
     }
 
     private ScanFindingResponse findingResponse(ScanFinding finding) {
@@ -258,7 +258,8 @@ public class ScanService {
                 FindingSanitizer.sanitize(finding.getRationale()),
                 FindingSanitizer.sanitize(finding.getRemediation()),
                 finding.getDetectionSource(), finding.getVerificationStatus(),
-                finding.getDetectedAt());
+                finding.getDetectedAt(), finding.getSourceRuleId(), finding.getSourceConfidence(),
+                finding.getSourceReference(), finding.getSourceCweId(), finding.getSourceWascId());
     }
 
     private void audit(String eventType, ScanJob job, User actor) {

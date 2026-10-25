@@ -181,6 +181,19 @@ public class ZapClientService {
         return requiredProgress(json, "active");
     }
 
+    public int getPassiveScanRecordsToScan() throws IOException, InterruptedException {
+        JsonNode json = executeRequest("/JSON/pscan/view/recordsToScan/");
+        JsonNode records = json.get("recordsToScan");
+        if (records == null || !records.asText().matches("\\d{1,8}")) {
+            throw new IOException("ZAP passive scan queue response is invalid");
+        }
+        try {
+            return Integer.parseInt(records.asText());
+        } catch (NumberFormatException exception) {
+            throw new IOException("ZAP passive scan queue response is invalid", exception);
+        }
+    }
+
     public void stopActiveScan(String scanId) {
         if (scanId == null || scanId.isBlank()) {
             return;

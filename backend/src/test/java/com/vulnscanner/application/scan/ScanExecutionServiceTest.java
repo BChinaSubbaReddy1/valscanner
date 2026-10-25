@@ -15,7 +15,9 @@ import org.mockito.ArgumentCaptor;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.net.InetSocketAddress;
+import java.net.InetAddress;
 import java.net.URI;
+import java.net.UnknownHostException;
 import java.net.http.HttpClient;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
@@ -46,6 +48,12 @@ class ScanExecutionServiceTest {
         if (secondaryServer != null) {
             secondaryServer.stop(0);
         }
+    }
+
+    private void permitTestTarget(ScanExecutionService service, ScanJob job) {
+        URI target = URI.create(job.getTarget().getUrl());
+        ReflectionTestUtils.setField(service, "allowedPrivateTargetOrigins",
+                target.getScheme() + "://" + target.getRawAuthority());
     }
 
     @Test
@@ -91,13 +99,16 @@ class ScanExecutionServiceTest {
         assertEquals(ScanStatus.COMPLETED, job.getStatus(), job.getStatusMessage());
         ArgumentCaptor<ScanFinding> captor = ArgumentCaptor.forClass(ScanFinding.class);
         verify(findings, atLeastOnce()).save(captor.capture());
-        assertEquals("MISSING_CONTENT_SECURITY_POLICY", captor.getAllValues().stream()
-                .map(ScanFinding::getCheckType).filter("MISSING_CONTENT_SECURITY_POLICY"::equals)
-                .findFirst().orElseThrow());
+        ScanFinding cspFinding = captor.getAllValues().stream()
+                .filter(finding -> "MISSING_CONTENT_SECURITY_POLICY".equals(finding.getCheckType()))
+                .findFirst().orElseThrow();
+        assertEquals("OBSERVED", cspFinding.getVerificationStatus());
         ScanFinding cookieFinding = captor.getAllValues().stream()
                 .filter(finding -> "COOKIE_MISSING_HTTP_ONLY".equals(finding.getCheckType()))
                 .findFirst().orElseThrow();
         assertEquals("OBSERVED", cookieFinding.getVerificationStatus());
+        assertEquals("LOW", cookieFinding.getSeverity());
+        assertTrue(cookieFinding.getRationale().contains("exploitability was not verified"));
         assertTrue(cookieFinding.getEvidence().contains("preference"));
         assertTrue(!cookieFinding.getEvidence().contains("dark mode"));
         assertTrue(!cookieFinding.getEvidence().contains("abc"));
@@ -138,7 +149,9 @@ class ScanExecutionServiceTest {
             exchange.close();
         });
         server.createContext("/child", exchange -> {
-            byte[] body = "<p>child</p>".getBytes();
+            byte[] body = ("<p>child</p><form method=\"POST\" action=\"/child\">"
+                    + "<input name=\"username\" value=\"not-persisted\">"
+                    + "<input name=\"password\" value=\"secret\"></form>").getBytes();
             exchange.getResponseHeaders().add("Content-Type", "text/html");
             exchange.sendResponseHeaders(200, body.length);
             exchange.getResponseBody().write(body);
@@ -175,16 +188,30 @@ class ScanExecutionServiceTest {
 
         ScanExecutionService service = new ScanExecutionService(
                 jobs, findings, true, null, null, crawlPages);
+        permitTestTarget(service, job);
         service.runClaimed(2L);
 
-        verify(crawlPages, times(2)).save(any(ScanCrawlPage.class));
+        ArgumentCaptor<ScanCrawlPage> pagesCaptor = ArgumentCaptor.forClass(ScanCrawlPage.class);
+        verify(crawlPages, times(2)).save(pagesCaptor.capture());
+        ScanCrawlPage childPage = pagesCaptor.getAllValues().stream()
+                .filter(page -> page.getUrl().endsWith("/child"))
+                .findFirst().orElseThrow();
+        assertEquals(1, childPage.getDiscoveredForms().size());
+        assertEquals("POST", childPage.getDiscoveredForms().getFirst().method());
+        assertEquals(List.of("username", "password"),
+                childPage.getDiscoveredForms().getFirst().parameterNames());
         assertEquals(1, staticRequests.get());
         assertEquals(0, crossOriginRequests.get());
         assertEquals(ScanStatus.COMPLETED, job.getStatus());
+        ArgumentCaptor<ScanFinding> findingsCaptor = ArgumentCaptor.forClass(ScanFinding.class);
+        verify(findings, atLeastOnce()).save(findingsCaptor.capture());
+        assertTrue(findingsCaptor.getAllValues().stream().anyMatch(finding ->
+                "MISSING_CONTENT_SECURITY_POLICY".equals(finding.getCheckType())
+                        && finding.getAffectedComponent().contains("/child [Content-Security-Policy]")));
     }
 
     @Test
-    void rejectsPrivateTargetWhenDevelopmentOverrideIsDisabled() {
+    void rejectsUnconfiguredPrivateTarget() {
         ScanJobRepository jobs = mock(ScanJobRepository.class);
         ScanFindingRepository findings = mock(ScanFindingRepository.class);
         Organization organization = approvedOrganization(19L);
@@ -213,6 +240,92 @@ class ScanExecutionServiceTest {
 
         assertEquals(ScanStatus.FAILED, job.getStatus());
         verify(findings, never()).save(any());
+    }
+
+    @Test
+    void acceptsPublicHttpAndHttpsAddressesWithoutAnOriginAllowlist() throws Exception {
+        ScanExecutionService service = serviceResolving(InetAddress.getByName("93.184.216.34"),
+                InetAddress.getByName("2606:2800:220:1:248:1893:25c8:1946"));
+
+        service.validateResolvedAddresses(URI.create("https://public.example/"), new java.util.HashMap<>());
+        service.validateResolvedAddresses(URI.create("http://public-v6.example/"), new java.util.HashMap<>());
+    }
+
+    @Test
+    void explicitOriginAllowsPrivateLabAddressButLegacyGlobalFlagDoesNot() throws Exception {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        ScanExecutionService service = serviceResolving(loopback);
+        URI allowedTarget = URI.create("http://127.0.0.1:8080/");
+
+        assertThrows(ScanExecutionService.ScanExecutionException.class,
+                () -> service.validateResolvedAddresses(allowedTarget, new java.util.HashMap<>()));
+
+        ReflectionTestUtils.setField(service, "allowedPrivateTargetOrigins", "http://127.0.0.1:8080");
+        service.validateResolvedAddresses(allowedTarget, new java.util.HashMap<>());
+        assertThrows(ScanExecutionService.ScanExecutionException.class,
+                () -> service.validateResolvedAddresses(
+                        URI.create("http://127.0.0.1:8081/"), new java.util.HashMap<>()));
+    }
+
+    @Test
+    void rejectsIpv4AndIpv6LoopbackAndUnsafeLinkLocalAndMetadataAddresses() throws Exception {
+        for (String address : List.of("127.0.0.1", "::1", "169.254.10.20", "fe80::1",
+                "169.254.169.254", "169.254.170.2", "fd00:ec2::254")) {
+            ScanExecutionService service = serviceResolving(InetAddress.getByName(address));
+            assertThrows(ScanExecutionService.ScanExecutionException.class,
+                    () -> service.validateResolvedAddresses(
+                            URI.create("http://target.example:8080/"), new java.util.HashMap<>()),
+                    address);
+        }
+    }
+
+    @Test
+    void rejectsDnsResolutionFailures() {
+        ScanExecutionService service = new ScanExecutionService(
+                mock(ScanJobRepository.class), mock(ScanFindingRepository.class), false, null) {
+            @Override
+            InetAddress[] resolveAddresses(String host) throws UnknownHostException {
+                throw new UnknownHostException(host);
+            }
+        };
+
+        assertThrows(UnknownHostException.class, () -> service.validateResolvedAddresses(
+                URI.create("https://unresolvable.example/"), new java.util.HashMap<>()));
+    }
+
+    @Test
+    void rejectsNonGlobalAndSpecialUseAddressRangesEvenIfAnOriginIsConfigured() throws Exception {
+        for (String address : List.of("0.1.2.3", "100.64.0.1", "192.0.2.1",
+                "198.18.0.1", "224.0.0.1", "240.0.0.1", "2001:db8::1", "2002::1")) {
+            ScanExecutionService service = serviceResolving(InetAddress.getByName(address));
+            ReflectionTestUtils.setField(service, "allowedPrivateTargetOrigins",
+                    "https://target.example");
+            assertThrows(ScanExecutionService.ScanExecutionException.class,
+                    () -> service.validateResolvedAddresses(
+                            URI.create("https://target.example/"), new java.util.HashMap<>()),
+                    address);
+        }
+    }
+
+    @Test
+    void rejectsUnconfiguredPrivateNetworkAddressesEvenWhenLegacyFlagIsTrue() throws Exception {
+        for (String address : List.of("10.0.0.8", "172.16.0.1", "192.168.1.10", "fc00::1")) {
+            ScanExecutionService service = serviceResolving(InetAddress.getByName(address));
+            assertThrows(ScanExecutionService.ScanExecutionException.class,
+                    () -> service.validateResolvedAddresses(
+                            URI.create("https://private.example/"), new java.util.HashMap<>()),
+                    address);
+        }
+    }
+
+    private ScanExecutionService serviceResolving(InetAddress... addresses) {
+        return new ScanExecutionService(
+                mock(ScanJobRepository.class), mock(ScanFindingRepository.class), true, null) {
+            @Override
+            InetAddress[] resolveAddresses(String host) {
+                return addresses;
+            }
+        };
     }
 
     @Test
@@ -294,7 +407,8 @@ class ScanExecutionServiceTest {
                 "http://127.0.0.1:" + server.getAddress().getPort());
         service.runClaimed(8L);
 
-        assertEquals(ScanStatus.COMPLETED, job.getStatus());
+        assertEquals(ScanStatus.FAILED, job.getStatus());
+        assertEquals("TARGET_URL_INVALID", job.getFailureReason());
         assertEquals(0, redirectedRequests.get());
     }
 
@@ -317,7 +431,9 @@ class ScanExecutionServiceTest {
         ScanJob job = approvedJob(organization, target);
         when(jobs.findByIdForExecutionUpdate(anyLong())).thenReturn(Optional.of(job));
 
-        new ScanExecutionService(jobs, findings, true, null).runClaimed(4L);
+        ScanExecutionService service = new ScanExecutionService(jobs, findings, true, null);
+        permitTestTarget(service, job);
+        service.runClaimed(4L);
 
         assertEquals(ScanStatus.FAILED, job.getStatus());
         assertTrue("RESPONSE_LIMIT_EXCEEDED".equals(job.getFailureReason()));
@@ -349,7 +465,8 @@ class ScanExecutionServiceTest {
 
         ScanExecutionService service = new ScanExecutionService(
                 jobs, findings, true, null, null, null, 10, 6, 1,
-                null, null, null, null, false);
+                null, null, null, null);
+        permitTestTarget(service, job);
         long startedAt = System.nanoTime();
         service.runClaimed(8L);
 
@@ -406,7 +523,8 @@ class ScanExecutionServiceTest {
 
         ScanExecutionService service = new ScanExecutionService(
                 jobs, findings, true, tx, null, null, 10, 6, 10,
-                null, null, null, null, false);
+                null, null, null, null);
+        permitTestTarget(service, job);
         var worker = java.util.concurrent.CompletableFuture.runAsync(() -> service.execute(25L));
         assertTrue(requestReceived.await(3, TimeUnit.SECONDS));
         cancellationRequested.set(true);
@@ -451,6 +569,7 @@ class ScanExecutionServiceTest {
         when(jobs.findByIdForExecutionUpdate(anyLong())).thenReturn(Optional.of(job));
 
         ScanExecutionService service = new ScanExecutionService(jobs, findings, true, null);
+        permitTestTarget(service, job);
         service.runClaimed(5L);
 
         assertEquals(ScanStatus.COMPLETED, job.getStatus());
@@ -498,6 +617,7 @@ class ScanExecutionServiceTest {
         ReflectionTestUtils.setField(job, "scanType", ScanType.ZAP_ACTIVE);
         when(jobs.findByIdForExecutionUpdate(anyLong())).thenReturn(Optional.of(job));
         ZapClientService zap = mock(ZapClientService.class);
+        when(zap.isEnabled()).thenReturn(true);
         when(zap.isAvailable()).thenReturn(true);
         when(zap.createTargetContext(any(), anyString()))
                 .thenReturn(new ZapClientService.ScopeContext("test-context", "1"));
@@ -509,7 +629,8 @@ class ScanExecutionServiceTest {
 
         ScanExecutionService service = new ScanExecutionService(
                 jobs, findings, true, null, null, null, 10, 6, 5,
-                null, null, zap, new ZapScanAdapter(), false);
+                null, null, zap, new ZapScanAdapter());
+        permitTestTarget(service, job);
         service.runClaimed(26L);
 
         assertEquals(ScanStatus.COMPLETED, job.getStatus(), job.getStatusMessage());
@@ -541,7 +662,9 @@ class ScanExecutionServiceTest {
         ScanJob job = approvedJob(organization, target);
         when(jobs.findByIdForExecutionUpdate(anyLong())).thenReturn(Optional.of(job));
 
-        new ScanExecutionService(jobs, findings, true, null).runClaimed(6L);
+        ScanExecutionService service = new ScanExecutionService(jobs, findings, true, null);
+        permitTestTarget(service, job);
+        service.runClaimed(6L);
 
         verify(findings, never()).save(argThat(finding ->
                 "SQL_INJECTION_SUSPECTED".equals(finding.getCheckType())
@@ -570,7 +693,9 @@ class ScanExecutionServiceTest {
         ScanJob job = approvedJob(organization, target);
         when(jobs.findByIdForExecutionUpdate(anyLong())).thenReturn(Optional.of(job));
 
-        new ScanExecutionService(jobs, findings, true, null).runClaimed(7L);
+        ScanExecutionService service = new ScanExecutionService(jobs, findings, true, null);
+        permitTestTarget(service, job);
+        service.runClaimed(7L);
 
         assertEquals(ScanStatus.COMPLETED, job.getStatus());
         assertEquals(1, requests.get());
@@ -614,11 +739,85 @@ class ScanExecutionServiceTest {
         when(jobs.findByIdForExecutionUpdate(anyLong())).thenReturn(Optional.of(job));
 
         ScanExecutionService service = new ScanExecutionService(jobs, findings, true, null, null, crawlPages);
+        permitTestTarget(service, job);
         service.runClaimed(99L);
 
         assertEquals(ScanStatus.COMPLETED, job.getStatus());
         assertEquals(100, job.getProgress());
         verify(crawlPages, times(1)).save(any(ScanCrawlPage.class));
+    }
+
+    @Test
+    void repeatedCookieObservationsRemainDistinctByPageAndAttributeType() throws Exception {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            exchange.getResponseHeaders().add("Content-Type", "text/html");
+            exchange.getResponseHeaders().add("Set-Cookie", "owasp-locale=en; Path=/");
+            exchange.getResponseHeaders().add("Set-Cookie", "owasp-locale=en; Path=/");
+            byte[] body = "<a href=\"/child\">child</a>".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.createContext("/child", exchange -> {
+            exchange.getResponseHeaders().add("Content-Type", "text/html");
+            exchange.getResponseHeaders().add("Set-Cookie", "owasp-locale=en; Path=/");
+            byte[] body = "<html><body>child</body></html>".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.start();
+
+        Organization organization = approvedOrganization(101L);
+        Target target = approvedTarget(organization, "http://127.0.0.1:" + server.getAddress().getPort() + "/");
+        ScanJob job = approvedJob(organization, target);
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        ScanFindingRepository findings = mock(ScanFindingRepository.class);
+        when(jobs.findByIdForExecutionUpdate(anyLong())).thenReturn(Optional.of(job));
+
+        ScanExecutionService service = new ScanExecutionService(jobs, findings, true, null);
+        permitTestTarget(service, job);
+        service.runClaimed(102L);
+
+        ArgumentCaptor<ScanFinding> captor = ArgumentCaptor.forClass(ScanFinding.class);
+        verify(findings, atLeastOnce()).save(captor.capture());
+        List<ScanFinding> cookieFindings = captor.getAllValues().stream()
+                .filter(finding -> finding.getCheckType().startsWith("COOKIE_MISSING_"))
+                .toList();
+
+        assertEquals(4, cookieFindings.size());
+        assertEquals(2, cookieFindings.stream()
+                .filter(finding -> "COOKIE_MISSING_HTTP_ONLY".equals(finding.getCheckType())).count());
+        assertEquals(2, cookieFindings.stream()
+                .filter(finding -> "COOKIE_MISSING_SAMESITE".equals(finding.getCheckType())).count());
+        assertTrue(cookieFindings.stream().allMatch(finding -> "LOW".equals(finding.getSeverity())
+                && "OBSERVED".equals(finding.getVerificationStatus())
+                && finding.getRationale().contains("exploitability was not verified")
+                && !finding.getEvidence().contains("owasp-locale=en")));
+        assertEquals(2, cookieFindings.stream().map(ScanFinding::getAffectedComponent).distinct().count());
+        assertFalse(cookieFindings.stream()
+                .anyMatch(finding -> "COOKIE_MISSING_SECURE".equals(finding.getCheckType())),
+                "Secure absence is not reported for an HTTP response.");
+        assertEquals(2, job.getDiscoveredPageCount());
+        assertEquals(2, job.getVisitedPageCount());
+        assertEquals(2, job.getTestedPassivePageCount());
+        assertEquals("COMPLETED", job.getNativeEngineStatus());
+        assertEquals("NOT_REQUESTED", job.getZapEngineStatus());
+    }
+
+    @Test
+    void passiveHeaderScopeReportsChecksThatDoNotRun() {
+        Organization organization = approvedOrganization(103L);
+        ScanJob job = approvedJob(organization, approvedTarget(organization, "https://example.test/"));
+
+        ScanExecutionSummary summary = ScanExecutionSummary.from(job);
+
+        assertEquals("NOT_REQUESTED", summary.zapEngineStatus());
+        assertTrue(summary.checksInScope().contains("Set-Cookie attribute observations (Secure assessed only for HTTPS responses)"));
+        assertTrue(summary.checksOutOfScope().contains("SQL injection and reflected XSS active probes"));
+        assertTrue(summary.checksOutOfScope().contains("OWASP ZAP spider or passive analysis"));
+        assertTrue(summary.checksOutOfScope().contains("Authorization and access-control testing"));
     }
 
     @Test
@@ -661,7 +860,9 @@ class ScanExecutionServiceTest {
         ScanJob job = approvedJob(organization, target);
         when(jobs.findByIdForExecutionUpdate(anyLong())).thenReturn(Optional.of(job));
 
-        new ScanExecutionService(jobs, findings, true, null).runClaimed(30L);
+        ScanExecutionService service = new ScanExecutionService(jobs, findings, true, null);
+        permitTestTarget(service, job);
+        service.runClaimed(30L);
 
         verify(findings, never()).save(argThat(finding -> "REFLECTED_XSS_POTENTIAL".equals(finding.getCheckType())));
         assertEquals(ScanStatus.COMPLETED, job.getStatus());
@@ -697,6 +898,7 @@ class ScanExecutionServiceTest {
 
         ScanExecutionService service = new ScanExecutionService(jobs, findings, true, null,
                 null, null, 10, 6, 15, null, nvdService);
+        permitTestTarget(service, job);
         service.runClaimed(31L);
 
         ArgumentCaptor<ScanFinding> captor = ArgumentCaptor.forClass(ScanFinding.class);

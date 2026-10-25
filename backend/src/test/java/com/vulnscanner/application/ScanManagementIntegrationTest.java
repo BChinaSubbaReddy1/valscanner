@@ -24,6 +24,7 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.List;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -208,14 +209,19 @@ class ScanManagementIntegrationTest {
         long scanId = createScan(login(analyst.getEmail()), target.getId());
         ScanJob job = scanJobRepository.findById(scanId).orElseThrow();
         scanCrawlPageRepository.saveAndFlush(new ScanCrawlPage(
-                job, "https://example.org/", 0, 200, 128, 2));
+                job, "https://example.org/", 0, 200, 128, 2,
+                List.of(new DiscoveredForm("https://example.org/search", "GET", List.of("query")))));
 
         mockMvc.perform(get("/api/scans/{scanId}/crawl-pages", scanId)
                         .header("Authorization", "Bearer " + login(analyst.getEmail())))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.length()").value(1))
                 .andExpect(jsonPath("$.data[0].url").value("https://example.org/"))
-                .andExpect(jsonPath("$.data[0].responseBytes").value(128));
+                .andExpect(jsonPath("$.data[0].responseBytes").value(128))
+                .andExpect(jsonPath("$.data[0].discoveredForms[0].actionUrl")
+                        .value("https://example.org/search"))
+                .andExpect(jsonPath("$.data[0].discoveredForms[0].method").value("GET"))
+                .andExpect(jsonPath("$.data[0].discoveredForms[0].parameterNames[0]").value("query"));
 
         mockMvc.perform(get("/api/scans/{scanId}/crawl-pages", scanId)
                         .header("Authorization", "Bearer " + login(otherAnalyst.getEmail())))

@@ -305,7 +305,18 @@ export default function ScanDetailsPage() {
             <dl className="meta-list">
               {scan.targetUrl || scan.url ? <div><dt>Target URL</dt><dd>{scan.targetUrl || scan.url}</dd></div> : null}
               <div><dt>Target ID</dt><dd>{scan.targetId ?? 'Not provided'}</dd></div>
-              <div><dt>Scan engine</dt><dd>{scan.scanType === 'PASSIVE_HEADERS' ? 'Native Header Engine' : (scan.scanType || 'Not provided')}</dd></div>
+              <div><dt>Scan mode</dt><dd>{scan.scanType || 'Not provided'}</dd></div>
+              <div><dt>Native engine</dt><dd>{scan.executionSummary?.nativeEngineStatus || 'Status unavailable'}</dd></div>
+              <div><dt>OWASP ZAP</dt><dd>{scan.executionSummary?.zapEngineStatus || 'Status unavailable'}</dd></div>
+              <div><dt>Discovered same-origin pages</dt><dd>{scan.executionSummary?.discoveredPageCount ?? 'Not reported'}</dd></div>
+              <div><dt>Visited pages</dt><dd>{scan.executionSummary?.visitedPageCount ?? 'Not reported'}</dd></div>
+              <div><dt>Passively tested pages</dt><dd>{scan.executionSummary?.testedPassivePageCount ?? 'Not reported'}</dd></div>
+              {scan.executionSummary?.checksInScope?.length ? (
+                <div><dt>Checks in scope</dt><dd>{scan.executionSummary.checksInScope.join('; ')}</dd></div>
+              ) : null}
+              {scan.executionSummary?.checksOutOfScope?.length ? (
+                <div><dt>Checks out of scope</dt><dd>{scan.executionSummary.checksOutOfScope.join('; ')}</dd></div>
+              ) : null}
               <div><dt>Progress</dt><dd>{Number.isFinite(scan.progress) ? `${scan.progress}%` : 'Not provided'}</dd></div>
               <div><dt>Created</dt><dd>{dateText(scan.createdAt)}</dd></div>
               <div><dt>Started</dt><dd>{dateText(scan.startedAt)}</dd></div>
@@ -387,7 +398,18 @@ export default function ScanDetailsPage() {
                   <div><dt>High severity</dt><dd>{report.severitySummary?.high ?? 0}</dd></div>
                   <div><dt>Medium severity</dt><dd>{report.severitySummary?.medium ?? 0}</dd></div>
                   <div><dt>Low severity</dt><dd>{report.severitySummary?.low ?? 0}</dd></div>
-                  <div><dt>Crawl pages</dt><dd>{report.totalCrawlPages ?? 0}</dd></div>
+                  <div><dt>Discovered same-origin pages</dt><dd>{report.executionSummary?.discoveredPageCount ?? 'Not reported'}</dd></div>
+                  <div><dt>Visited pages</dt><dd>{report.executionSummary?.visitedPageCount ?? 'Not reported'}</dd></div>
+                  <div><dt>Passively tested pages</dt><dd>{report.executionSummary?.testedPassivePageCount ?? 'Not reported'}</dd></div>
+                  <div><dt>Persisted HTML crawl records</dt><dd>{report.totalCrawlPages ?? 0}</dd></div>
+                  <div><dt>Native engine status</dt><dd>{report.executionSummary?.nativeEngineStatus || 'Status unavailable'}</dd></div>
+                  <div><dt>OWASP ZAP status</dt><dd>{report.executionSummary?.zapEngineStatus || 'Status unavailable'}</dd></div>
+                  {report.executionSummary?.checksInScope?.length ? (
+                    <div><dt>Checks in scope</dt><dd>{report.executionSummary.checksInScope.join('; ')}</dd></div>
+                  ) : null}
+                  {report.executionSummary?.checksOutOfScope?.length ? (
+                    <div><dt>Checks out of scope</dt><dd>{report.executionSummary.checksOutOfScope.join('; ')}</dd></div>
+                  ) : null}
                 </dl>
               </article>
             )}
@@ -488,6 +510,11 @@ export default function ScanDetailsPage() {
                 <p className="eyebrow">Persisted crawl output</p>
                 <h2 id="scan-crawl-pages-heading">Crawl pages</h2>
               </div>
+              <p className="muted">
+                Discovered pages are unique same-origin URLs found in visited markup; visited pages are successfully fetched responses;
+                passively tested pages are responses checked by the native passive engine. Crawl limits mean these counts do not establish
+                complete site coverage. Persisted crawl records include HTML pages only.
+              </p>
             </div>
             {crawlPagesLoading ? (
               <LoadingSpinner label="Loading crawl pages…" />
