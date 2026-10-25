@@ -161,6 +161,35 @@ class TargetManagementIntegrationTest {
         assertEquals(TargetStatus.PENDING, targetRepository.findById(target.getId()).orElseThrow().getStatus());
     }
 
+    @Test
+    void adminCanRegisterUnlistedPublicHttpAndHttpsTargetsButNotInvalidPorts() throws Exception {
+        Organization organization = approvedOrganization("Dynamic Public Targets");
+        User admin = createUser(RoleName.ADMIN, "dynamic-public-target-admin@example.com", organization);
+        String token = login(admin.getEmail());
+
+        for (String url : Set.of("http://unlisted-http.public.example/app",
+                "https://unlisted-https.public.example/app")) {
+            mockMvc.perform(post("/api/targets")
+                            .header("Authorization", "Bearer " + token)
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(targetRequest("Unlisted public site", url)))
+                    .andExpect(status().isCreated())
+                    .andExpect(jsonPath("$.data.url").value(url))
+                    .andExpect(jsonPath("$.data.status").value("PENDING"));
+        }
+
+        mockMvc.perform(post("/api/targets")
+                        .header("Authorization", "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(targetRequest("Bad port", "https://bad-port.public.example:70000/")))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(post("/api/targets")
+                        .header("Authorization", "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(targetRequest("Empty port", "https://empty-port.public.example:/")))
+                .andExpect(status().isBadRequest());
+    }
+
     private Organization approvedOrganization(String name) {
         Organization organization = new Organization();
         organization.setName(name);

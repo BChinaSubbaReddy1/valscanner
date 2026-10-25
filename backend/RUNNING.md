@@ -25,11 +25,12 @@ This will:
    deployment secret manager when bootstrap provisioning is required. Both must
    be explicitly set and nonblank; startup fails if an email is configured without
    a password.
-5. Expose the API on `http://localhost:8080`.
+5. Expose the API on `http://localhost:8081` by default (host port configurable
+   with `BACKEND_HOST_PORT`; the container listens on port 8080).
 
 Health check:
 ```bash
-curl http://localhost:8080/actuator/health
+curl http://localhost:8081/actuator/health
 ```
 
 After authenticating as an Organization Admin or Security Analyst and approving a target,
@@ -55,19 +56,33 @@ curl -X POST http://localhost:8080/api/scans/1/reject \
   -H "Content-Type: application/json" \
   -d '{"reason":"Target is not ready"}'
 ```
-The worker makes one bounded request to the approved target, does not follow redirects,
-and rejects private or cloud-metadata destinations by default. For a controlled internal
-test target only, set `SCANNER_ALLOW_PRIVATE_TARGETS=true`; approval and organization
-authorization are still mandatory.
+Public HTTP and HTTPS targets do not need to be added to `.env`. The worker resolves
+each hostname at scan time, rejects unsafe DNS answers, and connects to a validated
+address. It follows only same-origin redirects and validates each destination before
+following it. Loopback, private, link-local, multicast, unspecified, metadata, and
+other special-use destinations are blocked by default. Private Docker labs are
+authorized only by exact entries in `SCANNER_ALLOWED_PRIVATE_TARGET_ORIGINS`
+(the Compose defaults are the `juice-shop:3000` and `dvwa:80` service origins); this
+setting does not allow arbitrary private addresses.
 
-`PASSIVE_HEADERS` performs passive checks only and does not send SQL injection or XSS
-test inputs. `ZAP_PASSIVE` and `ZAP_ACTIVE` require the configured ZAP service;
-`ZAP_ACTIVE` never falls back to the native passive scanner. ZAP runs in a temporary
-context restricted to the exact target origin. Spidering is limited to depth 2 and
-10 children per node; active scanning is limited by ZAP rule/scan duration settings,
-10 alerts per rule, a 90-second worker budget, and configured ZAP API timeouts.
-There is no strict aggregate outbound-request-count quota, and live ZAP API behavior
-has not been verified in this environment.
+`PASSIVE_HEADERS` runs native passive response checks. `ZAP_PASSIVE` requests ZAP
+spidering and passive analysis; `ZAP_ACTIVE` additionally sends active test requests.
+Analyst scan requests require organization-admin approval before execution. ZAP modes
+require the optional ZAP Compose overlay, an API key in the untracked `.env`, and an
+available ZAP API:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.zap.yml up --build
+```
+
+The backend reaches ZAP at the internal `http://zap:8090` address. The ZAP host port
+is bound to loopback, and its readiness check uses the authenticated API version
+endpoint. ZAP scans use a temporary context restricted to the exact target origin.
+Spidering is limited to depth 2 and 10 children per node; ZAP active scan rule and
+duration limits, alert caps, the worker deadline, and API timeouts are configured.
+Reports retain distinct native and ZAP engine statuses, including partial ZAP results.
+The native scanner has configured request and response limits; ZAP has separate
+spider/active scan limits.
 POST-body, authenticated-account, and browser-execution coverage is not provided by
 the native scanner.
 

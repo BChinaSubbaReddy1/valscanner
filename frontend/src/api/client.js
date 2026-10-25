@@ -323,12 +323,12 @@ export const targetApi = {
 
 export const scanApi = {
   async createScan(targetId, scanType = 'PASSIVE_HEADERS') {
-    if (scanType !== 'PASSIVE_HEADERS') {
-      throw new Error('Only PASSIVE_HEADERS scans are supported.');
+    if (!['PASSIVE_HEADERS', 'ZAP_PASSIVE', 'ZAP_ACTIVE'].includes(scanType)) {
+      throw new Error('Unsupported scan type.');
     }
     return apiRequest('/api/scans', {
       method: 'POST',
-      body: { targetId, scanType: 'PASSIVE_HEADERS' },
+      body: { targetId, scanType },
     });
   },
 

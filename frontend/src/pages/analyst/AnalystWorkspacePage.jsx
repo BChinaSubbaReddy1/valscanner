@@ -5,7 +5,11 @@ import { useAuth } from '../../auth/useAuth';
 import LoadingSpinner from '../../components/LoadingSpinner';
 import { hasRole } from '../../utils/permissions';
 
-const SCAN_TYPE = 'PASSIVE_HEADERS';
+const SCAN_TYPES = [
+  { value: 'PASSIVE_HEADERS', label: 'Native passive headers' },
+  { value: 'ZAP_PASSIVE', label: 'OWASP ZAP passive scan' },
+  { value: 'ZAP_ACTIVE', label: 'OWASP ZAP active scan' },
+];
 const ACTIVE_SCAN_STATUSES = ['PENDING_APPROVAL', 'CREATED', 'QUEUED', 'CRAWLING', 'SCANNING', 'RUNNING'];
 const CANCELLABLE_SCAN_STATUSES = ['PENDING_APPROVAL', 'CREATED', 'QUEUED', 'CRAWLING', 'SCANNING', 'RUNNING'];
 const POLL_INTERVAL_MS = 5000;
@@ -80,6 +84,7 @@ export default function AnalystWorkspacePage() {
   const [loadingTargets, setLoadingTargets] = useState(true);
   const [targetError, setTargetError] = useState('');
   const [selectedTargetId, setSelectedTargetId] = useState('');
+  const [scanType, setScanType] = useState('PASSIVE_HEADERS');
   const [scans, setScans] = useState({ content: [], totalPages: 0, totalElements: 0, number: 0 });
   const [scanPage, setScanPage] = useState(0);
   const [loadingScans, setLoadingScans] = useState(true);
@@ -248,7 +253,7 @@ export default function AnalystWorkspacePage() {
     setScanError('');
     setScanMessage('');
     try {
-      const result = await scanApi.createScan(target.id, SCAN_TYPE);
+      const result = await scanApi.createScan(target.id, scanType);
       const createdJob = dataOf(result);
       if (!createdJob || createdJob.id == null) {
         throw new Error('The backend response did not include a scan job.');
@@ -300,7 +305,7 @@ export default function AnalystWorkspacePage() {
         <div>
           <p className="eyebrow">Security operations overview</p>
           <h1>Good to see you, {displayName(user)}</h1>
-          <p className="muted">Monitor approved targets, launch passive header scans, and review persisted findings.</p>
+          <p className="muted">Monitor approved targets, request authorized scans, and review persisted findings.</p>
         </div>
         <a className="primary-button" href="#targets">Start a scan</a>
       </div>
@@ -351,8 +356,8 @@ export default function AnalystWorkspacePage() {
             <article id="request-scan" className="data-card scan-launch-card">
               <div>
                 <p className="eyebrow">New scan</p>
-                <h3>Run a passive header scan</h3>
-                <p className="muted">Choose an approved target. The backend currently supports PASSIVE_HEADERS only.</p>
+                <h3>Request a scan</h3>
+                <p className="muted">Scan requests require organization admin approval before execution.</p>
               </div>
               <div className="scan-launch-controls">
                 <label htmlFor="scan-target-select">Approved target
@@ -363,9 +368,18 @@ export default function AnalystWorkspacePage() {
                     ))}
                   </select>
                 </label>
-                <div className="scan-config-summary">
-                  <span>Scan type</span><strong>PASSIVE_HEADERS</strong>
-                </div>
+                <label htmlFor="scan-type-select">Scan type
+                  <select id="scan-type-select" value={scanType} onChange={(event) => setScanType(event.target.value)}>
+                    {SCAN_TYPES.map((type) => (
+                      <option key={type.value} value={type.value}>{type.label}</option>
+                    ))}
+                  </select>
+                </label>
+                {scanType === 'ZAP_ACTIVE' ? (
+                  <p className="muted" role="note">
+                    Active scanning sends test requests to the approved target and runs only after organization admin approval.
+                  </p>
+                ) : null}
                 <button type="button" className="primary-button" disabled={!selectedTarget || submittingTarget != null} onClick={() => startScan(selectedTarget)}>
                   {submittingTarget === selectedTarget?.id ? 'Starting scan…' : 'Start selected scan'}
                 </button>

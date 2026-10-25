@@ -245,6 +245,22 @@ describe('Authentication, Access Control and IAM Views', () => {
     expect(new URL(fetchSpy.mock.calls[1][0]).searchParams.toString()).toBe('page=1&size=10');
   });
 
+  it('submits supported ZAP scan modes and rejects unknown modes locally', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 201,
+      headers: { get: () => 'application/json' },
+      json: async () => ({ success: true, data: { id: 82 } }),
+    });
+
+    await client.scanApi.createScan(71, 'ZAP_ACTIVE');
+
+    expect(fetchSpy.mock.calls[0][1].body).toBe('{"targetId":71,"scanType":"ZAP_ACTIVE"}');
+    await expect(client.scanApi.createScan(71, 'UNSUPPORTED_MODE'))
+      .rejects.toThrow('Unsupported scan type.');
+    expect(fetchSpy).toHaveBeenCalledOnce();
+  });
+
   it('uses the verified scan approval routes and requires rejection reasons', async () => {
     localStorage.setItem('scanner-auth-session', JSON.stringify({
       token: 'admin-bearer-token',
@@ -784,6 +800,38 @@ describe('Authentication, Access Control and IAM Views', () => {
     expect(await screen.findAllByRole('heading', { name: 'Approved portal' })).toHaveLength(2);
     expect(screen.getByText('CREATED')).toBeInTheDocument();
     expect(listScansSpy).toHaveBeenCalled();
+  });
+
+  it('allows an analyst to request ZAP active scanning with admin approval clearly stated', async () => {
+    localStorage.setItem('scanner-auth-session', JSON.stringify({
+      token: 'valid-analyst-token',
+      user: {
+        roles: ['SECURITY_ANALYST'],
+        accountStatus: 'ACTIVE',
+        membershipApprovalStatus: 'APPROVED',
+        organizationStatus: 'APPROVED',
+      },
+    }));
+    vi.spyOn(client.targetApi, 'listTargets').mockResolvedValue({
+      data: [{ id: 71, name: 'Authorized lab', url: 'http://lab.example.test', status: 'APPROVED' }],
+    });
+    vi.spyOn(client.scanApi, 'listScans').mockResolvedValue({
+      data: { content: [], totalPages: 0, totalElements: 0, number: 0 },
+    });
+    const createScanSpy = vi.spyOn(client.scanApi, 'createScan').mockResolvedValue({
+      message: 'Scan request submitted',
+      data: { id: 83, targetId: 71, targetName: 'Authorized lab', scanType: 'ZAP_ACTIVE', status: 'PENDING_APPROVAL' },
+    });
+
+    renderApp('/analyst/workspace');
+    await userEvent.selectOptions(await screen.findByRole('combobox', { name: /scan type/i }), 'ZAP_ACTIVE');
+    expect(screen.getByRole('note')).toHaveTextContent(/active scanning sends test requests/i);
+    expect(screen.getByRole('note')).toHaveTextContent(/organization admin approval/i);
+    await userEvent.selectOptions(screen.getByRole('combobox', { name: /approved target/i }), '71');
+    await userEvent.click(screen.getByRole('button', { name: /start selected scan/i }));
+
+    await waitFor(() => expect(createScanSpy).toHaveBeenCalledWith(71, 'ZAP_ACTIVE'));
+    expect(await screen.findByRole('status')).toHaveTextContent('Scan request submitted');
   });
 
   it('shows authorization failures when a scan cannot be started', async () => {

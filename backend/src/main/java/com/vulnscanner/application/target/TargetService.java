@@ -165,8 +165,11 @@ public class TargetService {
         try {
             URI uri = new URI(value.trim());
             String scheme = uri.getScheme();
-            if (!uri.isAbsolute() || uri.getHost() == null || uri.getHost().isBlank() ||
+            if (!uri.isAbsolute() || uri.isOpaque() || uri.getRawAuthority() == null
+                    || uri.getHost() == null || uri.getHost().isBlank() ||
                     uri.getRawUserInfo() != null || scheme == null ||
+                    (uri.getPort() != -1 && (uri.getPort() < 1 || uri.getPort() > 65535)) ||
+                    !hasValidRawAuthority(uri) ||
                     !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))) {
                 throw new IllegalArgumentException("Target URL must be an HTTP or HTTPS URL without credentials");
             }
@@ -174,6 +177,16 @@ public class TargetService {
         } catch (URISyntaxException exception) {
             throw new IllegalArgumentException("Target URL is malformed", exception);
         }
+    }
+
+    private boolean hasValidRawAuthority(URI uri) {
+        String host = uri.getHost();
+        if (host.startsWith("[") && host.endsWith("]")) {
+            host = host.substring(1, host.length() - 1);
+        }
+        String authorityHost = host.contains(":") ? "[" + host + "]" : host;
+        String expected = uri.getPort() == -1 ? authorityHost : authorityHost + ":" + uri.getPort();
+        return expected.equalsIgnoreCase(uri.getRawAuthority());
     }
 
     private TargetResponse response(Target target) {

@@ -8,7 +8,6 @@ import java.net.URLDecoder;
 import java.net.UnknownHostException;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayDeque;
@@ -48,6 +47,7 @@ public class ScanExecutionService {
     private static final int MAX_CRAWL_DEPTH = 2;
     private static final int MAX_DISCOVERED_FORMS_PER_PAGE = 50;
     private static final int MAX_FORM_FIELDS = 50;
+    private static final int MAX_REDIRECTS = 5;
     private static final int DEFAULT_MAX_REQUESTS = 10;
     private static final int DEFAULT_MAX_DETECTION_REQUESTS = 6;
     private static final int DEFAULT_REQUEST_TIMEOUT_SECONDS = 15;
@@ -336,7 +336,10 @@ public class ScanExecutionService {
         try {
             origin = new URI(job.getTarget().getUrl());
             validateResolvedAddresses(origin, new HashMap<>());
-        } catch (URISyntaxException | UnknownHostException exception) {
+        } catch (UnknownHostException exception) {
+            throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID,
+                    "Target hostname could not be resolved");
+        } catch (URISyntaxException exception) {
             throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID, "Target URL is not safe to scan");
         } catch (IOException exception) {
             throw new ScanExecutionException(ScanFailureReason.OUTBOUND_REQUEST_FAILED, "Target could not be resolved");
@@ -596,18 +599,20 @@ public class ScanExecutionService {
                 continue;
             }
             ScanResponse response = requestTarget(uri, context, false);
+            URI responseUri = normalize(response.finalUri());
+            discovered.add(responseUri);
             boolean htmlDocument = isHtmlDocument(response);
             PageDiscovery discovery = htmlDocument
-                    ? discoverPage(origin, uri, response.body())
+                    ? discoverPage(origin, responseUri, response.body())
                     : new PageDiscovery(List.of(), List.of());
-            pages.add(new CrawledPage(uri, response));
+            pages.add(new CrawledPage(responseUri, response));
             if (!cancellationRequested(job) && crawlPageRepository != null && htmlDocument) {
-                crawlPageRepository.save(new ScanCrawlPage(job, uri.toString(), next.depth(),
+                crawlPageRepository.save(new ScanCrawlPage(job, responseUri.toString(), next.depth(),
                         response.statusCode(), response.body().length, discovery.links().size(),
                         discovery.forms()));
             }
             if (!cancellationRequested(job) && job.getScanType() == ScanType.ZAP_ACTIVE) {
-                persistParameterFindings(job, uri, response, context);
+                persistParameterFindings(job, responseUri, response, context);
             }
             if (next.depth() < MAX_CRAWL_DEPTH) {
                 for (URI link : discovery.links()) {
@@ -629,48 +634,98 @@ public class ScanExecutionService {
 
     private ScanResponse requestTarget(URI uri, ScanContext context, boolean detectionRequest)
             throws ScanExecutionException {
-        try {
-            validateResolvedAddresses(uri, context.resolvedAddressesByHost());
-        } catch (UnknownHostException exception) {
-            throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID, "Target URL is not safe to scan");
-        } catch (IOException exception) {
-            throw new ScanExecutionException(ScanFailureReason.OUTBOUND_REQUEST_FAILED, "Target could not be resolved");
-        }
-
-        HttpRequest request = HttpRequest.newBuilder(uri)
-                .timeout(requestTimeout)
-                .header("User-Agent", "Automated-Web-Scanner-Passive/1.0")
-                .GET().build();
-        try {
-            if (!context.tryConsumeRequest(detectionRequest)) {
-                throw new ScanExecutionException(ScanFailureReason.OUTBOUND_REQUEST_FAILED, "Request budget is exhausted");
+        URI current = uri;
+        Set<URI> redirectChain = new HashSet<>();
+        redirectChain.add(normalize(uri));
+        for (int redirects = 0; ; redirects++) {
+            InetAddress[] addresses;
+            try {
+                addresses = validateResolvedAddresses(current, context.resolvedAddressesByHost());
+            } catch (UnknownHostException exception) {
+                throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID,
+                        "Target hostname could not be resolved");
+            } catch (IOException exception) {
+                throw new ScanExecutionException(ScanFailureReason.OUTBOUND_REQUEST_FAILED,
+                        "Target could not be resolved");
             }
-            HttpResponse<byte[]> response = BoundedHttpResponse.send(
-                    this.httpClient, request, MAX_RESPONSE_BYTES, requestTimeout);
-            validateRedirectDestination(uri, response, context);
-            byte[] body = response.body();
-            return new ScanResponse(response.statusCode(), response.headers(), body);
-        } catch (java.net.http.HttpTimeoutException exception) {
-            throw new ScanExecutionException(ScanFailureReason.TIME_BUDGET_EXCEEDED, "Target request timed out");
-        } catch (IOException exception) {
-            if (exception instanceof BoundedHttpResponse.ResponseTooLargeException) {
+
+            if (!context.tryConsumeRequest(detectionRequest)) {
+                throw new ScanExecutionException(ScanFailureReason.OUTBOUND_REQUEST_FAILED,
+                        "Request budget is exhausted");
+            }
+            PinnedHttpResponse.Response response;
+            try {
+                response = PinnedHttpResponse.send(current, addresses, requestTimeout, MAX_RESPONSE_BYTES,
+                        "Automated-Web-Scanner-Passive/1.0");
+            } catch (java.net.SocketTimeoutException exception) {
+                throw new ScanExecutionException(ScanFailureReason.TIME_BUDGET_EXCEEDED,
+                        "Target request timed out");
+            } catch (PinnedHttpResponse.ResponseTooLargeException exception) {
                 throw new ScanExecutionException(ScanFailureReason.RESPONSE_LIMIT_EXCEEDED,
                         "Target response exceeded the permitted size");
+            } catch (IOException exception) {
+                throw new ScanExecutionException(ScanFailureReason.OUTBOUND_REQUEST_FAILED,
+                        "Target request failed");
             }
-            throw new ScanExecutionException(ScanFailureReason.OUTBOUND_REQUEST_FAILED, "Target request failed");
-        } catch (InterruptedException exception) {
-            Thread.currentThread().interrupt();
-            throw new ScanExecutionException(ScanFailureReason.TIME_BUDGET_EXCEEDED, "Scan interrupted");
+
+            if (!isRedirect(response.statusCode())) {
+                return new ScanResponse(response.statusCode(), response.headers(), response.body(), current);
+            }
+            List<String> locations = response.headers().getOrDefault("location", List.of());
+            if (locations.size() > 1) {
+                throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID,
+                        "Target returned ambiguous redirect destinations");
+            }
+            String location = locations.isEmpty() ? null : locations.getFirst();
+            if (location == null || location.isBlank()) {
+                return new ScanResponse(response.statusCode(), response.headers(), response.body(), current);
+            }
+            if (redirects >= MAX_REDIRECTS) {
+                throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID,
+                        "Target exceeded the permitted redirect limit");
+            }
+            URI destination;
+            try {
+                destination = normalize(current.resolve(new URI(location)).normalize());
+                if (!redirectChain.add(destination)) {
+                    throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID,
+                            "Target returned a redirect loop");
+                }
+                if (!sameOrigin(uri, destination)) {
+                    throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID,
+                            "Redirect destination is outside the authorized target origin");
+                }
+                validateResolvedAddresses(destination, context.resolvedAddressesByHost());
+            } catch (ScanExecutionException exception) {
+                throw exception;
+            } catch (URISyntaxException | IllegalArgumentException exception) {
+                throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID,
+                        "Target returned an invalid redirect destination");
+            } catch (UnknownHostException exception) {
+                throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID,
+                        "Redirect destination hostname could not be resolved");
+            } catch (IOException exception) {
+                throw new ScanExecutionException(ScanFailureReason.OUTBOUND_REQUEST_FAILED,
+                        "Redirect destination could not be validated");
+            }
+            current = destination;
         }
     }
 
-    void validateResolvedAddresses(URI uri, Map<String, Set<String>> resolvedAddressesByHost)
-            throws IOException, UnknownHostException, ScanExecutionException {
-        if (!"http".equalsIgnoreCase(uri.getScheme()) && !"https".equalsIgnoreCase(uri.getScheme())) {
+    private boolean isRedirect(int statusCode) {
+        return statusCode == 301 || statusCode == 302 || statusCode == 303
+                || statusCode == 307 || statusCode == 308;
+    }
+
+    InetAddress[] validateResolvedAddresses(URI uri, Map<String, Set<String>> resolvedAddressesByHost)
+            throws IOException, ScanExecutionException {
+        if (!uri.isAbsolute() || uri.isOpaque() || uri.getRawAuthority() == null
+                || (!"http".equalsIgnoreCase(uri.getScheme()) && !"https".equalsIgnoreCase(uri.getScheme()))) {
             throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID, "Only HTTP and HTTPS targets are supported");
         }
         if (uri.getUserInfo() != null || uri.getHost() == null || uri.getHost().isBlank()
-                || (uri.getPort() != -1 && (uri.getPort() < 1 || uri.getPort() > 65535))) {
+                || (uri.getPort() != -1 && (uri.getPort() < 1 || uri.getPort() > 65535))
+                || !hasValidRawAuthority(uri)) {
             throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID, "Target URL is not safe to scan");
         }
         InetAddress[] addresses = resolveAddresses(uri.getHost());
@@ -679,21 +734,7 @@ public class ScanExecutionService {
         }
         Set<String> resolvedAddresses = new HashSet<>();
         boolean explicitlyAllowedPrivateTarget = isAllowedPrivateTargetOrigin(uri);
-        LOG.warn(
-                "SCAN_DIAGNOSTIC target scheme={} host={} port={} allowlisted={}",
-                uri.getScheme(),
-                uri.getHost(),
-                uri.getPort(),
-                explicitlyAllowedPrivateTarget
-        );
         for (InetAddress address : addresses) {
-            LOG.warn(
-                    "SCAN_DIAGNOSTIC address={} unsafe={} private={} allowlisted={}",
-                    address.getHostAddress(),
-                    isUnsafeAddress(address),
-                    isPrivate(address),
-                    explicitlyAllowedPrivateTarget
-            );
             if (isUnsafeAddress(address)
                     || (isPrivate(address) && !explicitlyAllowedPrivateTarget)) {
                 throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID,
@@ -707,45 +748,23 @@ public class ScanExecutionService {
             throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID,
                     "Target DNS resolution changed during the scan");
         }
+        return addresses;
     }
 
     InetAddress[] resolveAddresses(String host) throws UnknownHostException {
-        try {
-            InetAddress[] addresses = InetAddress.getAllByName(host);
-            LOG.warn("SCAN_DIAGNOSTIC DNS host={} addresses={}",
-                    host,
-                    Arrays.toString(addresses));
-            return addresses;
-        } catch (UnknownHostException exception) {
-            LOG.warn("SCAN_DIAGNOSTIC DNS resolution failed for host={}", host, exception);
-            throw exception;
-        }
+        return InetAddress.getAllByName(host);
     }
 
-
-    private void validateRedirectDestination(URI requestUri, HttpResponse<?> response, ScanContext context)
-            throws ScanExecutionException {
-        if (response.statusCode() < 300 || response.statusCode() >= 400) {
-            return;
+    private boolean hasValidRawAuthority(URI uri) {
+        String host = uri.getHost();
+        if (host.startsWith("[") && host.endsWith("]")) {
+            host = host.substring(1, host.length() - 1);
         }
-        Optional<String> location = response.headers().firstValue("Location");
-        if (location.isEmpty()) {
-            return;
-        }
-        try {
-            URI destination = requestUri.resolve(location.get());
-            validateResolvedAddresses(destination, context.resolvedAddressesByHost());
-        } catch (IllegalArgumentException exception) {
-            throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID,
-                    "Target returned an invalid redirect destination");
-        } catch (UnknownHostException exception) {
-            throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID,
-                    "Redirect destination could not be resolved");
-        } catch (IOException exception) {
-            throw new ScanExecutionException(ScanFailureReason.OUTBOUND_REQUEST_FAILED,
-                    "Redirect destination could not be validated");
-        }
+        String authorityHost = host.contains(":") ? "[" + host + "]" : host;
+        String expected = uri.getPort() == -1 ? authorityHost : authorityHost + ":" + uri.getPort();
+        return expected.equalsIgnoreCase(uri.getRawAuthority());
     }
+
 
     private boolean isAllowedPrivateTargetOrigin(URI target) {
         if (allowedPrivateTargetOrigins == null || allowedPrivateTargetOrigins.isBlank()) {
@@ -871,10 +890,10 @@ public class ScanExecutionService {
     }
 
     private void persistFindings(ScanJob job, ScanResponse response, URI pageUri, Set<String> keys) {
-        java.net.http.HttpHeaders headers = response.headers();
+        Map<String, List<String>> headers = response.headers();
         addMissingHeader(job, keys, headers, "MISSING_CONTENT_SECURITY_POLICY", "Content-Security-Policy",
                 "MEDIUM", "Content-Security-Policy is absent", "Add a restrictive Content-Security-Policy.", pageUri);
-        if ("https".equalsIgnoreCase(job.getTarget().getUrl().split(":", 2)[0])) {
+        if ("https".equalsIgnoreCase(pageUri.getScheme())) {
             addMissingHeader(job, keys, response.headers(), "MISSING_STRICT_TRANSPORT_SECURITY", "Strict-Transport-Security",
                     "MEDIUM", "Strict-Transport-Security is absent on an HTTPS response",
                     "Enable HSTS with an appropriate max-age and includeSubDomains policy.", pageUri);
@@ -885,13 +904,13 @@ public class ScanExecutionService {
                 "LOW", "Referrer-Policy is absent", "Set an explicit Referrer-Policy appropriate for the application.", pageUri);
         addMissingHeader(job, keys, response.headers(), "MISSING_PERMISSIONS_POLICY", "Permissions-Policy",
                 "LOW", "Permissions-Policy is absent", "Restrict unnecessary browser capabilities with Permissions-Policy.", pageUri);
-        if (headers.firstValue("X-Frame-Options").isEmpty() && !containsFrameAncestors(headers)) {
+        if (firstHeader(headers, "x-frame-options") == null && !containsFrameAncestors(headers)) {
             addFinding(job, keys, "MISSING_FRAME_PROTECTION",
                     pageComponent(pageUri, "X-Frame-Options/CSP frame-ancestors"), "MEDIUM",
                     "Neither X-Frame-Options nor CSP frame-ancestors was present",
                     "Use X-Frame-Options or a CSP frame-ancestors directive to prevent framing.");
         }
-        for (String cookie : headers.allValues("Set-Cookie")) {
+        for (String cookie : allHeaders(headers, "set-cookie")) {
             CookieObservation observation = parseCookie(cookie);
             if (observation == null) {
                 continue;
@@ -1029,9 +1048,9 @@ public class ScanExecutionService {
         return html.matches("(?s).*<svg\\s+data-vscan=\"" + java.util.regex.Pattern.quote(marker) + "\"[^>]*>.*");
     }
 
-    private void addMissingHeader(ScanJob job, Set<String> keys, java.net.http.HttpHeaders headers, String type,
+    private void addMissingHeader(ScanJob job, Set<String> keys, Map<String, List<String>> headers, String type,
                                   String header, String severity, String evidence, String remediation, URI pageUri) {
-        if (headers.firstValue(header).isEmpty()) {
+        if (firstHeader(headers, header) == null) {
             addFinding(job, keys, type, pageComponent(pageUri, header), severity, evidence, remediation);
         }
     }
@@ -1040,14 +1059,14 @@ public class ScanExecutionService {
         return pageUri + " [" + component + "]";
     }
 
-    private boolean containsFrameAncestors(java.net.http.HttpHeaders headers) {
-        return headers.allValues("Content-Security-Policy").stream()
+    private boolean containsFrameAncestors(Map<String, List<String>> headers) {
+        return allHeaders(headers, "content-security-policy").stream()
                 .anyMatch(value -> value.toLowerCase(Locale.ROOT).contains("frame-ancestors"));
     }
 
-    private void addDisclosureFinding(ScanJob job, Set<String> keys, java.net.http.HttpHeaders headers, String header,
+    private void addDisclosureFinding(ScanJob job, Set<String> keys, Map<String, List<String>> headers, String header,
                                       URI pageUri) {
-        for (String value : headers.allValues(header)) {
+        for (String value : allHeaders(headers, header.toLowerCase(Locale.ROOT))) {
             if (value.matches(".*\\d.*")) {
                 addFinding(job, keys, "INFORMATION_DISCLOSURE_" + header.toUpperCase(Locale.ROOT),
                         pageComponent(pageUri, header), "LOW",
@@ -1088,7 +1107,7 @@ public class ScanExecutionService {
     }
 
     private boolean isPotentialHtml(ScanResponse response) {
-        String contentType = response.headers().firstValue("Content-Type").orElse("");
+        String contentType = Objects.toString(firstHeader(response.headers(), "content-type"), "");
         String mediaType = contentType.split(";", 2)[0].trim().toLowerCase(Locale.ROOT);
         if ("application/json".equals(mediaType) || "text/plain".equals(mediaType)
                 || "application/javascript".equals(mediaType) || "text/css".equals(mediaType)) {
@@ -1242,12 +1261,22 @@ public class ScanExecutionService {
     }
 
     private boolean isHtmlDocument(ScanResponse response) {
-        return response.headers().firstValue("Content-Type")
-                .map(value -> {
-                    String mediaType = value.split(";", 2)[0].trim().toLowerCase(Locale.ROOT);
-                    return "text/html".equals(mediaType) || "application/xhtml+xml".equals(mediaType);
-                })
-                .orElse(false);
+        String contentType = firstHeader(response.headers(), "content-type");
+        return contentType != null && isHtmlContentType(contentType);
+    }
+
+    private boolean isHtmlContentType(String contentType) {
+        String mediaType = contentType.split(";", 2)[0].trim().toLowerCase(Locale.ROOT);
+        return "text/html".equals(mediaType) || "application/xhtml+xml".equals(mediaType);
+    }
+
+    private String firstHeader(Map<String, List<String>> headers, String name) {
+        List<String> values = headers.get(name.toLowerCase(Locale.ROOT));
+        return values == null || values.isEmpty() ? null : values.getFirst();
+    }
+
+    private List<String> allHeaders(Map<String, List<String>> headers, String name) {
+        return headers.getOrDefault(name.toLowerCase(Locale.ROOT), List.of());
     }
 
     private PageDiscovery discoverPage(URI origin, URI base, byte[] body) {
@@ -1342,7 +1371,7 @@ public class ScanExecutionService {
     private record CrawlResult(List<CrawledPage> pages, int discoveredPageCount, int visitedPageCount) {}
     private record CrawledPage(URI uri, ScanResponse response) {}
     private record PageDiscovery(List<URI> links, List<DiscoveredForm> forms) {}
-    private record ScanResponse(int statusCode, java.net.http.HttpHeaders headers, byte[] body) {}
+    private record ScanResponse(int statusCode, Map<String, List<String>> headers, byte[] body, URI finalUri) {}
     private record QueryParameter(String name, String value) {}
     private record CookieObservation(String name, boolean secure, boolean httpOnly, boolean sameSite) {}
 

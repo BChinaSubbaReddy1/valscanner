@@ -11,6 +11,7 @@ import org.springframework.stereotype.Service;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URLEncoder;
+import java.net.http.HttpTimeoutException;
 import java.util.regex.Pattern;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -76,13 +77,35 @@ public class ZapClientService {
         }
         try {
             HttpRequest request = newRequestBuilder("/JSON/core/view/version/")
-                    .timeout(connectTimeout)
+                    .timeout(readTimeout)
                     .GET()
                     .build();
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-            return response.statusCode() == 200;
-        } catch (Exception exception) {
-            log.debug("OWASP ZAP health check failed: {}", exception.getMessage());
+            HttpResponse<byte[]> response = BoundedHttpResponse.send(
+                    httpClient, request, MAX_API_RESPONSE_BYTES, readTimeout);
+            if (response.statusCode() == 401 || response.statusCode() == 403) {
+                log.warn("OWASP ZAP health check authentication failed (HTTP {})", response.statusCode());
+                return false;
+            }
+            if (response.statusCode() != 200) {
+                log.warn("OWASP ZAP health check returned HTTP {}", response.statusCode());
+                return false;
+            }
+            JsonNode json = objectMapper.readTree(new String(response.body(), StandardCharsets.UTF_8));
+            if (json.path("version").asText("").isBlank()) {
+                log.warn("OWASP ZAP health check returned an invalid version response");
+                return false;
+            }
+            return true;
+        } catch (HttpTimeoutException exception) {
+            log.warn("OWASP ZAP health check timed out");
+            return false;
+        } catch (IOException exception) {
+            log.warn("OWASP ZAP health check communication or response failed ({})",
+                    exception.getClass().getSimpleName());
+            return false;
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            log.warn("OWASP ZAP health check was interrupted");
             return false;
         }
     }

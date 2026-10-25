@@ -409,7 +409,153 @@ class ScanExecutionServiceTest {
 
         assertEquals(ScanStatus.FAILED, job.getStatus());
         assertEquals("TARGET_URL_INVALID", job.getFailureReason());
+        assertTrue(job.getStatusMessage().contains("outside the authorized target origin"));
         assertEquals(0, redirectedRequests.get());
+    }
+
+    @Test
+    void followsValidatedSameOriginRedirectAndScansFinalResponse() throws Exception {
+        AtomicInteger finalRequests = new AtomicInteger();
+        AtomicInteger relativeRequests = new AtomicInteger();
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/redirect", exchange -> {
+            exchange.getResponseHeaders().add("Location", "/nested/landing");
+            exchange.sendResponseHeaders(302, -1);
+            exchange.close();
+        });
+        server.createContext("/nested/landing", exchange -> {
+            finalRequests.incrementAndGet();
+            exchange.getResponseHeaders().add("Content-Type", "text/html");
+            byte[] body = "<html><body><a href=\"child\">child</a></body></html>"
+                    .getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.createContext("/nested/child", exchange -> {
+            relativeRequests.incrementAndGet();
+            exchange.getResponseHeaders().add("Content-Type", "text/html");
+            byte[] body = "<html><body>child</body></html>".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.start();
+
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        ScanFindingRepository findings = mock(ScanFindingRepository.class);
+        Organization organization = approvedOrganization(104L);
+        Target target = approvedTarget(organization,
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/redirect");
+        ScanJob job = approvedJob(organization, target);
+        when(jobs.findByIdForExecutionUpdate(anyLong())).thenReturn(Optional.of(job));
+        ScanExecutionService service = new ScanExecutionService(jobs, findings, false, null);
+        permitTestTarget(service, job);
+
+        service.runClaimed(104L);
+
+        assertEquals(ScanStatus.COMPLETED, job.getStatus(), job.getStatusMessage());
+        assertEquals(1, finalRequests.get());
+        assertEquals(1, relativeRequests.get());
+        assertEquals(2, job.getVisitedPageCount());
+    }
+
+    @Test
+    void rejectsRedirectLoopsBeforeRepeatingAnOutboundRequest() throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/first", exchange -> {
+            requests.incrementAndGet();
+            exchange.getResponseHeaders().add("Location", "/second");
+            exchange.sendResponseHeaders(302, -1);
+            exchange.close();
+        });
+        server.createContext("/second", exchange -> {
+            requests.incrementAndGet();
+            exchange.getResponseHeaders().add("Location", "/first");
+            exchange.sendResponseHeaders(302, -1);
+            exchange.close();
+        });
+        server.start();
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        Organization organization = approvedOrganization(106L);
+        Target target = approvedTarget(organization,
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/first");
+        ScanJob job = approvedJob(organization, target);
+        when(jobs.findByIdForExecutionUpdate(anyLong())).thenReturn(Optional.of(job));
+        ScanExecutionService service = new ScanExecutionService(
+                jobs, mock(ScanFindingRepository.class), false, null);
+        permitTestTarget(service, job);
+
+        service.runClaimed(106L);
+
+        assertEquals(ScanStatus.FAILED, job.getStatus());
+        assertEquals("TARGET_URL_INVALID", job.getFailureReason());
+        assertEquals(2, requests.get());
+    }
+
+    @Test
+    void rejectsAmbiguousRedirectLocations() throws Exception {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            exchange.getResponseHeaders().add("Location", "/first");
+            exchange.getResponseHeaders().add("Location", "/second");
+            exchange.sendResponseHeaders(302, -1);
+            exchange.close();
+        });
+        server.start();
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        Organization organization = approvedOrganization(107L);
+        Target target = approvedTarget(organization,
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/");
+        ScanJob job = approvedJob(organization, target);
+        when(jobs.findByIdForExecutionUpdate(anyLong())).thenReturn(Optional.of(job));
+        ScanExecutionService service = new ScanExecutionService(
+                jobs, mock(ScanFindingRepository.class), false, null);
+        permitTestTarget(service, job);
+
+        service.runClaimed(107L);
+
+        assertEquals(ScanStatus.FAILED, job.getStatus());
+        assertEquals("TARGET_URL_INVALID", job.getFailureReason());
+        assertTrue(job.getStatusMessage().contains("ambiguous redirect"));
+    }
+
+    @Test
+    void connectsToTheValidatedDnsAddressWithoutResolvingHostnameAgain() throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = "<html>pinned</html>".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.start();
+
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        ScanFindingRepository findings = mock(ScanFindingRepository.class);
+        Organization organization = approvedOrganization(105L);
+        String url = "http://scanner-target.test:" + server.getAddress().getPort() + "/";
+        Target target = approvedTarget(organization, url);
+        ScanJob job = approvedJob(organization, target);
+        when(jobs.findByIdForExecutionUpdate(anyLong())).thenReturn(Optional.of(job));
+        InetAddress resolvedAddress = InetAddress.getByName("127.0.0.1");
+        ScanExecutionService service = new ScanExecutionService(jobs, findings, false, null) {
+            @Override
+            InetAddress[] resolveAddresses(String host) {
+                assertEquals("scanner-target.test", host);
+                return new InetAddress[]{resolvedAddress};
+            }
+        };
+        ReflectionTestUtils.setField(service, "allowedPrivateTargetOrigins",
+                "http://scanner-target.test:" + server.getAddress().getPort());
+
+        service.runClaimed(105L);
+
+        assertEquals(ScanStatus.COMPLETED, job.getStatus(), job.getStatusMessage());
+        assertEquals(1, requests.get());
     }
 
     @Test
