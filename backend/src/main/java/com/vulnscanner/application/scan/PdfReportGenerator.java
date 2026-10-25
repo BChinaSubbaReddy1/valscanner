@@ -95,7 +95,9 @@ public final class PdfReportGenerator {
             appendWrapped(lines, "Evidence", finding.evidence());
             appendWrapped(lines, "Rationale", finding.rationale());
             appendWrapped(lines, "Detection source", finding.detectionSource()
-                    + " | Verification: " + finding.verificationStatus());
+                    + " | Assessment status: " + finding.verificationStatus());
+            appendWrapped(lines, "Assessment note",
+                    "Automated status does not independently confirm exploitability.");
             appendWrapped(lines, "Source metadata", "Rule " + finding.sourceRuleId()
                     + " | Confidence " + finding.sourceConfidence()
                     + " | CWE " + finding.sourceCweId()

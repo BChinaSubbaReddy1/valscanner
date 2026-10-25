@@ -205,7 +205,8 @@ class ScanReportIntegrationTest {
         assertTrue(pdfBody.contains("Severity totals: High 0, Medium 1, Low 31, Total 32"));
         assertTrue(pdfBody.contains("Evidence:"));
         assertTrue(pdfBody.contains("Header absent"));
-        assertTrue(pdfBody.contains("Detection source: PASSIVE_HEADERS"));
+        assertTrue(pdfBody.contains("Detection source: PASSIVE_HEADERS | Assessment status: VERIFIED"));
+        assertTrue(pdfBody.contains("Assessment note: Automated status does not independently confirm exploitability."));
         assertTrue(pdfBody.contains("TEST_FINDING_29"));
         assertFalse(pdfBody.contains("PDF summary limit:"));
     }

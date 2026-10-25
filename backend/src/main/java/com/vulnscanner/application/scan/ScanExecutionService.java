@@ -1299,9 +1299,12 @@ public class ScanExecutionService {
                 continue;
             }
             String actionUrl = form.hasAttr("action") ? form.absUrl("action") : base.toString();
-            URI action = addSameOriginLink(origin, actionUrl, links);
+            URI action = validateSameOriginLink(origin, actionUrl);
             if (action == null) {
                 continue;
+            }
+            if (method.equals("GET")) {
+                links.add(action);
             }
             LinkedHashSet<String> names = new LinkedHashSet<>();
             for (Element field : form.select("input[name], textarea[name], select[name], button[name]")) {
@@ -1319,13 +1322,20 @@ public class ScanExecutionService {
     }
 
     private URI addSameOriginLink(URI origin, String absoluteUrl, Set<URI> links) {
+        URI candidate = validateSameOriginLink(origin, absoluteUrl);
+        if (candidate != null) {
+            links.add(candidate);
+        }
+        return candidate;
+    }
+
+    private URI validateSameOriginLink(URI origin, String absoluteUrl) {
         if (absoluteUrl == null || absoluteUrl.isBlank()) {
             return null;
         }
         try {
             URI candidate = normalize(URI.create(absoluteUrl));
             if (sameOrigin(origin, candidate)) {
-                links.add(candidate);
                 return candidate;
             }
         } catch (IllegalArgumentException ignored) {

@@ -149,10 +149,29 @@ class ScanExecutionServiceTest {
             exchange.close();
         });
         server.createContext("/child", exchange -> {
-            byte[] body = ("<p>child</p><form method=\"POST\" action=\"/child\">"
+            byte[] body = ("<p>child</p><form method=\"POST\" action=\"/post-only\">"
                     + "<input name=\"username\" value=\"not-persisted\">"
-                    + "<input name=\"password\" value=\"secret\"></form>").getBytes();
+                    + "<input name=\"password\" value=\"secret\"></form>"
+                    + "<form method=\"GET\" action=\"/get-only\"><input name=\"search\"></form>").getBytes();
             exchange.getResponseHeaders().add("Content-Type", "text/html");
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        AtomicInteger postActionGetRequests = new AtomicInteger();
+        server.createContext("/post-only", exchange -> {
+            postActionGetRequests.incrementAndGet();
+            byte[] body = "post action".getBytes();
+            exchange.getResponseHeaders().add("Content-Type", "text/plain");
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        AtomicInteger getActionRequests = new AtomicInteger();
+        server.createContext("/get-only", exchange -> {
+            getActionRequests.incrementAndGet();
+            byte[] body = "get action".getBytes();
+            exchange.getResponseHeaders().add("Content-Type", "text/plain");
             exchange.sendResponseHeaders(200, body.length);
             exchange.getResponseBody().write(body);
             exchange.close();
@@ -196,10 +215,19 @@ class ScanExecutionServiceTest {
         ScanCrawlPage childPage = pagesCaptor.getAllValues().stream()
                 .filter(page -> page.getUrl().endsWith("/child"))
                 .findFirst().orElseThrow();
-        assertEquals(1, childPage.getDiscoveredForms().size());
-        assertEquals("POST", childPage.getDiscoveredForms().getFirst().method());
-        assertEquals(List.of("username", "password"),
-                childPage.getDiscoveredForms().getFirst().parameterNames());
+        assertEquals(2, childPage.getDiscoveredForms().size());
+        DiscoveredForm postForm = childPage.getDiscoveredForms().stream()
+                .filter(form -> "POST".equals(form.method()))
+                .findFirst().orElseThrow();
+        assertTrue(postForm.actionUrl().endsWith("/post-only"));
+        assertEquals(List.of("username", "password"), postForm.parameterNames());
+        DiscoveredForm getForm = childPage.getDiscoveredForms().stream()
+                .filter(form -> "GET".equals(form.method()))
+                .findFirst().orElseThrow();
+        assertTrue(getForm.actionUrl().endsWith("/get-only"));
+        assertEquals(List.of("search"), getForm.parameterNames());
+        assertEquals(0, postActionGetRequests.get());
+        assertEquals(1, getActionRequests.get());
         assertEquals(1, staticRequests.get());
         assertEquals(0, crossOriginRequests.get());
         assertEquals(ScanStatus.COMPLETED, job.getStatus());

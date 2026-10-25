@@ -956,6 +956,7 @@ describe('Authentication, Access Control and IAM Views', () => {
     expect(crawlPagesSpy).toHaveBeenCalledWith('91');
     expect(screen.getAllByText('CONTENT_SECURITY_POLICY').length).toBeGreaterThan(0);
     expect(screen.getByText('POTENTIAL')).toBeInTheDocument();
+    expect(screen.getByText('Automated status does not independently confirm exploitability.')).toBeInTheDocument();
     expect(findingsSpy).toHaveBeenCalledWith('91');
     expect(screen.queryByText(/CVE-/i)).not.toBeInTheDocument();
   });

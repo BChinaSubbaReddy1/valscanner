@@ -465,6 +465,7 @@ export default function ScanDetailsPage() {
                               {isNvdCve ? 'Known vulnerability / NVD lookup' : (finding.checkType || 'Check type unavailable')}
                             </p>
                             <h3>{statusText(finding.verificationStatus || 'Finding')}</h3>
+                            <p className="muted">Automated status does not independently confirm exploitability.</p>
                           </div>
                           <span className="status-chip" data-status={finding.severity}>{finding.severity || 'Severity unavailable'}</span>
                         </div>

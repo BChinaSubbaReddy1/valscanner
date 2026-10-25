@@ -10,7 +10,7 @@ public class ZapScanAdapter {
     public ScanFinding toFinding(ScanJob job, ZapAlert alert) {
         String checkType = mapCheckType(alert.alert());
         String severity = mapSeverity(alert.risk());
-        String verificationStatus = mapVerificationStatus(alert.confidence());
+        String verificationStatus = mapVerificationStatus(checkType);
 
         String component = alert.url() != null ? alert.url() : "";
         if (alert.param() != null && !alert.param().isBlank()) {
@@ -62,15 +62,21 @@ public class ZapScanAdapter {
         };
     }
 
-    public String mapVerificationStatus(String confidence) {
-        if (confidence == null) {
+    public String mapVerificationStatus(String checkType) {
+        if (checkType == null) {
             return "POTENTIAL";
         }
-        return switch (confidence.trim().toLowerCase(Locale.ROOT)) {
-            case "high" -> "OBSERVED";
-            case "medium" -> "OBSERVED";
-            default -> "POTENTIAL";
-        };
+        if (checkType.equals("SQL_INJECTION_SUSPECTED")) {
+            return "SUSPECTED";
+        }
+        if (checkType.equals("REFLECTED_XSS_POTENTIAL")) {
+            return "POTENTIAL";
+        }
+        if (checkType.startsWith("MISSING_") || checkType.startsWith("COOKIE_MISSING_")
+                || checkType.startsWith("INFORMATION_DISCLOSURE_")) {
+            return "OBSERVED";
+        }
+        return "POTENTIAL";
     }
 
     public String mapCheckType(String alertName) {
@@ -94,7 +100,7 @@ public class ZapScanAdapter {
         if (normalized.contains("sql injection")) {
             return "SQL_INJECTION_SUSPECTED";
         }
-        if (normalized.contains("cross site scripting") || normalized.contains("xss")) {
+        if (normalized.contains("cross site scripting (reflected)")) {
             return "REFLECTED_XSS_POTENTIAL";
         }
         if (normalized.contains("httponly")) {

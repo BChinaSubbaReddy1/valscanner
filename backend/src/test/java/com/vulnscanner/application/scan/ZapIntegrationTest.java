@@ -217,7 +217,7 @@ class ZapIntegrationTest {
     }
 
     @Test
-    void zapAlertRetainsSourceMetadataWithoutCallingItIndependentlyVerified() {
+    void zapAlertRetainsConfidenceAsMetadataWithoutTreatingItAsVerification() {
         String targetUrl = "http://127.0.0.1:" + targetServer.getAddress().getPort();
         ScanJob job = createApprovedJob(10L, ScanType.ZAP_PASSIVE, targetUrl);
         ZapAlert alert = new ZapAlert("40012", "Cross Site Scripting (Reflected)", "High", "High",
@@ -226,12 +226,40 @@ class ZapIntegrationTest {
 
         ScanFinding finding = new ZapScanAdapter().toFinding(job, alert);
 
-        assertEquals("OBSERVED", finding.getVerificationStatus());
+        assertEquals("POTENTIAL", finding.getVerificationStatus());
         assertEquals("40012", finding.getSourceRuleId());
         assertEquals("High", finding.getSourceConfidence());
         assertEquals("https://example.test/rule", finding.getSourceReference());
         assertEquals("79", finding.getSourceCweId());
         assertEquals("8", finding.getSourceWascId());
+
+        ZapAlert sqlAlert = new ZapAlert("40018", "SQL Injection", "High", "High",
+                targetUrl + "/search", "q", "test", "database error", "Description", "Remediation",
+                "", "", "");
+        ScanFinding sqlFinding = new ZapScanAdapter().toFinding(job, sqlAlert);
+
+        assertEquals("SUSPECTED", sqlFinding.getVerificationStatus());
+        assertEquals("High", sqlFinding.getSourceConfidence());
+
+        for (String confidence : List.of("Medium", "Low")) {
+            ZapAlert xssAlert = new ZapAlert("40012", "Cross Site Scripting (Reflected)", "High", confidence,
+                    targetUrl + "/search", "q", "", "", "Description", "Remediation",
+                    "", "", "");
+            assertEquals("POTENTIAL",
+                    new ZapScanAdapter().toFinding(job, xssAlert).getVerificationStatus());
+        }
+        ZapAlert xssWithoutConfidence = new ZapAlert("40012", "Cross Site Scripting (Reflected)", "High", null,
+                targetUrl + "/search", "q", "", "", "Description", "Remediation",
+                "", "", "");
+        assertEquals("POTENTIAL",
+                new ZapScanAdapter().toFinding(job, xssWithoutConfidence).getVerificationStatus());
+
+        ZapAlert xssProtectionHeaderAlert = new ZapAlert("10020", "X-XSS-Protection Header Not Set",
+                "Low", "High", targetUrl, "", "", "", "Description", "Remediation",
+                "", "", "");
+        ScanFinding xssProtectionHeaderFinding = new ZapScanAdapter().toFinding(job, xssProtectionHeaderAlert);
+        assertEquals("ZAP_X_XSS_PROTECTION_HEADER_NOT_SET", xssProtectionHeaderFinding.getCheckType());
+        assertEquals("POTENTIAL", xssProtectionHeaderFinding.getVerificationStatus());
     }
 
     @Test
@@ -402,7 +430,7 @@ class ZapIntegrationTest {
                 .filter(f -> f.getCheckType().equals("REFLECTED_XSS_POTENTIAL"))
                 .findFirst().orElseThrow();
         assertEquals("HIGH", xssFinding.getSeverity());
-        assertEquals("OBSERVED", xssFinding.getVerificationStatus());
+        assertEquals("POTENTIAL", xssFinding.getVerificationStatus());
         assertEquals("High", xssFinding.getSourceConfidence());
         assertEquals("", xssFinding.getSourceRuleId());
         assertEquals("OWASP_ZAP", xssFinding.getDetectionSource());
