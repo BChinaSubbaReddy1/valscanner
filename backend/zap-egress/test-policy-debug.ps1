@@ -1,4 +1,4 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 
 $entrypoint = Join-Path $PSScriptRoot 'entrypoint.sh'
 $squidConfig = Join-Path $PSScriptRoot 'squid-debug.conf'
@@ -52,7 +52,7 @@ grep -Fqx 'acl approved_lab_1 dstdomain lab.example' /run/squid/approved-labs.co
     || fail "approved-labs.conf missing expected dstdomain line" 21
 grep -Fqx 'acl approved_lab_port_1 port 18080' /run/squid/approved-labs.conf \
     || fail "approved-labs.conf missing expected port line" 22
-grep -Fqx 'acl approved_lab_addr_1 dst 127.0.0.1' /run/squid/approved-labs.conf \
+grep -Fqx "acl approved_lab_addr_1 dst ${LAB_IP}" /run/squid/approved-labs.conf \
     || fail "approved-labs.conf missing expected dst line" 23
 grep -Fqx 'http_access allow approved_lab_1 approved_lab_port_1 approved_lab_addr_1' /run/squid/approved-labs.conf \
     || fail "approved-labs.conf missing expected http_access line" 24
@@ -82,55 +82,146 @@ request_status() {
 private_status=$(request_status http://private.example/ private.example private)
 metadata_status=$(request_status http://metadata.example/ metadata.example metadata)
 metadata6_status=$(request_status http://metadata6.example/ metadata6.example metadata6)
+documentation6_status=$(request_status http://documentation6.example/ documentation6.example documentation6)
 mapped_metadata_status=$(request_status http://mapped-metadata.example/ mapped-metadata.example mapped-metadata)
 mapped_private_status=$(request_status 'http://[::ffff:10.0.0.1]/' '[::ffff:10.0.0.1]' mapped-private)
 mapped_loopback_status=$(request_status 'http://[::ffff:127.0.0.1]/' '[::ffff:127.0.0.1]' mapped-loopback)
 mapped_link_local_status=$(request_status 'http://[::ffff:169.254.169.254]/' '[::ffff:169.254.169.254]' mapped-link-local)
-mapped_public_status=$(request_status 'http://[::ffff:93.184.216.34]/' '[::ffff:93.184.216.34]' mapped-public)
+mapped_public_status=$(request_status 'http://[::ffff:104.20.23.154]/' '[::ffff:104.20.23.154]' mapped-public)
 lab_status=$(request_status http://lab.example:18080/ lab.example lab)
 lab_wrong_port_status=$(request_status http://lab.example:18081/ lab.example lab-wrong-port)
 lab_subdomain_status=$(request_status http://sub.lab.example:18080/ sub.lab.example lab-subdomain)
 public_status=$(request_status http://public.example/ public.example public)
 
-printf 'private=%s\nmetadata=%s\nmetadata6=%s\nmapped_metadata=%s\nmapped_private=%s\nmapped_loopback=%s\nmapped_link_local=%s\nmapped_public=%s\nlab=%s\nlab_wrong_port=%s\nlab_subdomain=%s\npublic=%s\n' \
-    "$private_status" "$metadata_status" "$metadata6_status" "$mapped_metadata_status" \
+printf 'private=%s\nmetadata=%s\nmetadata6=%s\ndocumentation6=%s\nmapped_metadata=%s\nmapped_private=%s\nmapped_loopback=%s\nmapped_link_local=%s\nmapped_public=%s\nlab=%s\nlab_wrong_port=%s\nlab_subdomain=%s\npublic=%s\n' \
+    "$private_status" "$metadata_status" "$metadata6_status" "$documentation6_status" "$mapped_metadata_status" \
     "$mapped_private_status" "$mapped_loopback_status" "$mapped_link_local_status" "$mapped_public_status" \
     "$lab_status" "$lab_wrong_port_status" "$lab_subdomain_status" "$public_status"
-case "$private_status" in 403) ;; *) fail "private.example expected 403, got $private_status" 11 ;; esac
-case "$metadata_status" in 403) ;; *) fail "metadata.example expected 403, got $metadata_status" 12 ;; esac
-case "$metadata6_status" in 403) ;; *) fail "metadata6.example expected 403, got $metadata6_status" 13 ;; esac
-case "$mapped_metadata_status" in 403) ;; *) fail "mapped-metadata.example expected 403, got $mapped_metadata_status" 14 ;; esac
-case "$mapped_private_status" in 403) ;; *) fail "mapped private IPv4 expected 403, got $mapped_private_status" 15 ;; esac
-case "$mapped_loopback_status" in 403) ;; *) fail "mapped loopback IPv4 expected 403, got $mapped_loopback_status" 16 ;; esac
-case "$mapped_link_local_status" in 403) ;; *) fail "mapped link-local IPv4 expected 403, got $mapped_link_local_status" 17 ;; esac
-case "$mapped_public_status" in 403) fail "mapped public IPv4 expected non-403, got 403" 18 ;; esac
-case "$lab_status" in 403) fail "lab.example expected allow, got 403" 20 ;; esac
-case "$lab_wrong_port_status" in 403) ;; *) fail "lab.example:wrong-port expected 403, got $lab_wrong_port_status" 21 ;; esac
-case "$lab_subdomain_status" in 403) ;; *) fail "sub.lab.example expected 403, got $lab_subdomain_status" 22 ;; esac
-case "$public_status" in 403) fail "public.example expected allow, got 403" 23 ;; esac
+
+case "$private_status" in
+    403) ;;
+    *) fail "private.example expected 403, got $private_status" 11 ;;
+esac
+
+case "$metadata_status" in
+    403) ;;
+    *) fail "metadata.example expected 403, got $metadata_status" 12 ;;
+esac
+
+case "$metadata6_status" in
+    403) ;;
+    *) fail "metadata6.example expected 403, got $metadata6_status" 13 ;;
+esac
+
+case "$documentation6_status" in
+    403) ;;
+    *) fail "documentation6.example expected 403, got $documentation6_status" 19 ;;
+esac
+
+case "$mapped_metadata_status" in
+    403) ;;
+    *) fail "mapped-metadata.example expected 403, got $mapped_metadata_status" 14 ;;
+esac
+
+case "$mapped_private_status" in
+    403) ;;
+    *) fail "mapped private IPv4 expected 403, got $mapped_private_status" 15 ;;
+esac
+
+case "$mapped_loopback_status" in
+    403) ;;
+    *) fail "mapped loopback IPv4 expected 403, got $mapped_loopback_status" 16 ;;
+esac
+
+case "$mapped_link_local_status" in
+    403) ;;
+    *) fail "mapped link-local IPv4 expected 403, got $mapped_link_local_status" 17 ;;
+esac
+
+if ! grep -E 'TCP_MISS/[0-9]{3} .*GET http://104\.20\.23\.154/ .*HIER_DIRECT/104\.20\.23\.154' \
+    /var/log/squid/access.log >/dev/null; then
+    fail "mapped public IPv4 was not confirmed as directly forwarded by Squid" 18
+fi
+
+case "$lab_status" in
+    200) ;;
+    *) fail "lab.example expected 200, got $lab_status" 20 ;;
+esac
+
+case "$lab_wrong_port_status" in
+    403) ;;
+    *) fail "lab.example:wrong-port expected 403, got $lab_wrong_port_status" 21 ;;
+esac
+
+case "$lab_subdomain_status" in
+    403) ;;
+    *) fail "sub.lab.example expected 403, got $lab_subdomain_status" 22 ;;
+esac
+
+case "$public_status" in
+    2??|3??|4??) ;;
+    *) fail "public.example expected a valid HTTP response, got $public_status" 23 ;;
+esac
 '@
 $containerTest = $containerTest -replace "`r", ''
-$encodedContainerTest = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($containerTest))
+
+$encodedContainerTest = [Convert]::ToBase64String(
+    [Text.Encoding]::UTF8.GetBytes($containerTest)
+)
 $containerCommand = "printf '%s' '$encodedContainerTest' | base64 -d | /bin/bash -s"
 
-$dockerArgs = @(
-    'run', '--rm', '--network', 'none',
-    '--add-host', 'private.example:10.0.0.1',
-    '--add-host', 'metadata.example:169.254.169.254',
-    '--add-host', 'metadata6.example:[fd00:ec2::254]',
-    '--add-host', 'mapped-metadata.example:[::ffff:169.254.169.254]',
-    '--add-host', 'lab.example:127.0.0.1',
-    '--add-host', 'sub.lab.example:127.0.0.1',
-    '--add-host', 'public.example:93.184.216.34',
-    '--entrypoint', '/bin/bash',
-    '--mount', "type=bind,source=$entrypoint,target=/usr/local/bin/zap-egress-entrypoint.sh,readonly",
-    '--mount', "type=bind,source=$squidConfig,target=/etc/squid/squid.conf,readonly",
-    '-e', 'SCANNER_ALLOWED_PRIVATE_TARGET_ORIGINS=http://lab.example:18080,http://metadata.example:80,http://metadata6.example:80,http://mapped-metadata.example:80',
-    'ubuntu/squid@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029',
-    '-c', $containerCommand
-)
+$serverName = "zap-egress-debug-server-$([guid]::NewGuid().ToString('N'))"
 
-& docker @dockerArgs
-if ($LASTEXITCODE -ne 0) {
-    throw "ZAP egress policy regression test failed with exit code $LASTEXITCODE"
+try {
+    # Start a real HTTP server for the approved lab target.
+    & docker run -d --rm `
+        --name $serverName `
+        --network bridge `
+        --entrypoint /bin/sh `
+        busybox:1.36 `
+        -c 'mkdir -p /www; printf "egress-test-ok\n" > /www/index.html; exec httpd -f -p 18080 -h /www'
+
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Could not start the temporary debug HTTP server.'
+    }
+
+    $labIp = (& docker inspect $serverName --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}').Trim()
+
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($labIp)) {
+        throw 'Could not determine the debug HTTP server IP.'
+    }
+
+    Start-Sleep -Seconds 2
+
+    $dockerArgs = @(
+        'run', '--rm', '--network', 'bridge',
+        '--add-host', 'private.example:10.0.0.1',
+        '--add-host', 'metadata.example:169.254.169.254',
+        '--add-host', 'metadata6.example:[fd00:ec2::254]',
+        '--add-host', 'documentation6.example:[2001:db8::1]',
+        '--add-host', 'mapped-metadata.example:[::ffff:169.254.169.254]',
+        '--add-host', 'mapped-private.example:[::ffff:10.0.0.1]',
+        '--add-host', 'mapped-loopback.example:[::ffff:127.0.0.1]',
+        '--add-host', 'mapped-link-local.example:[::ffff:169.254.169.254]',
+        '--add-host', 'mapped-public.example:[::ffff:104.20.23.154]',
+        '--add-host', "lab.example:$labIp",
+        '--add-host', "sub.lab.example:$labIp",
+        '--add-host', 'public.example:104.20.23.154',
+        '--entrypoint', '/bin/bash',
+        '--mount', "type=bind,source=$entrypoint,target=/usr/local/bin/zap-egress-entrypoint.sh,readonly",
+        '--mount', "type=bind,source=$squidConfig,target=/etc/squid/squid.conf,readonly",
+        '-e', "LAB_IP=$labIp",
+        '-e', 'SCANNER_ALLOWED_PRIVATE_TARGET_ORIGINS=http://lab.example:18080,http://metadata.example:80,http://mapped-metadata.example:80',
+        $squidImage,
+        '-c', $containerCommand
+    )
+
+    & docker @dockerArgs
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "ZAP egress debug regression test failed with exit code $LASTEXITCODE"
+    }
+}
+finally {
+    & docker rm -f $serverName 2>$null | Out-Null
 }
