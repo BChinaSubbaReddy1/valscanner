@@ -3,6 +3,9 @@ services:
     depends_on:
       zap:
         condition: service_healthy
+    networks:
+      - vulnscanner-lab
+      - vulnscanner-zap-control
     environment:
       SCANNER_ZAP_ENABLED: "true"
       SCANNER_ZAP_BASE_URL: http://zap:8090
@@ -11,6 +14,9 @@ services:
   zap:
     image: zaproxy/zap-stable:2.16.1
     container_name: vulnscanner-zap
+    depends_on:
+      zap-egress:
+        condition: service_healthy
     command:
       - zap.sh
       - -daemon
@@ -26,11 +32,18 @@ services:
       - api.key=${SCANNER_ZAP_API_KEY:?Set SCANNER_ZAP_API_KEY in .env}
       - -config
       - api.disablekey=false
+      - -config
+      - connection.proxyChain.enabled=true
+      - -config
+      - connection.proxyChain.hostName=zap-egress
+      - -config
+      - connection.proxyChain.port=3128
     ports:
       - "127.0.0.1:${ZAP_HOST_PORT:-8090}:8090"
     restart: unless-stopped
     networks:
-      - vulnscanner-lab
+      - vulnscanner-zap-control
+      - vulnscanner-zap-proxy
     healthcheck:
       test:
         - CMD-SHELL
@@ -39,3 +52,50 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
+
+  zap-egress:
+    image: ubuntu/squid@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029
+    container_name: vulnscanner-zap-egress
+    depends_on:
+      juice-shop:
+        condition: service_started
+      dvwa:
+        condition: service_started
+    restart: unless-stopped
+    environment:
+      SCANNER_ALLOWED_PRIVATE_TARGET_ORIGINS: ${SCANNER_ALLOWED_PRIVATE_TARGET_ORIGINS:-http://juice-shop:3000,http://dvwa:80}
+    entrypoint:
+      - /bin/sh
+      - /usr/local/bin/zap-egress-entrypoint.sh
+    volumes:
+      - ./zap-egress/squid.conf:/etc/squid/squid.conf:ro
+      - ./zap-egress/entrypoint.sh:/usr/local/bin/zap-egress-entrypoint.sh:ro
+    networks:
+      vulnscanner-zap-outbound:
+        gw_priority: 1
+      vulnscanner-zap-proxy: {}
+      vulnscanner-zap-targets: {}
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/3128'"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  juice-shop:
+    networks:
+      - vulnscanner-lab
+      - vulnscanner-zap-targets
+
+  dvwa:
+    networks:
+      - vulnscanner-lab
+      - vulnscanner-zap-targets
+
+networks:
+  vulnscanner-zap-control:
+    internal: true
+  vulnscanner-zap-targets:
+    internal: true
+  vulnscanner-zap-proxy:
+    internal: true
+  vulnscanner-zap-outbound: {}

@@ -78,6 +78,17 @@ docker compose -f docker-compose.yml -f docker-compose.zap.yml up --build
 The backend reaches ZAP at the internal `http://zap:8090` address. The ZAP host port
 is bound to loopback, and its readiness check uses the authenticated API version
 endpoint. ZAP scans use a temporary context restricted to the exact target origin.
+ZAP outbound HTTP(S) requests use the `zap-egress` Squid proxy. It blocks loopback,
+private, link-local, metadata, multicast, and special-use destination ranges; exact
+private lab host-and-port origins from `SCANNER_ALLOWED_PRIVATE_TARGET_ORIGINS` are
+the only private-destination exceptions, and are further bound to the addresses
+resolved when the proxy starts. Restart the proxy after changing a lab target's
+address. Explicit special-use and IPv6 metadata denials take precedence over those
+exceptions. The proxy is internal to the Compose network and
+does not publish a host port. ZAP itself is attached only to the internal API and proxy
+networks, so it has no direct route to targets or the internet. Only the egress proxy
+joins the isolated target network and the outbound network. Juice Shop and DVWA are
+also joined to the isolated ZAP target network.
 Spidering is limited to depth 2 and 10 children per node; ZAP active scan rule and
 duration limits, alert caps, the worker deadline, and API timeouts are configured.
 Reports retain distinct native and ZAP engine statuses, including partial ZAP results.
