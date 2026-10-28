@@ -72,6 +72,9 @@ class ScanReportIntegrationTest {
         job.transitionTo(ScanStatus.RUNNING, 20, "Running", null);
         job.transitionTo(ScanStatus.COMPLETED, 100, "Done", null);
         job.updateNativeEngineStatus("COMPLETED");
+        job.updateZapEngineStatus("UNAVAILABLE");
+        job.updateZapFailureReason("ZAP_HEALTH_CHECK_FAILED");
+        job.recordNvdLookupStatus(NvdLookupStatus.RATE_LIMITED);
         job.updateCrawlCounts(3, 2, 2);
         scanJobRepository.saveAndFlush(job);
 
@@ -98,12 +101,17 @@ class ScanReportIntegrationTest {
                 .andExpect(jsonPath("$.data.totalFindings").value(3))
                 .andExpect(jsonPath("$.data.totalCrawlPages").value(1))
                 .andExpect(jsonPath("$.data.executionSummary.nativeEngineStatus").value("COMPLETED"))
-                .andExpect(jsonPath("$.data.executionSummary.zapEngineStatus").value("NOT_REQUESTED"))
+                .andExpect(jsonPath("$.data.executionSummary.zapRequested").value(true))
+                .andExpect(jsonPath("$.data.executionSummary.zapEngineStatus").value("UNAVAILABLE"))
+                .andExpect(jsonPath("$.data.executionSummary.zapFailureReason").value("ZAP_HEALTH_CHECK_FAILED"))
+                .andExpect(jsonPath("$.data.executionSummary.zapSpiderStatus").value("NOT_STARTED"))
+                .andExpect(jsonPath("$.data.executionSummary.zapPassiveStatus").value("NOT_STARTED"))
+                .andExpect(jsonPath("$.data.executionSummary.nvdLookupStatus").value("RATE_LIMITED"))
                 .andExpect(jsonPath("$.data.executionSummary.discoveredPageCount").value(3))
                 .andExpect(jsonPath("$.data.executionSummary.visitedPageCount").value(2))
                 .andExpect(jsonPath("$.data.executionSummary.testedPassivePageCount").value(2))
-                .andExpect(jsonPath("$.data.executionSummary.checksOutOfScope").value(
-                        org.hamcrest.Matchers.hasItem("OWASP ZAP spider or passive analysis")))
+                .andExpect(jsonPath("$.data.executionSummary.checksInScope").value(
+                        org.hamcrest.Matchers.hasItem("OWASP ZAP spider and passive analysis")))
                 .andExpect(jsonPath("$.data.severitySummary.high").value(1))
                 .andExpect(jsonPath("$.data.severitySummary.medium").value(1))
                 .andExpect(jsonPath("$.data.severitySummary.low").value(1))
@@ -112,6 +120,37 @@ class ScanReportIntegrationTest {
 
         JsonNode json = objectMapper.readTree(result.getResponse().getContentAsString());
         assertEquals(3, json.path("data").path("findings").size());
+    }
+
+    @Test
+    void reportContainsOnlyFindingsFromTheRequestedScan() throws Exception {
+        Organization organization = approvedOrganization("Isolated Findings Tenant");
+        User analyst = createUser(RoleName.SECURITY_ANALYST, "isolated-findings@example.com", organization);
+        Target target = createTarget(organization, analyst, TargetStatus.APPROVED);
+        ScanJob firstScan = completedScan(target, organization, analyst);
+        ScanJob secondScan = completedScan(target, organization, analyst);
+        scanFindingRepository.save(new ScanFinding(firstScan, "FIRST_SCAN_FINDING", "HIGH",
+                "first-endpoint", "first evidence", "first rationale", "first remediation",
+                "TEST", "OBSERVED"));
+        scanFindingRepository.save(new ScanFinding(secondScan, "SECOND_SCAN_FINDING", "LOW",
+                "second-endpoint", "second evidence", "second rationale", "second remediation",
+                "TEST", "OBSERVED"));
+        scanFindingRepository.flush();
+        String token = login(analyst.getEmail());
+
+        mockMvc.perform(get("/api/scans/{scanId}/report", firstScan.getId())
+                        .header("Authorization", "Bearer " + token))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.totalFindings").value(1))
+                .andExpect(jsonPath("$.data.severitySummary.high").value(1))
+                .andExpect(jsonPath("$.data.findings[0].checkType").value("FIRST_SCAN_FINDING"));
+        mockMvc.perform(get("/api/scans/{scanId}/report/export", secondScan.getId())
+                        .param("format", "json")
+                        .header("Authorization", "Bearer " + token))
+                .andExpect(status().isOk())
+                .andExpect(content().string(org.hamcrest.Matchers.containsString("SECOND_SCAN_FINDING")))
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString("FIRST_SCAN_FINDING"))));
     }
 
     @Test
@@ -126,6 +165,9 @@ class ScanReportIntegrationTest {
         job.transitionTo(ScanStatus.RUNNING, 20, "Running", null);
         job.transitionTo(ScanStatus.COMPLETED, 100, "Done", null);
         job.updateNativeEngineStatus("COMPLETED");
+        job.updateZapEngineStatus("UNAVAILABLE");
+        job.updateZapFailureReason("ZAP_HEALTH_CHECK_FAILED");
+        job.recordNvdLookupStatus(NvdLookupStatus.RATE_LIMITED);
         job.updateCrawlCounts(4, 3, 3);
         scanJobRepository.saveAndFlush(job);
 
@@ -134,11 +176,19 @@ class ScanReportIntegrationTest {
                 "PASSIVE_HEADERS", "VERIFIED"));
 
         scanFindingRepository.save(new ScanFinding(job, "FORMULA_FIXTURE", "LOW",
-                "=HYPERLINK(\"https://attacker.invalid\")", "controlled fixture", "Test fixture", "Review",
+                "=HYPERLINK(\"https://attacker.invalid\")",
+                "a".repeat(85) + "😀; café 東京 😀 (sample) \\ path\nnext", "Test fixture", "Review",
                 "TEST", "OBSERVED"));
         for (int index = 0; index < 30; index++) {
+            String component = switch (index) {
+                case 0 -> "+1";
+                case 1 -> "-1";
+                case 2 -> "@SUM";
+                case 3 -> "  =1";
+                default -> "component-" + index;
+            };
             scanFindingRepository.save(new ScanFinding(job, "TEST_FINDING_" + index, "LOW",
-                    "component-" + index, "controlled fixture", "Test fixture", "Review",
+                    component, "controlled fixture", "Test fixture", "Review",
                     "TEST", "OBSERVED"));
         }
 
@@ -155,12 +205,19 @@ class ScanReportIntegrationTest {
         String jsonBody = jsonResult.getResponse().getContentAsString();
         assertTrue(jsonBody.contains("MISSING_CONTENT_SECURITY_POLICY"));
         assertTrue(jsonBody.contains("\"nativeEngineStatus\" : \"COMPLETED\""));
-        assertTrue(jsonBody.contains("\"zapEngineStatus\" : \"NOT_REQUESTED\""));
+        assertTrue(jsonBody.contains("\"zapRequested\" : true"));
+        assertTrue(jsonBody.contains("\"zapEngineStatus\" : \"UNAVAILABLE\""));
+        assertTrue(jsonBody.contains("\"zapFailureReason\" : \"ZAP_HEALTH_CHECK_FAILED\""));
+        assertTrue(jsonBody.contains("\"zapSpiderStatus\" : \"NOT_STARTED\""));
+        assertTrue(jsonBody.contains("\"zapPassiveStatus\" : \"NOT_STARTED\""));
+        assertTrue(jsonBody.contains("\"nvdLookupStatus\" : \"RATE_LIMITED\""));
         assertTrue(jsonBody.contains("\"discoveredPageCount\" : 4"));
         assertTrue(jsonBody.contains("\"totalFindings\" : 32"));
         assertTrue(jsonBody.contains("\"medium\" : 1"));
         assertTrue(jsonBody.contains("\"low\" : 31"));
         assertTrue(jsonBody.contains("\"detectionSource\" : \"PASSIVE_HEADERS\""));
+        assertTrue(jsonBody.contains("東京"));
+        assertTrue(jsonBody.contains("😀") || jsonBody.contains("\\uD83D\\uDE00"));
         // Check redaction
         assertFalse(jsonBody.contains("secret-123456"));
         assertTrue(jsonBody.contains("[REDACTED]"));
@@ -177,13 +234,25 @@ class ScanReportIntegrationTest {
         assertTrue(csvBody.startsWith("# Scan ID,"));
         assertTrue(csvBody.contains("Finding ID,Check Type,Severity"));
         assertTrue(csvBody.contains("MISSING_CONTENT_SECURITY_POLICY"));
-        assertTrue(csvBody.contains("# OWASP ZAP Status,NOT_REQUESTED"));
+        assertTrue(csvBody.contains("# OWASP ZAP Status,UNAVAILABLE"));
+        assertTrue(csvBody.contains("# OWASP ZAP Requested,true"));
+        assertTrue(csvBody.contains("# OWASP ZAP Failure Reason,ZAP_HEALTH_CHECK_FAILED"));
+        assertTrue(csvBody.contains("# ZAP Spider Status,NOT_STARTED"));
+        assertTrue(csvBody.contains("# ZAP Passive Analysis Status,NOT_STARTED"));
+        assertTrue(csvBody.contains("# NVD Lookup Status,RATE_LIMITED"));
         assertTrue(csvBody.contains("# Discovered Same-Origin Pages,4"));
         assertTrue(csvBody.contains("# Passively Tested Pages,3"));
         assertTrue(csvBody.contains("# Persisted HTML Crawl Records,0"));
         assertTrue(csvBody.contains("# High,0,Medium,1,Low,31,Total,32"));
         assertTrue(csvBody.contains("PASSIVE_HEADERS"));
         assertTrue(csvBody.contains("'=HYPERLINK("));
+        assertTrue(csvBody.contains("東京"));
+        assertTrue(csvBody.contains("😀"));
+        assertTrue(csvBody.contains("LOW,'+1,"));
+        assertTrue(csvBody.contains("LOW,'-1,"));
+        assertTrue(csvBody.contains("LOW,'@SUM,"));
+        assertTrue(csvBody.contains("LOW,'  =1,"));
+        assertTrue(csvBody.contains("LOW,component-4,"));
         assertFalse(csvBody.contains("secret-123456"));
 
         // PDF export
@@ -201,10 +270,21 @@ class ScanReportIntegrationTest {
         String pdfTail = new String(pdfBytes, pdfBytes.length - 10, 10, StandardCharsets.ISO_8859_1);
         assertTrue(pdfTail.contains("%%EOF"));
         String pdfBody = new String(pdfBytes, StandardCharsets.ISO_8859_1);
-        assertTrue(pdfBody.contains("OWASP ZAP: NOT_REQUESTED"));
+        assertTrue(pdfBody.contains("OWASP ZAP: UNAVAILABLE"));
+        assertTrue(pdfBody.contains("OWASP ZAP requested: true"));
+        assertTrue(pdfBody.contains("ZAP_HEALTH_CHECK_FAILED"));
+        assertTrue(pdfBody.contains("ZAP spider: NOT_STARTED"));
+        assertTrue(pdfBody.contains("ZAP passive analysis: NOT_STARTED"));
+        assertTrue(pdfBody.contains("ZAP active scan: NOT_EXECUTED"));
+        assertTrue(pdfBody.contains("NVD lookup: RATE_LIMITED"));
         assertTrue(pdfBody.contains("Severity totals: High 0, Medium 1, Low 31, Total 32"));
         assertTrue(pdfBody.contains("Evidence:"));
         assertTrue(pdfBody.contains("Header absent"));
+        assertTrue(pdfBody.contains("café"));
+        assertTrue(pdfBody.contains("\\u{6771}"));
+        assertTrue(pdfBody.contains("\\u{1F600}"));
+        assertTrue(pdfBody.contains("\\(sample\\)"));
+        assertTrue(pdfBody.contains("\\\\ path next"));
         assertTrue(pdfBody.contains("Detection source: PASSIVE_HEADERS | Assessment status: VERIFIED"));
         assertTrue(pdfBody.contains("Assessment note: Automated status does not independently confirm exploitability."));
         assertTrue(pdfBody.contains("TEST_FINDING_29"));
@@ -248,18 +328,26 @@ class ScanReportIntegrationTest {
         jobA.transitionTo(ScanStatus.RUNNING, 20, "Running", null);
         jobA.transitionTo(ScanStatus.COMPLETED, 100, "Done", null);
         scanJobRepository.saveAndFlush(jobA);
+        String foreignEvidence = "FOREIGN_ORGANIZATION_REPORT_EVIDENCE";
+        scanFindingRepository.saveAndFlush(new ScanFinding(jobA, "FOREIGN_REPORT_FINDING", "HIGH",
+                "foreign-component", foreignEvidence, "Sensitive rationale", "Sensitive remediation",
+                "TEST", "OBSERVED"));
 
         String tokenB = login(analystB.getEmail());
 
-        // Foreign organization request must return 404
         mockMvc.perform(get("/api/scans/{scanId}/report", jobA.getId())
                         .header("Authorization", "Bearer " + tokenB))
-                .andExpect(status().isNotFound());
-
-        mockMvc.perform(get("/api/scans/{scanId}/report/export", jobA.getId())
-                        .param("format", "pdf")
-                        .header("Authorization", "Bearer " + tokenB))
-                .andExpect(status().isNotFound());
+                .andExpect(status().isNotFound())
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString(foreignEvidence))));
+        for (String format : new String[]{"json", "csv", "pdf"}) {
+            mockMvc.perform(get("/api/scans/{scanId}/report/export", jobA.getId())
+                            .param("format", format)
+                            .header("Authorization", "Bearer " + tokenB))
+                    .andExpect(status().isNotFound())
+                    .andExpect(content().string(org.hamcrest.Matchers.not(
+                            org.hamcrest.Matchers.containsString(foreignEvidence))));
+        }
     }
 
     private Organization approvedOrganization(String name) {
@@ -292,6 +380,16 @@ class ScanReportIntegrationTest {
         target.setCreatedBy(creator);
         target.setStatus(status);
         return targetRepository.save(target);
+    }
+
+    private ScanJob completedScan(Target target, Organization organization, User analyst) {
+        ScanJob job = new ScanJob(target, organization, analyst, ScanType.PASSIVE_HEADERS);
+        job.transitionTo(ScanStatus.PENDING_APPROVAL, 0, "Pending", null);
+        job.transitionTo(ScanStatus.QUEUED, 0, "Queued", null);
+        job.transitionTo(ScanStatus.RUNNING, 20, "Running", null);
+        job.transitionTo(ScanStatus.COMPLETED, 100, "Done", null);
+        job.updateNativeEngineStatus("COMPLETED");
+        return scanJobRepository.saveAndFlush(job);
     }
 
     private String login(String email) throws Exception {

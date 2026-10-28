@@ -28,8 +28,10 @@ public final class PdfReportGenerator {
                 kids.append(5 + pageIndex * 2).append(" 0 R ");
             }
             objects.put(2, bytes("<< /Type /Pages /Kids [" + kids + "] /Count " + pageLines.size() + " >>"));
-            objects.put(3, bytes("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"));
-            objects.put(4, bytes("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>"));
+            objects.put(3, bytes("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+                    + "/Encoding /WinAnsiEncoding >>"));
+            objects.put(4, bytes("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold "
+                    + "/Encoding /WinAnsiEncoding >>"));
 
             for (int pageIndex = 0; pageIndex < pageLines.size(); pageIndex++) {
                 int pageObjectId = 5 + pageIndex * 2;
@@ -71,7 +73,16 @@ public final class PdfReportGenerator {
         lines.add("Scan ID: " + report.scanId());
         lines.add("Target: " + report.targetName() + " (" + report.targetUrl() + ")");
         lines.add("Scan type: " + report.scanType() + " | Status: " + report.status());
-        lines.add("Native engine: " + scope.nativeEngineStatus() + " | OWASP ZAP: " + scope.zapEngineStatus());
+        lines.add("Native engine: " + scope.nativeEngineStatus() + " | OWASP ZAP: " + scope.zapEngineStatus()
+                + " | NVD lookup: " + scope.nvdLookupStatus());
+        lines.add("OWASP ZAP requested: " + scope.zapRequested());
+        lines.add("ZAP spider: " + scope.zapSpiderStatus()
+                + " | URLs discovered: " + count(scope.zapSpiderDiscoveredCount()));
+        lines.add("ZAP passive analysis: " + scope.zapPassiveStatus()
+                + " | Alerts: " + count(scope.zapAlertCount()));
+        lines.add("ZAP active scan: "
+                + (scope.zapActiveStatus() == null ? "NOT_EXECUTED" : scope.zapActiveStatus()));
+        appendField(lines, "OWASP ZAP failure or skip reason", scope.zapFailureReason());
         lines.add("Scope counts: " + count(scope.discoveredPageCount()) + " discovered, "
                 + count(scope.visitedPageCount()) + " visited, " + count(scope.testedPassivePageCount())
                 + " passively tested; " + report.totalCrawlPages() + " persisted HTML crawl records.");
@@ -81,9 +92,9 @@ public final class PdfReportGenerator {
                 + ", Medium " + report.severitySummary().medium()
                 + ", Low " + report.severitySummary().low()
                 + ", Total " + report.totalFindings());
-        appendWrapped(lines, "Checks in scope", String.join("; ", scope.checksInScope()));
-        appendWrapped(lines, "Checks out of scope", String.join("; ", scope.checksOutOfScope()));
-        appendWrapped(lines, "Status details", report.statusMessage());
+        appendField(lines, "Checks in scope", String.join("; ", scope.checksInScope()));
+        appendField(lines, "Checks out of scope", String.join("; ", scope.checksOutOfScope()));
+        appendField(lines, "Status details", report.statusMessage());
         lines.add("Findings:");
         if (report.findings().isEmpty()) {
             lines.add("No findings were persisted for this scan.");
@@ -91,32 +102,55 @@ public final class PdfReportGenerator {
         for (ScanFindingResponse finding : report.findings()) {
             lines.add("");
             lines.add("[" + finding.severity() + "] " + finding.checkType() + " (finding " + finding.id() + ")");
-            appendWrapped(lines, "Affected location", finding.affectedComponent());
-            appendWrapped(lines, "Evidence", finding.evidence());
-            appendWrapped(lines, "Rationale", finding.rationale());
-            appendWrapped(lines, "Detection source", finding.detectionSource()
+            appendField(lines, "Affected location", finding.affectedComponent());
+            appendField(lines, "Evidence", finding.evidence());
+            appendField(lines, "Rationale", finding.rationale());
+            appendField(lines, "Detection source", finding.detectionSource()
                     + " | Assessment status: " + finding.verificationStatus());
-            appendWrapped(lines, "Assessment note",
+            appendField(lines, "Assessment note",
                     "Automated status does not independently confirm exploitability.");
-            appendWrapped(lines, "Source metadata", "Rule " + finding.sourceRuleId()
+            appendField(lines, "Source metadata", "Rule " + finding.sourceRuleId()
                     + " | Confidence " + finding.sourceConfidence()
                     + " | CWE " + finding.sourceCweId()
                     + " | WASC " + finding.sourceWascId()
                     + " | Reference " + finding.sourceReference());
-            appendWrapped(lines, "Remediation", finding.remediation());
+            appendField(lines, "Remediation", finding.remediation());
         }
-        return lines;
+        return printableLines(lines);
     }
 
-    private static void appendWrapped(List<String> lines, String label, String value) {
+    private static void appendField(List<String> lines, String label, String value) {
         String text = label + ": " + (value == null || value.isBlank() ? "Not available" : value);
-        for (int start = 0; start < text.length(); start += WRAP_LENGTH) {
-            lines.add(text.substring(start, Math.min(text.length(), start + WRAP_LENGTH)));
-        }
+        lines.add(text);
     }
 
     private static String count(Integer value) {
         return value == null ? "Not reported" : value.toString();
+    }
+
+    private static List<String> printableLines(List<String> lines) {
+        List<String> printable = new ArrayList<>();
+        for (String line : lines) {
+            StringBuilder rendered = new StringBuilder();
+            for (int offset = 0; offset < line.length();) {
+                int codePoint = line.codePointAt(offset);
+                offset += Character.charCount(codePoint);
+                if (codePoint == '\r' || codePoint == '\n') {
+                    rendered.append(' ');
+                } else if (codePoint >= 0x20 && codePoint <= 0x7e
+                        || codePoint >= 0xa0 && codePoint <= 0xff) {
+                    rendered.appendCodePoint(codePoint);
+                } else {
+                    rendered.append("\\u{")
+                            .append(Integer.toHexString(codePoint).toUpperCase(java.util.Locale.ROOT))
+                            .append('}');
+                }
+            }
+            for (int start = 0; start < rendered.length(); start += WRAP_LENGTH) {
+                printable.add(rendered.substring(start, Math.min(rendered.length(), start + WRAP_LENGTH)));
+            }
+        }
+        return printable;
     }
 
     private static List<List<String>> paginate(List<String> lines) {
@@ -155,9 +189,7 @@ public final class PdfReportGenerator {
         }
         return text.replace("\\", "\\\\")
                 .replace("(", "\\(")
-                .replace(")", "\\)")
-                .replace("\r", " ")
-                .replace("\n", " ");
+                .replace(")", "\\)");
     }
 
     private static byte[] bytes(String text) {

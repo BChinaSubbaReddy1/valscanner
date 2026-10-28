@@ -122,6 +122,17 @@ public class ScanReportService {
             writer.println("# Scan Type," + report.scanType());
             writer.println("# Native Engine Status," + report.executionSummary().nativeEngineStatus());
             writer.println("# OWASP ZAP Status," + report.executionSummary().zapEngineStatus());
+            writer.println("# OWASP ZAP Requested," + report.executionSummary().zapRequested());
+            writer.println("# OWASP ZAP Failure Reason," + escapeCsv(report.executionSummary().zapFailureReason()));
+            writer.println("# ZAP Spider Status," + escapeCsv(report.executionSummary().zapSpiderStatus()));
+            writer.println("# ZAP Spider Discovered URLs,"
+                    + reportCount(report.executionSummary().zapSpiderDiscoveredCount()));
+            writer.println("# ZAP Passive Analysis Status,"
+                    + escapeCsv(report.executionSummary().zapPassiveStatus()));
+            writer.println("# ZAP Alert Count," + reportCount(report.executionSummary().zapAlertCount()));
+            writer.println("# ZAP Active Scan Status,"
+                    + escapeCsv(report.executionSummary().zapActiveStatus()));
+            writer.println("# NVD Lookup Status," + report.executionSummary().nvdLookupStatus());
             writer.println("# Discovered Same-Origin Pages," + reportCount(report.executionSummary().discoveredPageCount()));
             writer.println("# Visited Pages," + reportCount(report.executionSummary().visitedPageCount()));
             writer.println("# Passively Tested Pages," + reportCount(report.executionSummary().testedPassivePageCount()));

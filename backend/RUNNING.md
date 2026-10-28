@@ -23,8 +23,9 @@ This will:
    `INITIAL_SUPER_ADMIN_EMAIL` / `INITIAL_SUPER_ADMIN_PASSWORD`. Both values
    are blank by default; set them through an untracked `.env` file or a
    deployment secret manager when bootstrap provisioning is required. Both must
-   be explicitly set and nonblank; startup fails if an email is configured without
-   a password.
+   be explicitly set and nonblank to create a new account; startup fails if a
+   password is missing when a new account needs to be created. A matching existing
+   account is left unchanged and does not require the password.
 5. Expose the API on `http://localhost:8081` by default (host port configurable
    with `BACKEND_HOST_PORT`; the container listens on port 8080).
 
@@ -65,11 +66,12 @@ authorized only by exact entries in `SCANNER_ALLOWED_PRIVATE_TARGET_ORIGINS`
 (the Compose defaults are the `juice-shop:3000` and `dvwa:80` service origins); this
 setting does not allow arbitrary private addresses.
 
-`PASSIVE_HEADERS` runs native passive response checks. `ZAP_PASSIVE` requests ZAP
-spidering and passive analysis; `ZAP_ACTIVE` additionally sends active test requests.
-Analyst scan requests require organization-admin approval before execution. ZAP modes
-require the optional ZAP Compose overlay, an API key in the untracked `.env`, and an
-available ZAP API:
+Every newly submitted scan runs its selected native checks followed by the ZAP spider
+and passive analysis. `PASSIVE_HEADERS` and `ZAP_PASSIVE` do not enable active probes;
+`ZAP_ACTIVE` additionally sends bounded ZAP active scan requests. Analyst scan
+requests require organization-admin approval before execution. Run the ZAP Compose
+overlay, set an API key in the untracked `.env`, and keep the ZAP API available for
+ZAP execution:
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.zap.yml up --build
@@ -91,7 +93,9 @@ joins the isolated target network and the outbound network. Juice Shop and DVWA 
 also joined to the isolated ZAP target network.
 Spidering is limited to depth 2 and 10 children per node; ZAP active scan rule and
 duration limits, alert caps, the worker deadline, and API timeouts are configured.
-Reports retain distinct native and ZAP engine statuses, including partial ZAP results.
+Reports retain distinct native and ZAP engine and stage statuses. If ZAP is disabled,
+unavailable, times out, or fails, the overall scan may retain native results, but its
+ZAP status and failure reason report that ZAP did not complete successfully.
 The native scanner has configured request and response limits; ZAP has separate
 spider/active scan limits.
 POST-body, authenticated-account, and browser-execution coverage is not provided by
@@ -100,7 +104,10 @@ the native scanner.
 Password-reset endpoints return `503 Service Unavailable` until a delivery integration
 is configured. They do not create or store reset tokens in this configuration.
 NVD keyword lookups are displayed only as low-severity candidates; product/version
-applicability must be verified independently. PDF exports are one-page summaries and
+applicability must be verified independently. Scan execution summaries distinguish
+NVD lookup outcomes such as candidates found, no candidates, timeout, rate limit,
+invalid response, unavailable service, and partial results. A failed lookup is not
+reported as a successful no-candidate result. PDF exports are one-page summaries and
 include the omitted-finding count when the 25-line findings budget is reached.
 
 ## Running without Docker

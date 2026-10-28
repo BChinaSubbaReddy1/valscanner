@@ -961,6 +961,52 @@ describe('Authentication, Access Control and IAM Views', () => {
     expect(screen.queryByText(/CVE-/i)).not.toBeInTheDocument();
   });
 
+  it('renders script-like finding values as text instead of executable HTML', async () => {
+    localStorage.setItem('scanner-auth-session', JSON.stringify({
+      token: 'valid-analyst-token',
+      user: {
+        roles: ['SECURITY_ANALYST'],
+        accountStatus: 'ACTIVE',
+        membershipApprovalStatus: 'APPROVED',
+        organizationStatus: 'APPROVED',
+      },
+    }));
+    const scriptLikeTitle = '<script type="application/json">{"value":"title"}</script>';
+    const scriptLikeUrl = 'https://portal.example.test/<img src="x" alt="url">';
+    const scriptLikeEvidence = '<script type="application/json">{"value":"evidence"}</script>';
+    vi.spyOn(client.scanApi, 'getScan').mockResolvedValue({
+      data: {
+        id: 95,
+        targetId: 71,
+        targetName: 'Approved portal',
+        scanType: 'PASSIVE_HEADERS',
+        status: 'COMPLETED',
+        progress: 100,
+      },
+    });
+    vi.spyOn(client.scanApi, 'listFindings').mockResolvedValue({
+      data: [{
+        id: 6,
+        checkType: scriptLikeTitle,
+        severity: 'LOW',
+        affectedComponent: scriptLikeUrl,
+        evidence: scriptLikeEvidence,
+        rationale: 'Controlled untrusted text fixture.',
+        remediation: 'Render as text.',
+        detectionSource: 'TEST',
+        verificationStatus: 'OBSERVED',
+      }],
+    });
+    vi.spyOn(client.scanApi, 'listCrawlPages').mockResolvedValue({ data: [] });
+
+    const { container } = renderApp('/analyst/scans/95');
+
+    expect(await screen.findByText(scriptLikeTitle, { exact: true, selector: 'p.eyebrow' })).toBeInTheDocument();
+    expect(screen.getByText(scriptLikeUrl, { exact: true })).toBeInTheDocument();
+    expect(screen.getByText(scriptLikeEvidence, { exact: true })).toBeInTheDocument();
+    expect(container.querySelector('script, img')).toBeNull();
+  });
+
   it('does not present stale findings after a failed findings reload', async () => {
     localStorage.setItem('scanner-auth-session', JSON.stringify({
       token: 'valid-analyst-token',
@@ -1227,12 +1273,17 @@ describe('Authentication, Access Control and IAM Views', () => {
         progress: 100,
         executionSummary: {
           nativeEngineStatus: 'COMPLETED',
-          zapEngineStatus: 'NOT_REQUESTED',
+          zapRequested: true,
+          zapEngineStatus: 'COMPLETED',
+          zapSpiderStatus: 'COMPLETED',
+          zapSpiderDiscoveredCount: 8,
+          zapPassiveStatus: 'COMPLETED',
+          zapAlertCount: 2,
           discoveredPageCount: 2,
           visitedPageCount: 2,
           testedPassivePageCount: 2,
-          checksInScope: ['Cookie attribute observations'],
-          checksOutOfScope: ['OWASP ZAP spider or passive analysis'],
+          checksInScope: ['Cookie attribute observations', 'OWASP ZAP spider and passive analysis'],
+          checksOutOfScope: ['OWASP ZAP active scanning'],
         },
       },
     });
@@ -1269,9 +1320,12 @@ describe('Authentication, Access Control and IAM Views', () => {
     renderApp('/analyst/scans/97');
 
     expect((await screen.findAllByText('Native Header Engine')).length).toBeGreaterThan(0);
-    expect(screen.getByText('NOT_REQUESTED')).toBeInTheDocument();
+    expect(screen.getAllByText('COMPLETED').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('Yes').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('8').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('2').length).toBeGreaterThan(0);
     expect(screen.getAllByText(/Discovered same-origin pages/i).length).toBeGreaterThan(0);
-    expect(screen.getByText(/OWASP ZAP spider or passive analysis/i)).toBeInTheDocument();
+    expect(screen.getByText(/OWASP ZAP spider and passive analysis/i)).toBeInTheDocument();
     expect(screen.getAllByText('OWASP ZAP').length).toBeGreaterThan(0);
     expect(screen.getAllByText('X_FRAME_OPTIONS').length).toBeGreaterThan(0);
     expect(screen.getAllByText('SQL_INJECTION_ACTIVE').length).toBeGreaterThan(0);

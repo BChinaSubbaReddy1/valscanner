@@ -26,12 +26,26 @@ final class PinnedHttpResponse {
     private static final int MAX_HEADER_COUNT = 200;
     private static final int MAX_STATUS_LINE_BYTES = 8_192;
     private static final int MAX_INFORMATIONAL_RESPONSES = 5;
+    private static final int MAX_REQUEST_BODY_BYTES = 8_192;
 
     private PinnedHttpResponse() {
     }
 
     static Response send(URI uri, InetAddress[] addresses, Duration timeout, int maxBodyBytes,
                          String userAgent) throws IOException {
+        return send(uri, addresses, timeout, maxBodyBytes, userAgent, "GET", new byte[0]);
+    }
+
+    static Response sendPost(URI uri, InetAddress[] addresses, Duration timeout, int maxBodyBytes,
+                             String userAgent, byte[] body) throws IOException {
+        if (body == null || body.length > MAX_REQUEST_BODY_BYTES) {
+            throw new IOException("HTTP request body exceeded the permitted size");
+        }
+        return send(uri, addresses, timeout, maxBodyBytes, userAgent, "POST", body);
+    }
+
+    private static Response send(URI uri, InetAddress[] addresses, Duration timeout, int maxBodyBytes,
+                                 String userAgent, String method, byte[] body) throws IOException {
         validateRequestUri(uri);
         if (addresses == null || addresses.length == 0) {
             throw new IOException("No validated destination address is available");
@@ -40,11 +54,11 @@ final class PinnedHttpResponse {
         IOException lastFailure = null;
         for (InetAddress address : addresses) {
             try {
-                return sendToAddress(uri, address, deadline, maxBodyBytes, userAgent);
+                return sendToAddress(uri, address, deadline, maxBodyBytes, userAgent, method, body);
             } catch (ResponseTooLargeException exception) {
                 throw exception;
             } catch (IOException exception) {
-                if (System.nanoTime() >= deadline) {
+                if (method.equals("POST") || System.nanoTime() >= deadline) {
                     throw exception;
                 }
                 lastFailure = exception;
@@ -57,7 +71,7 @@ final class PinnedHttpResponse {
     }
 
     private static Response sendToAddress(URI uri, InetAddress address, long deadline, int maxBodyBytes,
-                                         String userAgent) throws IOException {
+                                         String userAgent, String method, byte[] body) throws IOException {
         int port = uri.getPort() == -1 ? ("https".equalsIgnoreCase(uri.getScheme()) ? 443 : 80) : uri.getPort();
         Socket socket = new Socket();
         try {
@@ -68,7 +82,7 @@ final class PinnedHttpResponse {
             }
             socket.setSoTimeout(remainingMillis(deadline));
             OutputStream output = socket.getOutputStream();
-            output.write(requestBytes(uri, port, userAgent));
+            output.write(requestBytes(uri, port, userAgent, method, body));
             output.flush();
             InputStream input = socket.getInputStream();
             return readResponse(socket, input, deadline, maxBodyBytes);
@@ -112,7 +126,7 @@ final class PinnedHttpResponse {
         }
     }
 
-    private static byte[] requestBytes(URI uri, int port, String userAgent) {
+    private static byte[] requestBytes(URI uri, int port, String userAgent, String method, byte[] body) {
         String path = uri.getRawPath();
         if (path == null || path.isEmpty()) {
             path = "/";
@@ -124,12 +138,23 @@ final class PinnedHttpResponse {
         String authorityHost = host.contains(":") ? "[" + stripBrackets(host) + "]" : host;
         int defaultPort = "https".equalsIgnoreCase(uri.getScheme()) ? 443 : 80;
         String authority = port == defaultPort ? authorityHost : authorityHost + ":" + port;
-        String request = "GET " + path + " HTTP/1.1\r\n"
+        String request = method + " " + path + " HTTP/1.1\r\n"
                 + "Host: " + authority + "\r\n"
                 + "User-Agent: " + userAgent + "\r\n"
                 + "Accept-Encoding: identity\r\n"
+                + (method.equals("POST")
+                    ? "Content-Type: application/x-www-form-urlencoded\r\n"
+                        + "Content-Length: " + body.length + "\r\n"
+                    : "")
                 + "Connection: close\r\n\r\n";
-        return request.getBytes(StandardCharsets.ISO_8859_1);
+        byte[] headers = request.getBytes(StandardCharsets.ISO_8859_1);
+        if (body.length == 0) {
+            return headers;
+        }
+        byte[] bytes = new byte[headers.length + body.length];
+        System.arraycopy(headers, 0, bytes, 0, headers.length);
+        System.arraycopy(body, 0, bytes, headers.length, body.length);
+        return bytes;
     }
 
     private static Response readResponse(Socket socket, InputStream rawInput, long deadline, int maxBodyBytes)

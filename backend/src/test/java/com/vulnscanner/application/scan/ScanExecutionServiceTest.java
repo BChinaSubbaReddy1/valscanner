@@ -50,6 +50,116 @@ class ScanExecutionServiceTest {
         }
     }
 
+    @Test
+    void normalizeCanonicalizesSchemeAndHostAndPreservesRawComponents() {
+        ScanExecutionService service = new ScanExecutionService(
+                mock(ScanJobRepository.class), mock(ScanFindingRepository.class), false, null);
+
+        assertEquals("http://example.com/a?x=1",
+                ReflectionTestUtils.invokeMethod(service, "normalize", URI.create("HTTP://Example.COM/a?x=1"))
+                        .toString());
+        assertEquals("http://127.0.0.1:8080/a?x=1",
+                ReflectionTestUtils.invokeMethod(service, "normalize", URI.create("http://127.0.0.1:8080/a?x=1"))
+                        .toString());
+        assertEquals("http://[::1]:8080/a?x=1",
+                ReflectionTestUtils.invokeMethod(service, "normalize", URI.create("http://[::1]:8080/a?x=1"))
+                        .toString());
+        assertEquals("http://example.com/a%20b?keep=a%20b&tail=x%2By",
+                ReflectionTestUtils.invokeMethod(service, "normalize",
+                        URI.create("http://example.com/a%20b?keep=a%20b&tail=x%2By"))
+                        .toString());
+        assertEquals("http://example.com/?literal=a+b&encoded=a%2Bb&space=a%20b",
+                ReflectionTestUtils.invokeMethod(service, "normalize",
+                        URI.create("http://example.com/?literal=a+b&encoded=a%2Bb&space=a%20b"))
+                        .toString());
+        assertEquals("http://user:pass@example.com:8080/a",
+                ReflectionTestUtils.invokeMethod(service, "normalize",
+                        URI.create("http://user:pass@Example.COM:8080/a"))
+                        .toString());
+    }
+
+    @Test
+    void normalizeCanonicalizesSchemeHostAndPreservesExactEncoding() {
+        ScanExecutionService service = new ScanExecutionService(
+                mock(ScanJobRepository.class), mock(ScanFindingRepository.class), false, null);
+
+        assertEquals("http://example.com/a?x=1",
+                ReflectionTestUtils.invokeMethod(service, "normalize", URI.create("HTTP://Example.COM/a?x=1"))
+                        .toString());
+        assertEquals("http://127.0.0.1:8080/a?x=1",
+                ReflectionTestUtils.invokeMethod(service, "normalize", URI.create("http://127.0.0.1:8080/a?x=1"))
+                        .toString());
+        assertEquals("http://[::1]:8080/a?x=1",
+                ReflectionTestUtils.invokeMethod(service, "normalize", URI.create("http://[::1]:8080/a?x=1"))
+                        .toString());
+        assertEquals("http://example.com/a%20b?keep=a%20b&tail=x%2By",
+                ReflectionTestUtils.invokeMethod(service, "normalize",
+                        URI.create("http://example.com/a%20b?keep=a%20b&tail=x%2By"))
+                        .toString());
+    }
+
+    @Test
+    void normalizeCanonicalizesEquivalentRootPathAndDefaultPort() {
+        ScanExecutionService service = new ScanExecutionService(
+                mock(ScanJobRepository.class), mock(ScanFindingRepository.class), false, null);
+
+        assertEquals("http://example.com/",
+                ReflectionTestUtils.invokeMethod(service, "normalize", URI.create("http://example.com"))
+                        .toString());
+        assertEquals("http://example.com/",
+                ReflectionTestUtils.invokeMethod(service, "normalize", URI.create("http://example.com:80/"))
+                        .toString());
+        assertEquals("https://example.com/",
+                ReflectionTestUtils.invokeMethod(service, "normalize", URI.create("https://example.com:443"))
+                        .toString());
+    }
+
+    @Test
+    void postActionAllowlistCanonicalizesOriginButKeepsPathAndQueryExact() {
+        ScanExecutionService service = new ScanExecutionService(
+                mock(ScanJobRepository.class), mock(ScanFindingRepository.class), false, null);
+        ReflectionTestUtils.setField(service, "activePostFormAllowlist",
+                "HTTP://Example.COM:80/search/../search?mode=basic");
+
+        assertEquals(Boolean.TRUE, ReflectionTestUtils.invokeMethod(service, "isConfiguredPostAction",
+                URI.create("http://example.com/search?mode=basic")));
+        assertEquals(Boolean.FALSE, ReflectionTestUtils.invokeMethod(service, "isConfiguredPostAction",
+                URI.create("http://example.com/search/?mode=basic")));
+        assertEquals(Boolean.FALSE, ReflectionTestUtils.invokeMethod(service, "isConfiguredPostAction",
+                URI.create("http://example.com/search?mode=advanced")));
+        assertEquals(Boolean.FALSE, ReflectionTestUtils.invokeMethod(service, "isConfiguredPostAction",
+                URI.create("http://example.com/search?mode=basic#fragment")));
+
+        ReflectionTestUtils.setField(service, "activePostFormAllowlist",
+                "http://example.com/search?mode=basic#fragment");
+        assertEquals(Boolean.FALSE, ReflectionTestUtils.invokeMethod(service, "isConfiguredPostAction",
+                URI.create("http://example.com/search?mode=basic")));
+    }
+
+    @Test
+    void queryParametersDecodeFormEncodingAndRetainEmptyParameterSlots() {
+        ScanExecutionService service = new ScanExecutionService(
+                mock(ScanJobRepository.class), mock(ScanFindingRepository.class), false, null);
+
+        List<?> parameters = ReflectionTestUtils.invokeMethod(service, "queryParameters",
+                URI.create("http://example.com/?literal+name=one&literal%2Bname=two"
+                        + "&space%20name=three&%69d=4&flag&flag=&&tail=x%2By"));
+
+        assertEquals(List.of(
+                "literal name=one@0",
+                "literal+name=two@1",
+                "space name=three@2",
+                "id=4@3",
+                "flag=@4",
+                "flag=@5",
+                "tail=x+y@7"),
+                parameters.stream()
+                        .map(parameter -> ReflectionTestUtils.getField(parameter, "name") + "="
+                                + ReflectionTestUtils.getField(parameter, "value") + "@"
+                                + ReflectionTestUtils.getField(parameter, "rawPartIndex"))
+                        .toList());
+    }
+
     private void permitTestTarget(ScanExecutionService service, ScanJob job) {
         URI target = URI.create(job.getTarget().getUrl());
         ReflectionTestUtils.setField(service, "allowedPrivateTargetOrigins",
@@ -138,8 +248,8 @@ class ScanExecutionServiceTest {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         AtomicInteger staticRequests = new AtomicInteger();
         server.createContext("/", exchange -> {
-            byte[] body = ("<a href=\"/child#section\">child</a>"
-                    + "<a href=\"/child\">duplicate</a>"
+            byte[] body = ("<a href=\"child#section\">child</a>"
+                    + "<a href=\"./child\">duplicate</a>"
                     + "<a href=\"/style.css\">static</a>"
                     + "<a href=\"http://127.0.0.1:" + secondaryServer.getAddress().getPort()
                     + "/outside\">outside</a>").getBytes();
@@ -159,8 +269,14 @@ class ScanExecutionServiceTest {
             exchange.close();
         });
         AtomicInteger postActionGetRequests = new AtomicInteger();
+        AtomicInteger postActionPostRequests = new AtomicInteger();
         server.createContext("/post-only", exchange -> {
-            postActionGetRequests.incrementAndGet();
+            if ("POST".equals(exchange.getRequestMethod())) {
+                postActionPostRequests.incrementAndGet();
+            } else {
+                postActionGetRequests.incrementAndGet();
+            }
+
             byte[] body = "post action".getBytes();
             exchange.getResponseHeaders().add("Content-Type", "text/plain");
             exchange.sendResponseHeaders(200, body.length);
@@ -227,15 +343,37 @@ class ScanExecutionServiceTest {
         assertTrue(getForm.actionUrl().endsWith("/get-only"));
         assertEquals(List.of("search"), getForm.parameterNames());
         assertEquals(0, postActionGetRequests.get());
+        assertEquals(0, postActionPostRequests.get());
         assertEquals(1, getActionRequests.get());
         assertEquals(1, staticRequests.get());
         assertEquals(0, crossOriginRequests.get());
         assertEquals(ScanStatus.COMPLETED, job.getStatus());
+        assertEquals(4, job.getDiscoveredPageCount());
+        assertEquals(4, job.getVisitedPageCount());
+        assertEquals(4, job.getTestedPassivePageCount());
         ArgumentCaptor<ScanFinding> findingsCaptor = ArgumentCaptor.forClass(ScanFinding.class);
         verify(findings, atLeastOnce()).save(findingsCaptor.capture());
         assertTrue(findingsCaptor.getAllValues().stream().anyMatch(finding ->
                 "MISSING_CONTENT_SECURITY_POLICY".equals(finding.getCheckType())
                         && finding.getAffectedComponent().contains("/child [Content-Security-Policy]")));
+    }
+
+    @Test
+    void discoversLinksFromHtmlEncodedWithTheDeclaredResponseCharset() {
+        ScanExecutionService service = new ScanExecutionService(
+                mock(ScanJobRepository.class), mock(ScanFindingRepository.class), false, null);
+        URI origin = URI.create("http://example.test/");
+        byte[] body = "<a href=\"/caf\u00e9\">café</a>".getBytes(java.nio.charset.StandardCharsets.ISO_8859_1);
+        assertEquals("<a href=\"/café\">café</a>",
+                new String(body, java.nio.charset.StandardCharsets.ISO_8859_1));
+        assertEquals(java.nio.charset.StandardCharsets.ISO_8859_1,
+                ReflectionTestUtils.invokeMethod(service, "responseCharset", "text/html; charset=ISO-8859-1"));
+
+        Object discovery = ReflectionTestUtils.invokeMethod(service, "discoverPage",
+                origin, origin, "text/html; charset=ISO-8859-1", body);
+
+        assertEquals(List.of(URI.create("http://example.test/café")),
+                ReflectionTestUtils.getField(discovery, "links"));
     }
 
     @Test
@@ -304,6 +442,23 @@ class ScanExecutionServiceTest {
                     () -> service.validateResolvedAddresses(
                             URI.create("http://target.example:8080/"), new java.util.HashMap<>()),
                     address);
+        }
+    }
+
+    @Test
+    void rejectsDnsAnswersMixingAllowedAndDisallowedAddresses() throws Exception {
+        InetAddress publicAddress = InetAddress.getByAddress(
+                new byte[]{93, (byte) 184, (byte) 216, 34});
+        InetAddress privateAddress = InetAddress.getByAddress(
+                new byte[]{10, 0, 0, 8});
+
+        for (InetAddress[] addresses : List.of(
+                new InetAddress[]{publicAddress, privateAddress},
+                new InetAddress[]{privateAddress, publicAddress})) {
+            ScanExecutionService service = serviceResolving(addresses);
+            assertThrows(ScanExecutionService.ScanExecutionException.class,
+                    () -> service.validateResolvedAddresses(
+                            URI.create("https://mixed-dns.example/"), new java.util.HashMap<>()));
         }
     }
 
@@ -485,7 +640,56 @@ class ScanExecutionServiceTest {
         assertEquals(ScanStatus.COMPLETED, job.getStatus(), job.getStatusMessage());
         assertEquals(1, finalRequests.get());
         assertEquals(1, relativeRequests.get());
+        assertEquals(3, job.getDiscoveredPageCount());
         assertEquals(2, job.getVisitedPageCount());
+    }
+
+    @Test
+    void crawlStopsAtConfiguredRequestBudgetAndKeepsDiscoveredAndVisitedCountsDistinct() throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = "<a href=\"/one\">one</a><a href=\"/two\">two</a>"
+                    .getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "text/html");
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.createContext("/one", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = "one".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.createContext("/two", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = "two".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.start();
+
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        Organization organization = approvedOrganization(105L);
+        Target target = approvedTarget(organization,
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/");
+        ScanJob job = approvedJob(organization, target);
+        when(jobs.findByIdForExecutionUpdate(anyLong())).thenReturn(Optional.of(job));
+        ScanExecutionService service = new ScanExecutionService(
+                jobs, mock(ScanFindingRepository.class), true, null, null, null, 2, 6, 5);
+        permitTestTarget(service, job);
+
+        service.runClaimed(105L);
+
+        assertEquals(ScanStatus.COMPLETED, job.getStatus(), job.getStatusMessage());
+        assertEquals(2, requests.get());
+        assertEquals(3, job.getDiscoveredPageCount());
+        assertEquals(2, job.getVisitedPageCount());
+        assertEquals(2, job.getTestedPassivePageCount());
     }
 
     @Test
@@ -757,13 +961,13 @@ class ScanExecutionServiceTest {
     @Test
     void explicitActiveModeRunsBoundedSqlAndXssChecks() throws Exception {
         AtomicInteger requests = new AtomicInteger();
+        List<String> rawQueries = new CopyOnWriteArrayList<>();
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/", exchange -> {
             requests.incrementAndGet();
-            String decoded = URLDecoder.decode(
-                    exchange.getRequestURI().getRawQuery() == null ? ""
-                            : exchange.getRequestURI().getRawQuery(),
-                    StandardCharsets.UTF_8);
+            String rawQuery = exchange.getRequestURI().getRawQuery();
+            rawQueries.add(rawQuery == null ? "" : rawQuery);
+            String decoded = URLDecoder.decode(rawQuery == null ? "" : rawQuery, StandardCharsets.UTF_8);
             String body;
             int status = 200;
             if (decoded.contains("' OR '1'='1")) {
@@ -786,13 +990,15 @@ class ScanExecutionServiceTest {
         ScanFindingRepository findings = mock(ScanFindingRepository.class);
         Organization organization = approvedOrganization(26L);
         Target target = approvedTarget(organization,
-                "http://127.0.0.1:" + server.getAddress().getPort() + "/?id=1");
+                "http://127.0.0.1:" + server.getAddress().getPort()
+                        + "/?id=1&keep=a%20b&id=2&tail=x%2By&literal=a+b"
+                        + "&encoded=a%2Bb&space=a%20b&&flag&flag=");
         ScanJob job = approvedJob(organization, target);
         ReflectionTestUtils.setField(job, "scanType", ScanType.ZAP_ACTIVE);
         when(jobs.findByIdForExecutionUpdate(anyLong())).thenReturn(Optional.of(job));
         ZapClientService zap = mock(ZapClientService.class);
         when(zap.isEnabled()).thenReturn(true);
-        when(zap.isAvailable()).thenReturn(true);
+        when(zap.checkAvailability()).thenReturn(ZapClientService.AvailabilityStatus.AVAILABLE);
         when(zap.createTargetContext(any(), anyString()))
                 .thenReturn(new ZapClientService.ScopeContext("test-context", "1"));
         when(zap.startSpider(anyString(), anyString())).thenReturn("spider-1");
@@ -802,7 +1008,7 @@ class ScanExecutionServiceTest {
         when(zap.getAlerts(anyString())).thenReturn(List.of());
 
         ScanExecutionService service = new ScanExecutionService(
-                jobs, findings, true, null, null, null, 10, 6, 5,
+                jobs, findings, true, null, null, null, 10, 9, 5,
                 null, null, zap, new ZapScanAdapter());
         permitTestTarget(service, job);
         service.runClaimed(26L);
@@ -810,11 +1016,205 @@ class ScanExecutionServiceTest {
         assertEquals(ScanStatus.COMPLETED, job.getStatus(), job.getStatusMessage());
         ArgumentCaptor<ScanFinding> captor = ArgumentCaptor.forClass(ScanFinding.class);
         verify(findings, atLeastOnce()).save(captor.capture());
-        assertTrue(captor.getAllValues().stream()
-                .anyMatch(finding -> "SQL_INJECTION_SUSPECTED".equals(finding.getCheckType())));
-        assertTrue(captor.getAllValues().stream()
-                .anyMatch(finding -> "REFLECTED_XSS_POTENTIAL".equals(finding.getCheckType())));
-        assertEquals(4, requests.get());
+        ScanFinding sqlFinding = captor.getAllValues().stream()
+                .filter(finding -> "SQL_INJECTION_SUSPECTED".equals(finding.getCheckType()))
+                .findFirst().orElseThrow();
+        assertEquals("HIGH", sqlFinding.getSeverity());
+        assertEquals("SUSPECTED", sqlFinding.getVerificationStatus());
+        assertEquals("ACTIVE_QUERY_PARAMETER", sqlFinding.getDetectionSource());
+        assertTrue(sqlFinding.getAffectedComponent().contains("[id]"));
+        assertTrue(sqlFinding.getEvidence().contains("database error signature"));
+        ScanFinding xssFinding = captor.getAllValues().stream()
+                .filter(finding -> "REFLECTED_XSS_POTENTIAL".equals(finding.getCheckType()))
+                .findFirst().orElseThrow();
+        assertEquals("MEDIUM", xssFinding.getSeverity());
+        assertEquals("POTENTIAL", xssFinding.getVerificationStatus());
+        assertEquals("ACTIVE_QUERY_PARAMETER", xssFinding.getDetectionSource());
+        assertTrue(xssFinding.getAffectedComponent().contains("[id]"));
+        assertTrue(xssFinding.getEvidence().contains("unique test marker"));
+        assertEquals(10, requests.get());
+        assertEquals(10, rawQueries.size());
+        String untouchedQuery = "&keep=a%20b&id=2&tail=x%2By&literal=a+b"
+                + "&encoded=a%2Bb&space=a%20b&&flag&flag=";
+        assertEquals("id=1" + untouchedQuery, rawQueries.get(0));
+        assertTrue(rawQueries.subList(1, 4).stream()
+                .allMatch(query -> query.startsWith("id=")
+                        && query.endsWith(untouchedQuery)));
+        assertTrue(rawQueries.subList(4, 7).stream()
+                .allMatch(query -> query.startsWith("id=1&keep=")
+                        && query.endsWith("&id=2&tail=x%2By&literal=a+b"
+                                + "&encoded=a%2Bb&space=a%20b&&flag&flag=")));
+        assertTrue(rawQueries.subList(7, 10).stream()
+                .allMatch(query -> query.startsWith("id=1&keep=a%20b&id=")
+                        && query.endsWith("&tail=x%2By&literal=a+b"
+                                + "&encoded=a%2Bb&space=a%20b&&flag&flag=")));
+    }
+
+    @Test
+    void activeModeProbesOnlyExplicitlyAllowlistedSafePostForms() throws Exception {
+        AtomicInteger getRequests = new AtomicInteger();
+        AtomicInteger postRequests = new AtomicInteger();
+        AtomicInteger externalRequests = new AtomicInteger();
+        List<String> postedPaths = new CopyOnWriteArrayList<>();
+        secondaryServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        secondaryServer.createContext("/", exchange -> {
+            externalRequests.incrementAndGet();
+            exchange.sendResponseHeaders(204, -1);
+            exchange.close();
+        });
+        secondaryServer.start();
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            getRequests.incrementAndGet();
+            byte[] body = ("<html>"
+                    + "<form method=\"POST\" action=\"/search\"><input type=\"search\" name=\"q\" value=\"start\"></form>"
+                    + "<form method=\"POST\" action=\"/delete\"><input name=\"q\" value=\"ignored\"></form>"
+                    + "<form method=\"POST\" action=\"/secret\"><input type=\"hidden\" name=\"csrf\" value=\"secret\">"
+                    + "<input name=\"q\" value=\"ignored\"></form>"
+                    + "<form method=\"POST\" action=\"/password\"><input type=\"password\" name=\"password\"></form>"
+                    + "<form method=\"POST\" action=\"/empty\"></form>"
+                    + "<form method=\"POST\" action=\"/unlisted\"><input name=\"q\" value=\"ignored\"></form>"
+                    + "<form method=\"POST\" action=\"/logout\"><input name=\"q\" value=\"ignored\"></form>"
+                    + "<form method=\"POST\" action=\"/verify\"><input name=\"user\" value=\"analyst\">"
+                    + "<input name=\"pin\" value=\"1234\"></form>"
+                    + "<form method=\"POST\" action=\"/safe-search\"><input name=\"q\" value=\"term\"></form>"
+                    + "<form method=\"POST\" action=\"/redirect\"><input name=\"q\" value=\"ignored\"></form>"
+                    + "<form method=\"POST\" action=\"http://127.0.0.1:"
+                    + secondaryServer.getAddress().getPort()
+                    + "/outside\"><input name=\"q\" value=\"ignored\"></form>"
+                    + "</html>").getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "text/html");
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.createContext("/search", exchange -> {
+            postRequests.incrementAndGet();
+            postedPaths.add(exchange.getRequestURI().getPath());
+            String decoded = URLDecoder.decode(
+                    new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8),
+                    StandardCharsets.UTF_8);
+            String body;
+            int status = 200;
+            if (decoded.contains("' OR '1'='1") || decoded.contains("' OR '1'='2")) {
+                body = "Database error: SQL syntax near query";
+                status = 500;
+            } else if (decoded.contains("vscanxss")) {
+                body = "<html>" + decoded.substring(decoded.indexOf('=') + 1) + "</html>";
+            } else {
+                body = "<html>safe</html>";
+            }
+            byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "text/html");
+            exchange.sendResponseHeaders(status, bytes.length);
+            exchange.getResponseBody().write(bytes);
+            exchange.close();
+        });
+        server.createContext("/delete", exchange -> {
+            postRequests.incrementAndGet();
+            exchange.sendResponseHeaders(204, -1);
+            exchange.close();
+        });
+        server.createContext("/secret", exchange -> {
+            postRequests.incrementAndGet();
+            exchange.sendResponseHeaders(204, -1);
+            exchange.close();
+        });
+        server.createContext("/password", exchange -> {
+            postRequests.incrementAndGet();
+            exchange.sendResponseHeaders(204, -1);
+            exchange.close();
+        });
+        server.createContext("/empty", exchange -> {
+            postRequests.incrementAndGet();
+            exchange.sendResponseHeaders(204, -1);
+            exchange.close();
+        });
+        server.createContext("/unlisted", exchange -> {
+            postRequests.incrementAndGet();
+            exchange.sendResponseHeaders(204, -1);
+            exchange.close();
+        });
+        server.createContext("/logout", exchange -> {
+            postRequests.incrementAndGet();
+            exchange.sendResponseHeaders(204, -1);
+            exchange.close();
+        });
+        server.createContext("/verify", exchange -> {
+            postRequests.incrementAndGet();
+            exchange.sendResponseHeaders(204, -1);
+            exchange.close();
+        });
+        server.createContext("/safe-search", exchange -> {
+            postRequests.incrementAndGet();
+            postedPaths.add(exchange.getRequestURI().getPath());
+            exchange.getRequestBody().readAllBytes();
+            byte[] body = "<html>safe result</html>".getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "text/html");
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.createContext("/redirect", exchange -> {
+            postRequests.incrementAndGet();
+            postedPaths.add(exchange.getRequestURI().getPath());
+            exchange.getResponseHeaders().add("Location",
+                    "http://127.0.0.1:" + secondaryServer.getAddress().getPort() + "/redirected");
+            exchange.sendResponseHeaders(302, -1);
+            exchange.close();
+        });
+        server.start();
+
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        ScanFindingRepository findings = mock(ScanFindingRepository.class);
+        Organization organization = approvedOrganization(42L);
+        Target target = approvedTarget(organization,
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/");
+        ScanJob job = approvedJob(organization, target);
+        ReflectionTestUtils.setField(job, "scanType", ScanType.ZAP_ACTIVE);
+        when(jobs.findByIdForExecutionUpdate(anyLong())).thenReturn(Optional.of(job));
+
+        ScanExecutionService service = new ScanExecutionService(
+                jobs, findings, true, null, null, null, 10, 16, 5,
+                null, null, null, null);
+        permitTestTarget(service, job);
+        ReflectionTestUtils.setField(service, "activePostFormAllowlist",
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/search\n"
+                        + "http://127.0.0.1:" + server.getAddress().getPort() + "/delete\n"
+                        + "http://127.0.0.1:" + server.getAddress().getPort() + "/secret\n"
+                        + "http://127.0.0.1:" + server.getAddress().getPort() + "/password\n"
+                        + "http://127.0.0.1:" + server.getAddress().getPort() + "/empty\n"
+                        + "http://127.0.0.1:" + server.getAddress().getPort() + "/logout\n"
+                        + "http://127.0.0.1:" + server.getAddress().getPort() + "/verify\n"
+                        + "http://127.0.0.1:" + server.getAddress().getPort() + "/safe-search\n"
+                        + "http://127.0.0.1:" + server.getAddress().getPort() + "/redirect\n"
+                        + "http://127.0.0.1:" + secondaryServer.getAddress().getPort() + "/outside");
+        service.runClaimed(42L);
+
+        assertEquals(ScanStatus.COMPLETED, job.getStatus(), job.getStatusMessage());
+        assertEquals(1, getRequests.get());
+        assertEquals(12, postRequests.get());
+        assertEquals(0, externalRequests.get());
+        assertEquals(4, postedPaths.stream().filter("/search"::equals).count());
+        assertEquals(4, postedPaths.stream().filter("/safe-search"::equals).count());
+        assertEquals(4, postedPaths.stream().filter("/redirect"::equals).count());
+        ArgumentCaptor<ScanFinding> captor = ArgumentCaptor.forClass(ScanFinding.class);
+        verify(findings, atLeastOnce()).save(captor.capture());
+        assertFalse(captor.getAllValues().stream().anyMatch(finding ->
+                finding.getAffectedComponent().contains("/safe-search")
+                        && ("SQL_INJECTION_SUSPECTED".equals(finding.getCheckType())
+                        || "REFLECTED_XSS_POTENTIAL".equals(finding.getCheckType()))));
+        assertTrue(captor.getAllValues().stream().anyMatch(finding ->
+                "SQL_INJECTION_SUSPECTED".equals(finding.getCheckType())
+                        && "ACTIVE_POST_FORM".equals(finding.getDetectionSource())
+                        && finding.getAffectedComponent().contains("/search [q]")));
+        assertTrue(captor.getAllValues().stream().anyMatch(finding ->
+                "REFLECTED_XSS_POTENTIAL".equals(finding.getCheckType())
+                        && "ACTIVE_POST_FORM".equals(finding.getDetectionSource())
+                        && finding.getAffectedComponent().contains("/search [q]")));
+        assertTrue(captor.getAllValues().stream().anyMatch(finding ->
+                "MISSING_CONTENT_SECURITY_POLICY".equals(finding.getCheckType())
+                        && finding.getAffectedComponent().contains("/search [Content-Security-Policy]")));
     }
 
     @Test
@@ -977,20 +1377,23 @@ class ScanExecutionServiceTest {
         assertEquals(2, job.getVisitedPageCount());
         assertEquals(2, job.getTestedPassivePageCount());
         assertEquals("COMPLETED", job.getNativeEngineStatus());
-        assertEquals("NOT_REQUESTED", job.getZapEngineStatus());
+        assertEquals("NOT_CONFIGURED", job.getZapEngineStatus());
     }
 
     @Test
-    void passiveHeaderScopeReportsChecksThatDoNotRun() {
+    void passiveHeaderScopeIncludesZapPassiveStagesButExcludesActiveChecks() {
         Organization organization = approvedOrganization(103L);
         ScanJob job = approvedJob(organization, approvedTarget(organization, "https://example.test/"));
 
         ScanExecutionSummary summary = ScanExecutionSummary.from(job);
 
-        assertEquals("NOT_REQUESTED", summary.zapEngineStatus());
+        assertTrue(summary.zapRequested());
+        assertEquals("NOT_STARTED", summary.zapEngineStatus());
+        assertEquals(NvdLookupStatus.NOT_REQUESTED, summary.nvdLookupStatus());
         assertTrue(summary.checksInScope().contains("Set-Cookie attribute observations (Secure assessed only for HTTPS responses)"));
         assertTrue(summary.checksOutOfScope().contains("SQL injection and reflected XSS active probes"));
-        assertTrue(summary.checksOutOfScope().contains("OWASP ZAP spider or passive analysis"));
+        assertTrue(summary.checksInScope().contains("OWASP ZAP spider and passive analysis"));
+        assertFalse(summary.checksOutOfScope().contains("OWASP ZAP spider or passive analysis"));
         assertTrue(summary.checksOutOfScope().contains("Authorization and access-control testing"));
     }
 
@@ -1001,6 +1404,8 @@ class ScanExecutionServiceTest {
         Target target = approvedTarget(organization, "http://127.0.0.1:8080/");
         ScanJob crawlingJob = approvedJob(organization, target);
         crawlingJob.transitionTo(ScanStatus.CRAWLING, 10, "Discovering", null);
+        crawlingJob.updateZapEngineStatus("RUNNING");
+        crawlingJob.updateZapSpiderStatus("RUNNING");
 
         when(jobs.findByStatusIn(anyCollection())).thenReturn(java.util.List.of(crawlingJob));
 
@@ -1009,8 +1414,45 @@ class ScanExecutionServiceTest {
 
         assertEquals(ScanStatus.FAILED, crawlingJob.getStatus());
         assertEquals("EXECUTOR_UNAVAILABLE", crawlingJob.getFailureReason());
+        assertEquals("FAILED", crawlingJob.getZapEngineStatus());
+        assertEquals("SERVER_RESTARTED_DURING_ZAP", crawlingJob.getZapFailureReason());
+        assertEquals("FAILED", crawlingJob.getZapSpiderStatus());
         assertTrue(crawlingJob.getStatusMessage().contains("restart"));
         verify(jobs).save(crawlingJob);
+    }
+
+    @Test
+    void cancellationBeforeFirstCrawlRequestEndsAsCancelledNotFailed() throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            byte[] body = "safe".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.start();
+
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        ScanFindingRepository findings = mock(ScanFindingRepository.class);
+        Organization organization = approvedOrganization(104L);
+        ScanJob job = approvedJob(organization,
+                approvedTarget(organization,
+                        "http://127.0.0.1:" + server.getAddress().getPort() + "/"));
+        setId(job, 104L);
+        when(jobs.findByIdForExecutionUpdate(104L)).thenReturn(Optional.of(job));
+        when(jobs.findCancellationRequestedById(104L)).thenReturn(Optional.of(true));
+
+        ScanExecutionService service = new ScanExecutionService(jobs, findings, false, null);
+        permitTestTarget(service, job);
+        service.runClaimed(104L);
+
+        assertEquals(ScanStatus.CANCELLED, job.getStatus());
+        assertEquals("Scan cancelled during execution", job.getStatusMessage());
+        assertEquals("CANCELLED", job.getNativeEngineStatus());
+        assertEquals(0, requests.get());
+        verify(findings, never()).save(any());
     }
 
     @Test
@@ -1048,6 +1490,7 @@ class ScanExecutionServiceTest {
         server.createContext("/", exchange -> {
             exchange.getResponseHeaders().add("Content-Type", "text/plain");
             exchange.getResponseHeaders().add("Server", "Apache/2.4.49");
+            exchange.getResponseHeaders().add("X-Powered-By", "PHP/8.1.2");
             byte[] body = "ok".getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(200, body.length);
             exchange.getResponseBody().write(body);
@@ -1065,10 +1508,17 @@ class ScanExecutionServiceTest {
         NvdCveService nvdService = mock(NvdCveService.class);
         when(nvdService.parseSoftwareVersion("Apache/2.4.49"))
                 .thenReturn(new NvdCveService.SoftwareVersion("Apache", "2.4.49"));
-        when(nvdService.findCves("Apache", "2.4.49")).thenReturn(java.util.List.of(
+        when(nvdService.parseSoftwareVersion("PHP/8.1.2"))
+                .thenReturn(new NvdCveService.SoftwareVersion("PHP", "8.1.2"));
+        when(nvdService.lookupCves("Apache", "2.4.49")).thenReturn(new NvdLookupResult(
+                NvdLookupStatus.CANDIDATES_FOUND, java.util.List.of(
                 new CveMatch("CVE-2021-41773", "Apache", "2.4.49", 7.5, "HIGH",
-                        "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N", "Path traversal flaw in Apache HTTP Server 2.4.49")
-        ));
+                        "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N", "Path traversal flaw in Apache HTTP Server 2.4.49"),
+                new CveMatch("CVE-2024-1234", "Apache", "2.4.49", 0.0, "UNKNOWN",
+                        "N/A", "CVSS data unavailable")
+        )));
+        when(nvdService.lookupCves("PHP", "8.1.2"))
+                .thenReturn(new NvdLookupResult(NvdLookupStatus.TIMEOUT, java.util.List.of()));
 
         ScanExecutionService service = new ScanExecutionService(jobs, findings, true, null,
                 null, null, 10, 6, 15, null, nvdService);
@@ -1087,6 +1537,14 @@ class ScanExecutionServiceTest {
         assertTrue(cveFinding.getEvidence().contains("Product and version applicability are not verified"));
         assertTrue(cveFinding.getEvidence().contains("NVD CVSS: 7.5"));
         assertTrue(cveFinding.getEvidence().contains("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"));
+        ScanFinding missingCvssFinding = captor.getAllValues().stream()
+                .filter(f -> "CVE_KEYWORD_CANDIDATE".equals(f.getCheckType()))
+                .filter(f -> f.getEvidence().contains("CVE-2024-1234"))
+                .findFirst().orElseThrow();
+        assertTrue(missingCvssFinding.getEvidence().contains("NVD CVSS metrics unavailable"));
+        assertFalse(missingCvssFinding.getEvidence().contains("NVD CVSS: 0.0"));
+        assertEquals(NvdLookupStatus.PARTIAL_RESULTS, job.getNvdLookupStatus());
+        assertEquals(NvdLookupStatus.PARTIAL_RESULTS, ScanExecutionSummary.from(job).nvdLookupStatus());
     }
 
     private void setId(Object entity, long id) {

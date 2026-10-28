@@ -38,8 +38,6 @@ services:
       - connection.proxyChain.hostName=zap-egress
       - -config
       - connection.proxyChain.port=3128
-    ports:
-      - "127.0.0.1:${ZAP_HOST_PORT:-8090}:8090"
     restart: unless-stopped
     networks:
       - vulnscanner-zap-control

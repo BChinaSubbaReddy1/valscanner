@@ -2,6 +2,7 @@ $ErrorActionPreference = 'Stop'
 
 $entrypoint = Join-Path $PSScriptRoot 'entrypoint.sh'
 $squidConfig = Join-Path $PSScriptRoot 'squid-debug.conf'
+$squidImage = 'ubuntu/squid@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029'
 $containerTest = @'
 set -euo pipefail
 
@@ -168,7 +169,22 @@ $containerTest = $containerTest -replace "`r", ''
 $encodedContainerTest = [Convert]::ToBase64String(
     [Text.Encoding]::UTF8.GetBytes($containerTest)
 )
-$containerCommand = "printf '%s' '$encodedContainerTest' | base64 -d | /bin/bash -s"
+
+if (-not (Test-Path -LiteralPath $entrypoint -PathType Leaf)) {
+    throw "Required entrypoint file was not found: $entrypoint"
+}
+if (-not (Test-Path -LiteralPath $squidConfig -PathType Leaf)) {
+    throw "Required Squid configuration was not found: $squidConfig"
+}
+if ([string]::IsNullOrWhiteSpace($squidImage)) {
+    throw 'The Squid image name is empty.'
+}
+if ([string]::IsNullOrWhiteSpace($containerTest) -or [string]::IsNullOrWhiteSpace($encodedContainerTest)) {
+    throw 'The encoded container test script is empty.'
+}
+if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+    throw 'Docker CLI was not found.'
+}
 
 $serverName = "zap-egress-debug-server-$([guid]::NewGuid().ToString('N'))"
 
@@ -211,9 +227,10 @@ try {
         '--mount', "type=bind,source=$entrypoint,target=/usr/local/bin/zap-egress-entrypoint.sh,readonly",
         '--mount', "type=bind,source=$squidConfig,target=/etc/squid/squid.conf,readonly",
         '-e', "LAB_IP=$labIp",
+        '-e', "TEST_SCRIPT_B64=$encodedContainerTest",
         '-e', 'SCANNER_ALLOWED_PRIVATE_TARGET_ORIGINS=http://lab.example:18080,http://metadata.example:80,http://mapped-metadata.example:80',
         $squidImage,
-        '-c', $containerCommand
+        '-c', 'printf "%s" "$TEST_SCRIPT_B64" | base64 -d > /tmp/test-policy-debug.sh && exec /bin/bash /tmp/test-policy-debug.sh'
     )
 
     & docker @dockerArgs

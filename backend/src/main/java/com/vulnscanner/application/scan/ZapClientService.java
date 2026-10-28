@@ -16,7 +16,6 @@ import java.util.regex.Pattern;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
-import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -72,8 +71,12 @@ public class ZapClientService {
     }
 
     public boolean isAvailable() {
+        return checkAvailability() == AvailabilityStatus.AVAILABLE;
+    }
+
+    public AvailabilityStatus checkAvailability() {
         if (!enabled) {
-            return false;
+            return AvailabilityStatus.UNAVAILABLE;
         }
         try {
             HttpRequest request = newRequestBuilder("/JSON/core/view/version/")
@@ -84,29 +87,29 @@ public class ZapClientService {
                     httpClient, request, MAX_API_RESPONSE_BYTES, readTimeout);
             if (response.statusCode() == 401 || response.statusCode() == 403) {
                 log.warn("OWASP ZAP health check authentication failed (HTTP {})", response.statusCode());
-                return false;
+                return AvailabilityStatus.UNAVAILABLE;
             }
             if (response.statusCode() != 200) {
                 log.warn("OWASP ZAP health check returned HTTP {}", response.statusCode());
-                return false;
+                return AvailabilityStatus.UNAVAILABLE;
             }
             JsonNode json = objectMapper.readTree(new String(response.body(), StandardCharsets.UTF_8));
             if (json.path("version").asText("").isBlank()) {
                 log.warn("OWASP ZAP health check returned an invalid version response");
-                return false;
+                return AvailabilityStatus.UNAVAILABLE;
             }
-            return true;
+            return AvailabilityStatus.AVAILABLE;
         } catch (HttpTimeoutException exception) {
             log.warn("OWASP ZAP health check timed out");
-            return false;
+            return AvailabilityStatus.TIMED_OUT;
         } catch (IOException exception) {
             log.warn("OWASP ZAP health check communication or response failed ({})",
                     exception.getClass().getSimpleName());
-            return false;
+            return AvailabilityStatus.UNAVAILABLE;
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
             log.warn("OWASP ZAP health check was interrupted");
-            return false;
+            return AvailabilityStatus.UNAVAILABLE;
         }
     }
 
@@ -166,6 +169,17 @@ public class ZapClientService {
         String path = "/JSON/spider/view/status/?scanId=" + URLEncoder.encode(scanId, StandardCharsets.UTF_8);
         JsonNode json = executeRequest(path);
         return requiredProgress(json, "spider");
+    }
+
+    public int getSpiderDiscoveredCount(String scanId) throws IOException, InterruptedException {
+        requireScanId(scanId, "spider");
+        String path = "/JSON/spider/view/results/?scanId=" + URLEncoder.encode(scanId, StandardCharsets.UTF_8);
+        JsonNode json = executeRequest(path);
+        JsonNode results = json.get("results");
+        if (results == null || !results.isArray() || results.size() > 10000) {
+            throw new IOException("ZAP spider results response is invalid");
+        }
+        return results.size();
     }
 
     public void stopSpider(String scanId) {
@@ -323,5 +337,11 @@ public class ZapClientService {
     }
 
     public record ScopeContext(String name, String id) {
+    }
+
+    public enum AvailabilityStatus {
+        AVAILABLE,
+        UNAVAILABLE,
+        TIMED_OUT
     }
 }

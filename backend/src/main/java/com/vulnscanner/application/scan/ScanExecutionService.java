@@ -5,9 +5,11 @@ import java.net.InetAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URLDecoder;
+import java.net.URLEncoder;
 import java.net.UnknownHostException;
 import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
+import java.net.http.HttpTimeoutException;
+import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayDeque;
@@ -47,6 +49,7 @@ public class ScanExecutionService {
     private static final int MAX_CRAWL_DEPTH = 2;
     private static final int MAX_DISCOVERED_FORMS_PER_PAGE = 50;
     private static final int MAX_FORM_FIELDS = 50;
+    private static final int MAX_FORM_BODY_BYTES = 8_192;
     private static final int MAX_REDIRECTS = 5;
     private static final int DEFAULT_MAX_REQUESTS = 10;
     private static final int DEFAULT_MAX_DETECTION_REQUESTS = 6;
@@ -57,6 +60,8 @@ public class ScanExecutionService {
     private final ScanFindingRepository findingRepository;
     @Value("${scanner.allowed-private-target-origins:}")
     private String allowedPrivateTargetOrigins = "";
+    @Value("${scanner.active-post-form-allowlist:}")
+    private String activePostFormAllowlist = "";
     private final TransactionTemplate transactionTemplate;
     private final AuditEventRepository auditEventRepository;
     private final ScanCrawlPageRepository crawlPageRepository;
@@ -234,11 +239,7 @@ public class ScanExecutionService {
         }
 
         try {
-            if (job.getScanType() == ScanType.ZAP_PASSIVE || job.getScanType() == ScanType.ZAP_ACTIVE) {
-                runZapScan(job);
-            } else {
-                runNativeScan(job);
-            }
+            runZapScan(job);
         } catch (ScanExecutionException exception) {
             markUnfinishedEnginesFailed(job);
             fail(job, exception.reason(), exception.getMessage());
@@ -257,6 +258,8 @@ public class ScanExecutionService {
         }
         if ("RUNNING".equals(job.getZapEngineStatus())) {
             job.updateZapEngineStatus("FAILED");
+            job.updateZapFailureReason("ZAP_EXECUTION_FAILED");
+            markRunningZapStages(job, "FAILED");
             changed = true;
         }
         if (changed) {
@@ -286,20 +289,6 @@ public class ScanExecutionService {
         return claimed[0];
     }
 
-    private void runNativeScan(ScanJob job) throws ScanExecutionException {
-        if (job.getStatus() == ScanStatus.CREATED) {
-            job.transitionTo(ScanStatus.QUEUED, 0, "Queued for passive scanning", null);
-            persistExecutionState(job);
-        }
-        runNativeStages(job);
-        if (job.getStatus() != ScanStatus.SCANNING) {
-            return;
-        }
-        job.transitionTo(ScanStatus.COMPLETED, 100, "Passive header scan completed", null);
-        persistExecutionState(job);
-        audit(job, "SCAN_JOB_COMPLETED", job.getStatusMessage());
-    }
-
     private void runNativeStages(ScanJob job) throws ScanExecutionException {
         job.updateNativeEngineStatus("RUNNING");
         persistExecutionState(job);
@@ -309,6 +298,9 @@ public class ScanExecutionService {
         CrawlResult crawl = crawl(job);
         if (cancellationRequested(job)) {
             job.updateNativeEngineStatus("CANCELLED");
+            if (job.isZapRequested() && "NOT_STARTED".equals(job.getZapEngineStatus())) {
+                job.updateZapFailureReason("CANCELLED_BEFORE_ZAP");
+            }
             job.transitionTo(ScanStatus.CANCELLED, job.getProgress(), "Scan cancelled during execution", null);
             persistExecutionState(job);
             audit(job, "SCAN_JOB_CANCELLED", "Scan cancelled during execution");
@@ -356,6 +348,7 @@ public class ScanExecutionService {
         }
         if (zapClientService == null) {
             job.updateZapEngineStatus("NOT_CONFIGURED");
+            job.updateZapFailureReason("ZAP_CLIENT_NOT_CONFIGURED");
             persistExecutionState(job);
             completeWithPartialZapResults(job,
                     "Native checks completed; OWASP ZAP is not configured, so ZAP findings are omitted");
@@ -363,16 +356,23 @@ public class ScanExecutionService {
         }
         if (!zapClientService.isEnabled()) {
             job.updateZapEngineStatus("DISABLED");
+            job.updateZapFailureReason("ZAP_DISABLED_BY_CONFIGURATION");
             persistExecutionState(job);
             completeWithPartialZapResults(job,
                     "Native checks completed; OWASP ZAP is disabled, so ZAP findings are omitted");
             return;
         }
-        if (!zapClientService.isAvailable()) {
-            job.updateZapEngineStatus("UNAVAILABLE");
+        ZapClientService.AvailabilityStatus availability = zapClientService.checkAvailability();
+        if (availability != ZapClientService.AvailabilityStatus.AVAILABLE) {
+            boolean timedOut = availability == ZapClientService.AvailabilityStatus.TIMED_OUT;
+            job.updateZapEngineStatus(timedOut ? "TIMED_OUT" : "UNAVAILABLE");
+            job.updateZapFailureReason(timedOut
+                    ? "ZAP_HEALTH_CHECK_TIMEOUT" : "ZAP_HEALTH_CHECK_FAILED");
             persistExecutionState(job);
             completeWithPartialZapResults(job,
-                    "Native checks completed; OWASP ZAP is unavailable, so ZAP findings are omitted");
+                    timedOut
+                            ? "Native checks completed; OWASP ZAP health check timed out"
+                            : "Native checks completed; OWASP ZAP is unavailable, so ZAP findings are omitted");
             return;
         }
         job.updateZapEngineStatus("RUNNING");
@@ -393,6 +393,8 @@ public class ScanExecutionService {
             if (cancelIfRequested(job, "Scan cancelled before OWASP ZAP spider")) {
                 return;
             }
+            job.updateZapSpiderStatus("RUNNING");
+            persistExecutionState(job);
             spiderScanId = zapClientService.startSpider(targetUrl, context.name());
 
             int spiderProgress = 0;
@@ -402,6 +404,8 @@ public class ScanExecutionService {
                     zapClientService.stopSpider(spiderScanId);
                     spiderFinished = true;
                     job.updateZapEngineStatus("CANCELLED");
+                    job.updateZapFailureReason("CANCELLED_DURING_ZAP");
+                    job.updateZapSpiderStatus("CANCELLED");
                     job.transitionTo(ScanStatus.CANCELLED, job.getProgress(), "Scan cancelled during ZAP spider", null);
                     persistExecutionState(job);
                     audit(job, "SCAN_JOB_CANCELLED", "Scan cancelled during ZAP spider");
@@ -424,13 +428,22 @@ public class ScanExecutionService {
                         "OWASP ZAP spider did not complete within its time budget");
             }
             spiderFinished = true;
+            job.updateZapSpiderStatus("COMPLETED");
+            persistExecutionState(job);
+            job.updateZapSpiderDiscoveredCount(zapClientService.getSpiderDiscoveredCount(spiderScanId));
+            persistExecutionState(job);
 
             // Active Scan phase if requested
             if (job.getScanType() == ScanType.ZAP_ACTIVE) {
+                if (System.nanoTime() > deadline) {
+                    throw new ScanExecutionException(ScanFailureReason.TIME_BUDGET_EXCEEDED,
+                            "OWASP ZAP spider exceeded its time budget");
+                }
                 if (cancelIfRequested(job, "Scan cancelled before OWASP ZAP active scan")) {
                     return;
                 }
                 job.updateProgress(job.getProgress(), "OWASP ZAP running active vulnerability scan");
+                job.updateZapActiveStatus("RUNNING");
                 persistExecutionState(job);
                 activeScanId = zapClientService.startActiveScan(targetUrl, context);
 
@@ -441,6 +454,8 @@ public class ScanExecutionService {
                         zapClientService.stopActiveScan(activeScanId);
                         activeFinished = true;
                         job.updateZapEngineStatus("CANCELLED");
+                        job.updateZapFailureReason("CANCELLED_DURING_ZAP");
+                        job.updateZapActiveStatus("CANCELLED");
                         job.transitionTo(ScanStatus.CANCELLED, job.getProgress(), "Scan cancelled during ZAP active scan", null);
                         persistExecutionState(job);
                         audit(job, "SCAN_JOB_CANCELLED", "Scan cancelled during ZAP active scan");
@@ -463,8 +478,12 @@ public class ScanExecutionService {
                             "OWASP ZAP active scan did not complete within its time budget");
                 }
                 activeFinished = true;
+                job.updateZapActiveStatus("COMPLETED");
+                persistExecutionState(job);
             }
 
+            job.updateZapPassiveStatus("RUNNING");
+            persistExecutionState(job);
             job.updateProgress(job.getProgress(), "Waiting for OWASP ZAP passive analysis");
             persistExecutionState(job);
             while (zapClientService.getPassiveScanRecordsToScan() > 0
@@ -483,6 +502,8 @@ public class ScanExecutionService {
                 throw new ScanExecutionException(ScanFailureReason.TIME_BUDGET_EXCEEDED,
                         "OWASP ZAP passive analysis exceeded its time budget");
             }
+            job.updateZapPassiveStatus("COMPLETED");
+            persistExecutionState(job);
 
             // Process alerts
             if (System.nanoTime() > deadline) {
@@ -502,26 +523,50 @@ public class ScanExecutionService {
             }
             persistZapFindings(job, alerts);
 
+            job.updateZapAlertCount(alerts.size());
             job.updateZapEngineStatus("COMPLETED");
             job.transitionTo(ScanStatus.COMPLETED, 100, "Native and OWASP ZAP scans completed successfully", null);
             persistExecutionState(job);
             audit(job, "SCAN_JOB_COMPLETED", job.getStatusMessage());
         } catch (ScanExecutionException exception) {
             LOG.warn("OWASP ZAP scan {} did not complete: {}", job.getId(), exception.reason());
-            job.updateZapEngineStatus("PARTIAL");
+            String failedStatus = exception.reason() == ScanFailureReason.TIME_BUDGET_EXCEEDED
+                    ? "TIMED_OUT" : "FAILED";
+            job.updateZapEngineStatus(failedStatus);
+            job.updateZapFailureReason(exception.reason().name());
+            markRunningZapStages(job, failedStatus);
             completeWithPartialZapResults(job,
-                    "Native checks completed; OWASP ZAP did not complete, and its results may be incomplete");
+                    "Native checks completed; OWASP ZAP " + failedStatus.toLowerCase(Locale.ROOT)
+                            + " (" + exception.reason().name() + ")");
         } catch (IOException e) {
             LOG.warn("OWASP ZAP API communication failed for scan {}", job.getId());
-            job.updateZapEngineStatus("PARTIAL");
+            boolean timedOut = e instanceof HttpTimeoutException;
+            String failedStatus = timedOut ? "TIMED_OUT" : "FAILED";
+            String failureReason = timedOut ? "ZAP_REQUEST_TIMEOUT" : "ZAP_COMMUNICATION_FAILED";
+            job.updateZapEngineStatus(failedStatus);
+            job.updateZapFailureReason(failureReason);
+            markRunningZapStages(job, failedStatus);
             completeWithPartialZapResults(job,
-                    "Native checks completed; OWASP ZAP communication failed, and its results are omitted");
+                    "Native checks completed; OWASP ZAP " + failedStatus.toLowerCase(Locale.ROOT)
+                            + " (" + failureReason + ")");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             LOG.warn("OWASP ZAP scan {} was interrupted", job.getId());
-            job.updateZapEngineStatus("PARTIAL");
-            completeWithPartialZapResults(job,
-                    "Native checks completed; OWASP ZAP was interrupted, and its results may be incomplete");
+            if (job.isCancellationRequested()) {
+                job.updateZapEngineStatus("CANCELLED");
+                job.updateZapFailureReason("CANCELLED_DURING_ZAP");
+                markRunningZapStages(job, "CANCELLED");
+                job.transitionTo(ScanStatus.CANCELLED, job.getProgress(),
+                        "Scan cancelled during OWASP ZAP execution", null);
+                persistExecutionState(job);
+                audit(job, "SCAN_JOB_CANCELLED", job.getStatusMessage());
+            } else {
+                job.updateZapEngineStatus("FAILED");
+                job.updateZapFailureReason("ZAP_INTERRUPTED");
+                markRunningZapStages(job, "FAILED");
+                completeWithPartialZapResults(job,
+                        "Native checks completed; OWASP ZAP failed (ZAP_INTERRUPTED)");
+            }
         } finally {
             if (activeScanId != null && !activeFinished) {
                 zapClientService.stopActiveScan(activeScanId);
@@ -539,11 +584,23 @@ public class ScanExecutionService {
         audit(job, "SCAN_JOB_PARTIALLY_COMPLETED", statusMessage);
     }
 
+    private void markRunningZapStages(ScanJob job, String status) {
+        if ("RUNNING".equals(job.getZapSpiderStatus())) {
+            job.updateZapSpiderStatus(status);
+        }
+        if ("RUNNING".equals(job.getZapPassiveStatus())) {
+            job.updateZapPassiveStatus(status);
+        }
+        if ("RUNNING".equals(job.getZapActiveStatus())) {
+            job.updateZapActiveStatus(status);
+        }
+    }
+
     private void persistZapFindings(ScanJob job, List<ZapAlert> alerts) {
         if (alerts == null || alerts.isEmpty()) {
             return;
         }
-        Set<String> existingKeys = new HashSet<>();
+        Set<FindingDeduplicationKey> existingKeys = new HashSet<>();
         List<ScanFinding> existingFindings = findingRepository.findByScanJob_Id(job.getId());
         if (existingFindings != null) {
             for (ScanFinding f : existingFindings) {
@@ -553,16 +610,26 @@ public class ScanExecutionService {
 
         for (ZapAlert alert : alerts) {
             ScanFinding candidate = zapScanAdapter.toFinding(job, alert);
-            String key = findingDeduplicationKey(candidate);
+            FindingDeduplicationKey key = findingDeduplicationKey(candidate);
             if (existingKeys.add(key)) {
                 findingRepository.save(candidate);
             }
         }
     }
 
-    private String findingDeduplicationKey(ScanFinding finding) {
-        return finding.getDetectionSource() + "|" + finding.getCheckType() + "|"
-                + finding.getSourceRuleId() + "|" + finding.getAffectedComponent();
+    private FindingDeduplicationKey findingDeduplicationKey(ScanFinding finding) {
+        return new FindingDeduplicationKey(
+                finding.getDetectionSource(),
+                finding.getCheckType(),
+                finding.getSourceRuleId(),
+                finding.getAffectedComponent(),
+                finding.getEvidence(),
+                finding.getSeverity(),
+                finding.getVerificationStatus(),
+                finding.getSourceConfidence(),
+                finding.getSourceReference(),
+                finding.getSourceCweId(),
+                finding.getSourceWascId());
     }
 
     public void markRejected(Long scanId) {
@@ -603,8 +670,9 @@ public class ScanExecutionService {
             discovered.add(responseUri);
             boolean htmlDocument = isHtmlDocument(response);
             PageDiscovery discovery = htmlDocument
-                    ? discoverPage(origin, responseUri, response.body())
-                    : new PageDiscovery(List.of(), List.of());
+                    ? discoverPage(origin, responseUri, firstHeader(response.headers(), "content-type"),
+                            response.body())
+                    : new PageDiscovery(List.of(), List.of(), List.of());
             pages.add(new CrawledPage(responseUri, response));
             if (!cancellationRequested(job) && crawlPageRepository != null && htmlDocument) {
                 crawlPageRepository.save(new ScanCrawlPage(job, responseUri.toString(), next.depth(),
@@ -613,6 +681,7 @@ public class ScanExecutionService {
             }
             if (!cancellationRequested(job) && job.getScanType() == ScanType.ZAP_ACTIVE) {
                 persistParameterFindings(job, responseUri, response, context);
+                probePostForms(job, origin, discovery.postForms(), context);
             }
             if (next.depth() < MAX_CRAWL_DEPTH) {
                 for (URI link : discovery.links()) {
@@ -622,6 +691,9 @@ public class ScanExecutionService {
             }
         }
         if (pages.isEmpty()) {
+            if (cancellationRequested(job)) {
+                return new CrawlResult(List.of(), discovered.size(), 0);
+            }
             throw new ScanExecutionException(ScanFailureReason.OUTBOUND_REQUEST_FAILED,
                     "Target response could not be inspected");
         }
@@ -710,6 +782,113 @@ public class ScanExecutionService {
             }
             current = destination;
         }
+    }
+
+    private ScanResponse requestPostTarget(URI origin, URI uri, byte[] body, ScanContext context)
+            throws ScanExecutionException {
+        if (!sameOrigin(origin, uri) || !isConfiguredPostAction(uri)) {
+            throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID,
+                    "POST form action is no longer within the approved scan scope");
+        }
+        InetAddress[] addresses;
+        try {
+            addresses = validateResolvedAddresses(uri, context.resolvedAddressesByHost());
+        } catch (UnknownHostException exception) {
+            throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID,
+                    "Target hostname could not be resolved");
+        } catch (IOException exception) {
+            throw new ScanExecutionException(ScanFailureReason.OUTBOUND_REQUEST_FAILED,
+                    "Target could not be resolved");
+        }
+        context.tryConsumeRequest(true);
+        PinnedHttpResponse.Response response;
+        try {
+            response = PinnedHttpResponse.sendPost(uri, addresses, requestTimeout, MAX_RESPONSE_BYTES,
+                    "Automated-Web-Scanner-Active/1.0", body);
+        } catch (java.net.SocketTimeoutException exception) {
+            throw new ScanExecutionException(ScanFailureReason.TIME_BUDGET_EXCEEDED,
+                    "Target request timed out");
+        } catch (PinnedHttpResponse.ResponseTooLargeException exception) {
+            throw new ScanExecutionException(ScanFailureReason.RESPONSE_LIMIT_EXCEEDED,
+                    "Target response exceeded the permitted size");
+        } catch (IOException exception) {
+            throw new ScanExecutionException(ScanFailureReason.OUTBOUND_REQUEST_FAILED,
+                    "Target request failed");
+        }
+        return new ScanResponse(response.statusCode(), response.headers(), response.body(), uri);
+    }
+
+    private void probePostForms(ScanJob job, URI origin, List<PostFormCandidate> forms, ScanContext context)
+            throws ScanExecutionException {
+        for (PostFormCandidate form : forms) {
+            if (cancellationRequested(job) || !context.canConsumeDetectionRequests(4)) {
+                return;
+            }
+            byte[] baselineBody = encodeForm(form.parameters(), -1, "");
+            if (baselineBody == null) {
+                continue;
+            }
+            Set<String> keys = new HashSet<>();
+            ScanResponse baseline = requestPostTarget(origin, form.action(), baselineBody, context);
+            persistFindings(job, baseline, form.action(), keys);
+            for (int index = 0; index < form.parameters().size(); index++) {
+                if (cancellationRequested(job) || !context.canConsumeDetectionRequests(3)) {
+                    break;
+                }
+                FormParameter parameter = form.parameters().get(index);
+                String sqlTrue = "' OR '1'='1";
+                String sqlFalse = "' OR '1'='2";
+                byte[] sqlTrueBody = encodeForm(form.parameters(), index, sqlTrue);
+                byte[] sqlFalseBody = encodeForm(form.parameters(), index, sqlFalse);
+                if (sqlTrueBody == null || sqlFalseBody == null) {
+                    break;
+                }
+                ScanResponse sqlPositive = requestPostTarget(origin, form.action(), sqlTrueBody, context);
+                ScanResponse sqlNegative = requestPostTarget(origin, form.action(), sqlFalseBody, context);
+                if (isSqlError(sqlPositive.body()) && !isSqlError(baseline.body())
+                        && (isSqlError(sqlNegative.body())
+                        || (sqlPositive.statusCode() >= 500 && baseline.statusCode() < 500))) {
+                    String errorSnippet = extractSqlErrorSnippet(sqlPositive.body());
+                    addFinding(job, keys, "SQL_INJECTION_SUSPECTED",
+                            form.action() + " [" + parameter.name() + "]", "HIGH",
+                            "Allowlisted POST form parameter '" + bounded(parameter.name())
+                                    + "' triggered a database error signature (" + errorSnippet
+                                    + "); manual verification is required.",
+                            "Use parameterized queries and validate input before database access.",
+                            "ACTIVE_POST_FORM", "SUSPECTED");
+                }
+                String marker = "vscanxss" + Integer.toHexString(
+                        Objects.hash(form.action(), parameter.name(), index));
+                String xssPayload = "\"><svg data-vscan=\"" + marker + "\">";
+                byte[] xssBody = encodeForm(form.parameters(), index, xssPayload);
+                if (xssBody == null) {
+                    break;
+                }
+                ScanResponse xssResponse = requestPostTarget(origin, form.action(), xssBody, context);
+                if (isPotentialHtml(xssResponse) && containsRaw(xssResponse.body(), xssPayload)
+                        && appearsExecutableReflection(xssResponse.body(), marker)) {
+                    addFinding(job, keys, "REFLECTED_XSS_POTENTIAL",
+                            form.action() + " [" + parameter.name() + "]", "MEDIUM",
+                            "The unique test marker was reflected unencoded in an HTML tag context for "
+                                    + "allowlisted POST form parameter '" + bounded(parameter.name())
+                                    + "'; no script was executed and manual verification is required.",
+                            "Encode output for its HTML context and validate input.",
+                            "ACTIVE_POST_FORM", "POTENTIAL");
+                }
+            }
+        }
+    }
+
+    private byte[] encodeForm(List<FormParameter> parameters, int replacedIndex, String replacement) {
+        List<String> encoded = new ArrayList<>(parameters.size());
+        for (int index = 0; index < parameters.size(); index++) {
+            FormParameter parameter = parameters.get(index);
+            String value = index == replacedIndex ? replacement : parameter.value();
+            encoded.add(URLEncoder.encode(parameter.name(), StandardCharsets.UTF_8)
+                    + "=" + URLEncoder.encode(value, StandardCharsets.UTF_8));
+        }
+        byte[] body = String.join("&", encoded).getBytes(StandardCharsets.UTF_8);
+        return body.length <= MAX_FORM_BODY_BYTES ? body : null;
     }
 
     private boolean isRedirect(int statusCode) {
@@ -994,9 +1173,16 @@ public class ScanExecutionService {
                                           ScanContext context) throws ScanExecutionException {
         URI testUri;
         try {
-            String query = parameter.name() + "=" + value;
-            testUri = new URI(uri.getScheme(), uri.getRawAuthority(), uri.getPath(), query, null);
-        } catch (URISyntaxException exception) {
+            String[] queryParts = uri.getRawQuery().split("&", -1);
+            String encodedName = URLEncoder.encode(parameter.name(), StandardCharsets.UTF_8)
+                    .replace("+", "%20");
+            String encodedValue = URLEncoder.encode(value, StandardCharsets.UTF_8)
+                    .replace("+", "%20");
+            queryParts[parameter.rawPartIndex()] = encodedName + "=" + encodedValue;
+            String rawPath = uri.getRawPath() == null ? "" : uri.getRawPath();
+            testUri = URI.create(uri.getScheme() + "://" + uri.getRawAuthority()
+                    + rawPath + "?" + String.join("&", queryParts));
+        } catch (IllegalArgumentException exception) {
             throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID,
                     "Test parameter URL is not safe to scan");
         }
@@ -1008,14 +1194,16 @@ public class ScanExecutionService {
             return List.of();
         }
         List<QueryParameter> parameters = new ArrayList<>();
-        for (String part : uri.getRawQuery().split("&", -1)) {
+        String[] queryParts = uri.getRawQuery().split("&", -1);
+        for (int index = 0; index < queryParts.length; index++) {
+            String part = queryParts[index];
             String[] pieces = part.split("=", 2);
             try {
                 String name = URLDecoder.decode(pieces[0], StandardCharsets.UTF_8);
                 String value = pieces.length == 2
                         ? URLDecoder.decode(pieces[1], StandardCharsets.UTF_8) : "";
                 if (!name.isBlank() && name.length() <= 100 && value.length() <= 500) {
-                    parameters.add(new QueryParameter(name, value));
+                    parameters.add(new QueryParameter(name, value, index));
                 }
             } catch (IllegalArgumentException ignored) {
                 // Malformed query encoding is not a safe candidate for active checks.
@@ -1076,13 +1264,18 @@ public class ScanExecutionService {
                 if (nvdCveService != null) {
                     NvdCveService.SoftwareVersion sv = nvdCveService.parseSoftwareVersion(value);
                     if (sv != null) {
-                        List<CveMatch> matches = nvdCveService.findCves(sv.software(), sv.version());
-                        for (CveMatch match : matches) {
+                        NvdLookupResult lookup = nvdCveService.lookupCves(sv.software(), sv.version());
+                        job.recordNvdLookupStatus(lookup.status());
+                        for (CveMatch match : lookup.candidates()) {
                             String cveComponent = pageComponent(pageUri,
                                     header + ": " + sv.software() + "/" + sv.version() + " [" + match.cveId() + "]");
-                            String cveEvidence = String.format("NVD keyword-search candidate only: '%s' version '%s' disclosed in '%s' was returned with %s. Product and version applicability are not verified. NVD CVSS: %.1f (%s; %s). %s",
-                                    sv.software(), sv.version(), header, match.cveId(), match.cvssScore(),
-                                    match.cvssSeverity(), match.cvssVector(), bounded(match.description()));
+                            String cvssEvidence = "UNKNOWN".equals(match.cvssSeverity())
+                                    ? "NVD CVSS metrics unavailable."
+                                    : String.format("NVD CVSS: %.1f (%s; %s).", match.cvssScore(),
+                                            match.cvssSeverity(), match.cvssVector());
+                            String cveEvidence = String.format("NVD keyword-search candidate only: '%s' version '%s' disclosed in '%s' was returned with %s. Product and version applicability are not verified. %s %s",
+                                    sv.software(), sv.version(), header, match.cveId(), cvssEvidence,
+                                    bounded(match.description()));
                             addFinding(job, keys, "CVE_KEYWORD_CANDIDATE", cveComponent, "LOW",
                                     cveEvidence, "Verify product identity and affected-version ranges against the vendor advisory before remediation.",
                                     "NVD_CVE_LOOKUP", "POTENTIAL");
@@ -1164,6 +1357,10 @@ public class ScanExecutionService {
             }
             if ("RUNNING".equals(job.getZapEngineStatus())) {
                 job.updateZapEngineStatus("CANCELLED");
+                job.updateZapFailureReason("CANCELLED_DURING_ZAP");
+                markRunningZapStages(job, "CANCELLED");
+            } else if (job.isZapRequested() && "NOT_STARTED".equals(job.getZapEngineStatus())) {
+                job.updateZapFailureReason("CANCELLED_BEFORE_ZAP");
             }
             job.transitionTo(ScanStatus.CANCELLED, job.getProgress(), message, null);
             persistExecutionState(job);
@@ -1198,6 +1395,9 @@ public class ScanExecutionService {
         if (job.getStatus() == ScanStatus.RUNNING || job.getStatus() == ScanStatus.CRAWLING
                 || job.getStatus() == ScanStatus.SCANNING || job.getStatus() == ScanStatus.QUEUED
                 || job.getStatus() == ScanStatus.CREATED) {
+            if (job.isZapRequested() && "NOT_STARTED".equals(job.getZapEngineStatus())) {
+                job.updateZapFailureReason("SCAN_FAILED_BEFORE_ZAP");
+            }
             job.transitionTo(ScanStatus.FAILED, job.getProgress(), message, reason);
             persistExecutionState(job);
             audit(job, job.getStatus() == ScanStatus.FAILED ? "SCAN_JOB_FAILED" : "SCAN_JOB_CANCELLED",
@@ -1279,11 +1479,11 @@ public class ScanExecutionService {
         return headers.getOrDefault(name.toLowerCase(Locale.ROOT), List.of());
     }
 
-    private PageDiscovery discoverPage(URI origin, URI base, byte[] body) {
-        Document document = Jsoup.parse(
-                new String(body, java.nio.charset.StandardCharsets.UTF_8), base.toString());
+    private PageDiscovery discoverPage(URI origin, URI base, String contentType, byte[] body) {
+        Document document = Jsoup.parse(new String(body, responseCharset(contentType)), base.toString());
         Set<URI> links = new LinkedHashSet<>();
         List<DiscoveredForm> forms = new ArrayList<>();
+        List<PostFormCandidate> postForms = new ArrayList<>();
         for (Element element : document.select("a[href], area[href]")) {
             addSameOriginLink(origin, element.absUrl("href"), links);
         }
@@ -1317,8 +1517,126 @@ public class ScanExecutionService {
                 }
             }
             forms.add(new DiscoveredForm(action.toString(), method, List.copyOf(names)));
+            if (method.equals("POST")) {
+                List<FormParameter> parameters = postFormParameters(form);
+                if (parameters != null && isConfiguredPostAction(action)) {
+                    postForms.add(new PostFormCandidate(action, parameters));
+                }
+            }
         }
-        return new PageDiscovery(List.copyOf(links), List.copyOf(forms));
+        return new PageDiscovery(List.copyOf(links), List.copyOf(forms), List.copyOf(postForms));
+    }
+
+    private Charset responseCharset(String contentType) {
+        if (contentType == null) {
+            return StandardCharsets.UTF_8;
+        }
+        java.util.regex.Matcher matcher = java.util.regex.Pattern.compile(
+                "(?i)(?:^|;)\\s*charset\\s*=\\s*(?:\"([^\"]+)\"|'([^']+)'|([^;\\s]+))")
+                .matcher(contentType);
+        if (!matcher.find()) {
+            return StandardCharsets.UTF_8;
+        }
+        String charsetName = matcher.group(1) != null ? matcher.group(1)
+                : matcher.group(2) != null ? matcher.group(2) : matcher.group(3);
+        try {
+            return Charset.forName(charsetName);
+        } catch (IllegalArgumentException exception) {
+            return StandardCharsets.UTF_8;
+        }
+    }
+
+    private List<FormParameter> postFormParameters(Element form) {
+        String enctype = form.attr("enctype").trim();
+        if ((!enctype.isEmpty() && !enctype.equalsIgnoreCase("application/x-www-form-urlencoded"))
+                || form.hasAttr("target")) {
+            return null;
+        }
+        String acceptCharset = form.attr("accept-charset").trim();
+        if (!acceptCharset.isEmpty() && !acceptCharset.equalsIgnoreCase("UTF-8")) {
+            return null;
+        }
+        List<FormParameter> parameters = new ArrayList<>();
+        for (Element field : form.select("input[name], textarea[name], select[name], button[name]")) {
+            if (field.hasAttr("disabled")) {
+                continue;
+            }
+            String name = field.attr("name").trim();
+            if (name.isEmpty() || name.length() > 100 || isUnsafeFormFieldName(name)) {
+                return null;
+            }
+            String value;
+            if ("input".equals(field.normalName())) {
+                String type = field.attr("type").trim().toLowerCase(Locale.ROOT);
+                if (!type.isEmpty() && !type.equals("text") && !type.equals("search")) {
+                    return null;
+                }
+                value = field.attr("value");
+            } else if ("textarea".equals(field.normalName())) {
+                value = field.text();
+            } else {
+                return null;
+            }
+            if (value.length() > 500) {
+                return null;
+            }
+            if (parameters.size() >= MAX_FORM_FIELDS) {
+                return null;
+            }
+            parameters.add(new FormParameter(name, value));
+        }
+        return parameters.isEmpty() ? null : List.copyOf(parameters);
+    }
+
+    private boolean isUnsafeFormFieldName(String name) {
+        String lower = name.toLowerCase(Locale.ROOT);
+        return isSensitiveParameter(name)
+                || lower.contains("user") || lower.contains("login") || lower.contains("identifier")
+                || lower.matches(".*(?:^|[^a-z0-9])pin(?:$|[^a-z0-9]).*")
+                || lower.contains("email") || lower.contains("account")
+                || lower.contains("role") || lower.contains("admin")
+                || lower.contains("delete") || lower.contains("remove") || lower.contains("purchase")
+                || lower.contains("checkout") || lower.contains("payment") || lower.contains("transfer");
+    }
+
+    private boolean isConfiguredPostAction(URI action) {
+        if (action.getRawUserInfo() != null || action.getRawFragment() != null
+                || isUnsafePostAction(action)) {
+            return false;
+        }
+        if (activePostFormAllowlist == null || activePostFormAllowlist.isBlank()) {
+            return false;
+        }
+        for (String configured : activePostFormAllowlist.split("\\R")) {
+            if (configured.isBlank()) {
+                continue;
+            }
+            try {
+                URI configuredUri = URI.create(configured.trim());
+                if (configuredUri.getRawUserInfo() != null || configuredUri.getRawFragment() != null) {
+                    continue;
+                }
+                URI allowed = normalize(configuredUri);
+                String allowedPath = allowed.getRawPath() == null || allowed.getRawPath().isEmpty()
+                        ? "/" : allowed.getRawPath();
+                String actionPath = action.getRawPath() == null || action.getRawPath().isEmpty()
+                        ? "/" : action.getRawPath();
+                if (sameOrigin(allowed, action) && allowedPath.equals(actionPath)
+                        && Objects.equals(allowed.getRawQuery(), action.getRawQuery())) {
+                    return true;
+                }
+            } catch (IllegalArgumentException ignored) {
+                // Invalid allowlist entries do not authorize a form action.
+            }
+        }
+        return false;
+    }
+
+    private boolean isUnsafePostAction(URI action) {
+        String path = Objects.toString(action.getRawPath(), "").toLowerCase(Locale.ROOT);
+        return path.matches(".*(?:^|[/_-])(?:logout|delete|remove|purchase|checkout|payment|transfer"
+                + "|account|profile|password|credential|admin|settings|register|signup|subscribe)"
+                + "(?:[/_-]|$).*");
     }
 
     private URI addSameOriginLink(URI origin, String absoluteUrl, Set<URI> links) {
@@ -1345,14 +1663,23 @@ public class ScanExecutionService {
     }
 
     private URI normalize(URI uri) {
-        try {
-            String scheme = uri.getScheme() == null ? null : uri.getScheme().toLowerCase(Locale.ROOT);
-            String host = uri.getHost() == null ? null : uri.getHost().toLowerCase(Locale.ROOT);
-            return new URI(scheme, uri.getUserInfo(), host, uri.getPort(), uri.getPath(),
-                    uri.getQuery(), null).normalize();
-        } catch (URISyntaxException exception) {
-            throw new IllegalArgumentException("Invalid crawl URL", exception);
+        String scheme = uri.getScheme() == null ? null : uri.getScheme().toLowerCase(Locale.ROOT);
+        String host = uri.getHost();
+        if (scheme == null || host == null) {
+            throw new IllegalArgumentException("Invalid crawl URL");
         }
+        int port = uri.getPort();
+        boolean defaultPort = ("http".equals(scheme) && port == 80)
+                || ("https".equals(scheme) && port == 443);
+        String authority = (uri.getRawUserInfo() == null ? "" : uri.getRawUserInfo() + "@")
+                + (host.startsWith("[") && host.endsWith("]")
+                    ? host.toLowerCase(Locale.ROOT)
+                    : host.contains(":") ? "[" + host.toLowerCase(Locale.ROOT) + "]"
+                    : host.toLowerCase(Locale.ROOT))
+                + (port == -1 || defaultPort ? "" : ":" + port);
+        String rawPath = uri.getRawPath() == null || uri.getRawPath().isEmpty() ? "/" : uri.getRawPath();
+        String rawQuery = uri.getRawQuery() == null ? "" : "?" + uri.getRawQuery();
+        return URI.create(scheme + "://" + authority + rawPath + rawQuery).normalize();
     }
 
     private boolean sameOrigin(URI left, URI right) {
@@ -1380,9 +1707,16 @@ public class ScanExecutionService {
     private record CrawlRequest(URI uri, int depth) {}
     private record CrawlResult(List<CrawledPage> pages, int discoveredPageCount, int visitedPageCount) {}
     private record CrawledPage(URI uri, ScanResponse response) {}
-    private record PageDiscovery(List<URI> links, List<DiscoveredForm> forms) {}
+    private record PageDiscovery(List<URI> links, List<DiscoveredForm> forms,
+                                 List<PostFormCandidate> postForms) {}
+    private record PostFormCandidate(URI action, List<FormParameter> parameters) {}
+    private record FormParameter(String name, String value) {}
     private record ScanResponse(int statusCode, Map<String, List<String>> headers, byte[] body, URI finalUri) {}
-    private record QueryParameter(String name, String value) {}
+    private record QueryParameter(String name, String value, int rawPartIndex) {}
+    private record FindingDeduplicationKey(String detectionSource, String checkType, String sourceRuleId,
+                                           String affectedComponent, String evidence, String severity,
+                                           String verificationStatus, String sourceConfidence, String sourceReference,
+                                           String sourceCweId, String sourceWascId) {}
     private record CookieObservation(String name, boolean secure, boolean httpOnly, boolean sameSite) {}
 
     private static final class ScanContext {

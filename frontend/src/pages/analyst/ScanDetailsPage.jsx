@@ -307,7 +307,18 @@ export default function ScanDetailsPage() {
               <div><dt>Target ID</dt><dd>{scan.targetId ?? 'Not provided'}</dd></div>
               <div><dt>Scan mode</dt><dd>{scan.scanType || 'Not provided'}</dd></div>
               <div><dt>Native engine</dt><dd>{scan.executionSummary?.nativeEngineStatus || 'Status unavailable'}</dd></div>
+              <div><dt>OWASP ZAP requested</dt><dd>{typeof scan.executionSummary?.zapRequested === 'boolean' ? (scan.executionSummary.zapRequested ? 'Yes' : 'No') : 'Not reported'}</dd></div>
               <div><dt>OWASP ZAP</dt><dd>{scan.executionSummary?.zapEngineStatus || 'Status unavailable'}</dd></div>
+              {scan.executionSummary?.zapFailureReason ? (
+                <div><dt>OWASP ZAP failure or skip reason</dt><dd>{scan.executionSummary.zapFailureReason}</dd></div>
+              ) : null}
+              <div><dt>ZAP spider</dt><dd>{scan.executionSummary?.zapSpiderStatus || 'Not reported'}</dd></div>
+              <div><dt>ZAP spider URLs discovered</dt><dd>{scan.executionSummary?.zapSpiderDiscoveredCount ?? 'Not reported'}</dd></div>
+              <div><dt>ZAP passive analysis</dt><dd>{scan.executionSummary?.zapPassiveStatus || 'Not reported'}</dd></div>
+              <div><dt>ZAP alert count</dt><dd>{scan.executionSummary?.zapAlertCount ?? 'Not reported'}</dd></div>
+              {scan.executionSummary?.zapActiveStatus ? (
+                <div><dt>ZAP active scan</dt><dd>{scan.executionSummary.zapActiveStatus}</dd></div>
+              ) : null}
               <div><dt>Discovered same-origin pages</dt><dd>{scan.executionSummary?.discoveredPageCount ?? 'Not reported'}</dd></div>
               <div><dt>Visited pages</dt><dd>{scan.executionSummary?.visitedPageCount ?? 'Not reported'}</dd></div>
               <div><dt>Passively tested pages</dt><dd>{scan.executionSummary?.testedPassivePageCount ?? 'Not reported'}</dd></div>
@@ -403,7 +414,18 @@ export default function ScanDetailsPage() {
                   <div><dt>Passively tested pages</dt><dd>{report.executionSummary?.testedPassivePageCount ?? 'Not reported'}</dd></div>
                   <div><dt>Persisted HTML crawl records</dt><dd>{report.totalCrawlPages ?? 0}</dd></div>
                   <div><dt>Native engine status</dt><dd>{report.executionSummary?.nativeEngineStatus || 'Status unavailable'}</dd></div>
+                  <div><dt>OWASP ZAP requested</dt><dd>{typeof report.executionSummary?.zapRequested === 'boolean' ? (report.executionSummary.zapRequested ? 'Yes' : 'No') : 'Not reported'}</dd></div>
                   <div><dt>OWASP ZAP status</dt><dd>{report.executionSummary?.zapEngineStatus || 'Status unavailable'}</dd></div>
+                  {report.executionSummary?.zapFailureReason ? (
+                    <div><dt>OWASP ZAP failure or skip reason</dt><dd>{report.executionSummary.zapFailureReason}</dd></div>
+                  ) : null}
+                  <div><dt>ZAP spider</dt><dd>{report.executionSummary?.zapSpiderStatus || 'Not reported'}</dd></div>
+                  <div><dt>ZAP spider URLs discovered</dt><dd>{report.executionSummary?.zapSpiderDiscoveredCount ?? 'Not reported'}</dd></div>
+                  <div><dt>ZAP passive analysis</dt><dd>{report.executionSummary?.zapPassiveStatus || 'Not reported'}</dd></div>
+                  <div><dt>ZAP alert count</dt><dd>{report.executionSummary?.zapAlertCount ?? 'Not reported'}</dd></div>
+                  {report.executionSummary?.zapActiveStatus ? (
+                    <div><dt>ZAP active scan</dt><dd>{report.executionSummary.zapActiveStatus}</dd></div>
+                  ) : null}
                   {report.executionSummary?.checksInScope?.length ? (
                     <div><dt>Checks in scope</dt><dd>{report.executionSummary.checksInScope.join('; ')}</dd></div>
                   ) : null}

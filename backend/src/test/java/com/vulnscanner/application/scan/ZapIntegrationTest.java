@@ -24,6 +24,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -89,6 +91,56 @@ class ZapIntegrationTest {
     }
 
     @Test
+    void everySupportedScanModeRunsZapSpiderAndPassiveAnalysis() throws Exception {
+        long scanId = 100L;
+        for (ScanType scanType : ScanType.values()) {
+            long id = scanId++;
+            String targetUrl = "http://127.0.0.1:" + targetServer.getAddress().getPort();
+            ScanJob job = createApprovedJob(id, scanType, targetUrl);
+            ScanJobRepository jobs = mock(ScanJobRepository.class);
+            when(jobs.findByIdForExecutionUpdate(id)).thenReturn(Optional.of(job));
+            ScanFindingRepository findings = mock(ScanFindingRepository.class);
+            ZapClientService zap = mock(ZapClientService.class);
+            when(zap.isEnabled()).thenReturn(true);
+            when(zap.checkAvailability()).thenReturn(ZapClientService.AvailabilityStatus.AVAILABLE);
+            when(zap.createTargetContext(any(), anyString()))
+                    .thenReturn(new ZapClientService.ScopeContext("scan-" + id, "context-" + id));
+            when(zap.startSpider(eq(targetUrl), anyString())).thenReturn("spider-" + id);
+            when(zap.getSpiderProgress(anyString())).thenReturn(100);
+            when(zap.getSpiderDiscoveredCount(anyString())).thenReturn(2);
+            when(zap.getPassiveScanRecordsToScan()).thenReturn(0);
+            when(zap.getAlerts(targetUrl)).thenReturn(List.of());
+            if (scanType == ScanType.ZAP_ACTIVE) {
+                when(zap.startActiveScan(eq(targetUrl), any())).thenReturn("active-" + id);
+                when(zap.getActiveScanProgress(anyString())).thenReturn(100);
+            }
+
+            ScanExecutionService service = new ScanExecutionService(
+                    jobs, findings, true, null, null, null,
+                    10, 6, 15, null, null, zap, new ZapScanAdapter());
+            permitTestTargetOrigin(service, job);
+            service.runClaimed(id);
+
+            assertEquals(ScanStatus.COMPLETED, job.getStatus(), scanType.name());
+            assertTrue(job.isZapRequested(), scanType.name());
+            assertEquals("COMPLETED", job.getZapEngineStatus(), scanType.name());
+            assertEquals("COMPLETED", job.getZapSpiderStatus(), scanType.name());
+            assertEquals(2, job.getZapSpiderDiscoveredCount(), scanType.name());
+            assertEquals("COMPLETED", job.getZapPassiveStatus(), scanType.name());
+            assertEquals(0, job.getZapAlertCount(), scanType.name());
+            if (scanType == ScanType.ZAP_ACTIVE) {
+                assertEquals("COMPLETED", job.getZapActiveStatus());
+                verify(zap).startActiveScan(eq(targetUrl), any());
+            } else {
+                assertNull(job.getZapActiveStatus());
+                verify(zap, never()).startActiveScan(anyString(), any());
+            }
+            verify(zap).startSpider(eq(targetUrl), anyString());
+            verify(zap).getAlerts(targetUrl);
+        }
+    }
+
+    @Test
     void unavailableZapCompletesWithNativeFindings() {
         String targetUrl = "http://127.0.0.1:" + targetServer.getAddress().getPort();
         ScanJob job = createApprovedJob(1L, ScanType.ZAP_PASSIVE, targetUrl);
@@ -104,7 +156,7 @@ class ZapIntegrationTest {
 
         ZapClientService zapClient = mock(ZapClientService.class);
         when(zapClient.isEnabled()).thenReturn(true);
-        when(zapClient.isAvailable()).thenReturn(false);
+        when(zapClient.checkAvailability()).thenReturn(ZapClientService.AvailabilityStatus.UNAVAILABLE);
 
         ScanExecutionService executionService = new ScanExecutionService(
                 jobRepo, findingRepo, true, tx, null, null,
@@ -118,6 +170,7 @@ class ZapIntegrationTest {
         assertEquals(ScanStatus.COMPLETED, job.getStatus());
         assertEquals(100, job.getProgress());
         assertEquals("UNAVAILABLE", job.getZapEngineStatus());
+        assertEquals("ZAP_HEALTH_CHECK_FAILED", job.getZapFailureReason());
         assertTrue(job.getStatusMessage().contains("OWASP ZAP is unavailable"));
         verify(findingRepo, atLeastOnce()).save(any(ScanFinding.class));
     }
@@ -138,7 +191,7 @@ class ZapIntegrationTest {
 
         ZapClientService zapClient = mock(ZapClientService.class);
         when(zapClient.isEnabled()).thenReturn(true);
-        when(zapClient.isAvailable()).thenReturn(false);
+        when(zapClient.checkAvailability()).thenReturn(ZapClientService.AvailabilityStatus.UNAVAILABLE);
 
         ScanExecutionService executionService = new ScanExecutionService(
                 jobRepo, findingRepo, true, tx, null, null,
@@ -171,7 +224,7 @@ class ZapIntegrationTest {
         }).when(tx).executeWithoutResult(any());
         ZapClientService zapClient = mock(ZapClientService.class);
         when(zapClient.isEnabled()).thenReturn(true);
-        when(zapClient.isAvailable()).thenReturn(false);
+        when(zapClient.checkAvailability()).thenReturn(ZapClientService.AvailabilityStatus.UNAVAILABLE);
 
         ScanExecutionService service = new ScanExecutionService(
                 jobRepo, findingRepo, true, tx, null, null,
@@ -212,8 +265,168 @@ class ZapIntegrationTest {
         assertEquals(ScanStatus.COMPLETED, job.getStatus());
         assertEquals("COMPLETED", job.getNativeEngineStatus());
         assertEquals("DISABLED", job.getZapEngineStatus());
-        verify(zapClient, never()).isAvailable();
+        assertEquals("ZAP_DISABLED_BY_CONFIGURATION", job.getZapFailureReason());
+        verify(zapClient, never()).checkAvailability();
         verify(zapClient, never()).startSpider(anyString(), anyString());
+    }
+
+    @Test
+    void zapStartupFailureIsReportedWithoutDiscardingNativeFindings() throws Exception {
+        String targetUrl = "http://127.0.0.1:" + targetServer.getAddress().getPort();
+        ScanJob job = createApprovedJob(14L, ScanType.PASSIVE_HEADERS, targetUrl);
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        when(jobs.findByIdForExecutionUpdate(14L)).thenReturn(Optional.of(job));
+        ScanFindingRepository findings = mock(ScanFindingRepository.class);
+        ZapClientService zap = mock(ZapClientService.class);
+        when(zap.isEnabled()).thenReturn(true);
+        when(zap.checkAvailability()).thenReturn(ZapClientService.AvailabilityStatus.AVAILABLE);
+        when(zap.createTargetContext(any(), anyString()))
+                .thenReturn(new ZapClientService.ScopeContext("scan-14", "14"));
+        when(zap.startSpider(eq(targetUrl), anyString())).thenThrow(new java.io.IOException("start failed"));
+
+        ScanExecutionService service = new ScanExecutionService(
+                jobs, findings, true, null, null, null,
+                10, 6, 15, null, null, zap, new ZapScanAdapter());
+        permitTestTargetOrigin(service, job);
+        service.runClaimed(14L);
+
+        assertEquals(ScanStatus.COMPLETED, job.getStatus());
+        assertEquals("FAILED", job.getZapEngineStatus());
+        assertEquals("ZAP_COMMUNICATION_FAILED", job.getZapFailureReason());
+        assertEquals("FAILED", job.getZapSpiderStatus());
+        assertEquals("NOT_STARTED", job.getZapPassiveStatus());
+        assertEquals("COMPLETED", job.getNativeEngineStatus());
+        verify(findings, atLeastOnce()).save(any(ScanFinding.class));
+    }
+
+    @Test
+    void zapHealthCheckTimeoutIsDistinctFromUnavailable() throws Exception {
+        String targetUrl = "http://127.0.0.1:" + targetServer.getAddress().getPort();
+        ScanJob job = createApprovedJob(17L, ScanType.PASSIVE_HEADERS, targetUrl);
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        when(jobs.findByIdForExecutionUpdate(17L)).thenReturn(Optional.of(job));
+        ZapClientService zap = mock(ZapClientService.class);
+        when(zap.isEnabled()).thenReturn(true);
+        when(zap.checkAvailability()).thenReturn(ZapClientService.AvailabilityStatus.TIMED_OUT);
+
+        ScanExecutionService service = new ScanExecutionService(
+                jobs, mock(ScanFindingRepository.class), true, null, null, null,
+                10, 6, 15, null, null, zap, new ZapScanAdapter());
+        permitTestTargetOrigin(service, job);
+        service.runClaimed(17L);
+
+        assertEquals(ScanStatus.COMPLETED, job.getStatus());
+        assertEquals("TIMED_OUT", job.getZapEngineStatus());
+        assertEquals("ZAP_HEALTH_CHECK_TIMEOUT", job.getZapFailureReason());
+        verify(zap, never()).startSpider(anyString(), anyString());
+    }
+
+    @Test
+    void zapTimeoutIsReportedAsTimedOutAndDoesNotClaimSuccess() throws Exception {
+        String targetUrl = "http://127.0.0.1:" + targetServer.getAddress().getPort();
+        ScanJob job = createApprovedJob(15L, ScanType.PASSIVE_HEADERS, targetUrl);
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        when(jobs.findByIdForExecutionUpdate(15L)).thenReturn(Optional.of(job));
+        ScanFindingRepository findings = mock(ScanFindingRepository.class);
+        ZapClientService zap = mock(ZapClientService.class);
+        when(zap.isEnabled()).thenReturn(true);
+        when(zap.checkAvailability()).thenReturn(ZapClientService.AvailabilityStatus.AVAILABLE);
+        when(zap.createTargetContext(any(), anyString()))
+                .thenReturn(new ZapClientService.ScopeContext("scan-15", "15"));
+        when(zap.startSpider(eq(targetUrl), anyString())).thenReturn("spider-15");
+        when(zap.getSpiderProgress("spider-15")).thenReturn(0);
+
+        ScanExecutionService service = new ScanExecutionService(
+                jobs, findings, true, null, null, null,
+                10, 6, 15, null, null, zap, new ZapScanAdapter(), 1);
+        permitTestTargetOrigin(service, job);
+        service.runClaimed(15L);
+
+        assertEquals(ScanStatus.COMPLETED, job.getStatus());
+        assertEquals("TIMED_OUT", job.getZapEngineStatus());
+        assertEquals("TIME_BUDGET_EXCEEDED", job.getZapFailureReason());
+        assertEquals("TIMED_OUT", job.getZapSpiderStatus());
+        assertEquals("NOT_STARTED", job.getZapPassiveStatus());
+    }
+
+    @Test
+    void concurrentExecutionRequestsDoNotStartZapTwiceForOneScan() throws Exception {
+        long id = 16L;
+        String targetUrl = "http://127.0.0.1:" + targetServer.getAddress().getPort();
+        ScanJob job = createApprovedJob(id, ScanType.PASSIVE_HEADERS, targetUrl);
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        when(jobs.findByIdForExecutionUpdate(id)).thenReturn(Optional.of(job));
+        ScanFindingRepository findings = mock(ScanFindingRepository.class);
+        ZapClientService zap = mock(ZapClientService.class);
+        CountDownLatch healthCheckEntered = new CountDownLatch(1);
+        CountDownLatch allowHealthCheck = new CountDownLatch(1);
+        when(zap.isEnabled()).thenReturn(true);
+        when(zap.checkAvailability()).thenAnswer(invocation -> {
+            healthCheckEntered.countDown();
+            if (!allowHealthCheck.await(5, TimeUnit.SECONDS)) {
+                throw new IllegalStateException("test did not release health check");
+            }
+            return ZapClientService.AvailabilityStatus.AVAILABLE;
+        });
+        when(zap.createTargetContext(any(), anyString()))
+                .thenReturn(new ZapClientService.ScopeContext("scan-16", "16"));
+        when(zap.startSpider(eq(targetUrl), anyString())).thenReturn("spider-16");
+        when(zap.getSpiderProgress(anyString())).thenReturn(100);
+        when(zap.getPassiveScanRecordsToScan()).thenReturn(0);
+        when(zap.getAlerts(targetUrl)).thenReturn(List.of());
+
+        ScanExecutionService service = new ScanExecutionService(
+                jobs, findings, true, null, null, null,
+                10, 6, 15, null, null, zap, new ZapScanAdapter());
+        permitTestTargetOrigin(service, job);
+        Thread firstWorker = new Thread(() -> service.execute(id));
+        firstWorker.start();
+        try {
+            assertTrue(healthCheckEntered.await(5, TimeUnit.SECONDS));
+            service.execute(id);
+        } finally {
+            allowHealthCheck.countDown();
+        }
+        firstWorker.join(5000);
+        service.execute(id);
+
+        assertFalse(firstWorker.isAlive());
+        assertEquals("COMPLETED", job.getZapEngineStatus());
+        verify(zap, times(1)).startSpider(eq(targetUrl), anyString());
+    }
+
+    @Test
+    void unexpectedZapWorkerFailureIsPersistedAsFailed() throws Exception {
+        ScanJob job = createApprovedJob(13L, ScanType.ZAP_PASSIVE,
+                "http://127.0.0.1:" + targetServer.getAddress().getPort());
+        ScanJobRepository jobRepo = mock(ScanJobRepository.class);
+        when(jobRepo.findByIdForExecutionUpdate(13L)).thenReturn(Optional.of(job));
+        ScanFindingRepository findingRepo = mock(ScanFindingRepository.class);
+        TransactionTemplate tx = mock(TransactionTemplate.class);
+        doAnswer(invocation -> {
+            ((java.util.function.Consumer<org.springframework.transaction.TransactionStatus>)
+                    invocation.getArgument(0)).accept(null);
+            return null;
+        }).when(tx).executeWithoutResult(any());
+        ZapClientService zapClient = mock(ZapClientService.class);
+        when(zapClient.isEnabled()).thenReturn(true);
+        when(zapClient.checkAvailability()).thenReturn(ZapClientService.AvailabilityStatus.AVAILABLE);
+        when(zapClient.createTargetContext(any(), anyString()))
+                .thenThrow(new IllegalStateException("controlled ZAP worker failure"));
+
+        ScanExecutionService service = new ScanExecutionService(
+                jobRepo, findingRepo, true, tx, null, null,
+                10, 6, 15, null, null, zapClient, new ZapScanAdapter());
+        permitTestTargetOrigin(service, job);
+
+        service.execute(13L);
+
+        assertEquals(ScanStatus.FAILED, job.getStatus());
+        assertEquals("FAILED", job.getZapEngineStatus());
+        assertEquals("ZAP_EXECUTION_FAILED", job.getZapFailureReason());
+        assertEquals("COMPLETED", job.getNativeEngineStatus());
+        assertNotNull(job.getFailureReason());
+        verify(zapClient).createTargetContext(any(), anyString());
     }
 
     @Test
@@ -263,6 +476,35 @@ class ZapIntegrationTest {
     }
 
     @Test
+    void deduplicatesIdenticalZapEvidenceButPersistsDistinctEvidence() {
+        String targetUrl = "http://127.0.0.1:" + targetServer.getAddress().getPort();
+        ScanJob job = createApprovedJob(11L, ScanType.ZAP_PASSIVE, targetUrl);
+        ScanFindingRepository findings = mock(ScanFindingRepository.class);
+        when(findings.findByScanJob_Id(11L)).thenReturn(List.of());
+        ScanExecutionService service = new ScanExecutionService(
+                mock(ScanJobRepository.class), findings, false, null);
+        ZapAlert original = new ZapAlert("40012", "Cross Site Scripting (Reflected)", "High", "High",
+                targetUrl + "/search", "q", "<script>one</script>", "<script>one</script>",
+                "Description", "Remediation", "https://example.test/rule", "79", "8");
+        ZapAlert duplicate = new ZapAlert("40012", "Cross Site Scripting (Reflected)", "High", "High",
+                targetUrl + "/search", "q", "<script>one</script>", "<script>one</script>",
+                "Duplicate description", "Remediation", "https://example.test/rule", "79", "8");
+        ZapAlert distinctEvidence = new ZapAlert("40012", "Cross Site Scripting (Reflected)", "High", "High",
+                targetUrl + "/search", "q", "<script>two</script>", "<script>two</script>",
+                "Description", "Remediation", "https://example.test/rule", "79", "8");
+
+        ReflectionTestUtils.invokeMethod(service, "persistZapFindings",
+                job, List.of(original, duplicate, distinctEvidence));
+
+        ArgumentCaptor<ScanFinding> captor = ArgumentCaptor.forClass(ScanFinding.class);
+        verify(findings, times(2)).save(captor.capture());
+        assertTrue(captor.getAllValues().stream()
+                .anyMatch(finding -> "<script>one</script>".equals(finding.getEvidence())));
+        assertTrue(captor.getAllValues().stream()
+                .anyMatch(finding -> "<script>two</script>".equals(finding.getEvidence())));
+    }
+
+    @Test
     void passiveZapWaitsForAnalysisAfterNativeChecks() throws Exception {
         zapMockServer = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         respond("/JSON/core/view/version/", "{\"version\":\"2.16.1\"}");
@@ -271,6 +513,7 @@ class ZapIntegrationTest {
         respond("/JSON/context/action/removeContext/", "{\"Result\":\"OK\"}");
         respond("/JSON/spider/action/scan/", "{\"scan\":\"1\"}");
         respond("/JSON/spider/view/status/", "{\"status\":\"100\"}");
+        respond("/JSON/spider/view/results/", "{\"results\":[\"http://example.test/\",\"http://example.test/a\"]}");
         AtomicInteger passiveQueueChecks = new AtomicInteger();
         zapMockServer.createContext("/JSON/pscan/view/recordsToScan/", exchange -> {
             String remaining = passiveQueueChecks.getAndIncrement() == 0 ? "1" : "0";
@@ -305,6 +548,11 @@ class ZapIntegrationTest {
 
         assertEquals(ScanStatus.COMPLETED, job.getStatus());
         assertEquals("Native and OWASP ZAP scans completed successfully", job.getStatusMessage());
+        assertEquals("COMPLETED", job.getZapEngineStatus());
+        assertEquals("COMPLETED", job.getZapSpiderStatus());
+        assertEquals(2, job.getZapSpiderDiscoveredCount());
+        assertEquals("COMPLETED", job.getZapPassiveStatus());
+        assertEquals(0, job.getZapAlertCount());
         assertEquals(2, passiveQueueChecks.get());
         verify(findingRepo, atLeastOnce()).save(any(ScanFinding.class));
     }
@@ -353,6 +601,13 @@ class ZapIntegrationTest {
             exchange.getResponseHeaders().add("Content-Type", "application/json");
             exchange.sendResponseHeaders(200, body.length);
             try (OutputStream os = exchange.getResponseBody()) { os.write(body); }
+        });
+        zapMockServer.createContext("/JSON/spider/view/results/", exchange -> {
+            byte[] body = "{\"results\":[\"http://127.0.0.1/\",\"http://127.0.0.1/test\"]}"
+                    .getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, body.length);
+            try (OutputStream output = exchange.getResponseBody()) { output.write(body); }
         });
         zapMockServer.createContext("/JSON/ascan/action/scan/", exchange -> {
             String query = exchange.getRequestURI().getRawQuery();
@@ -414,6 +669,12 @@ class ZapIntegrationTest {
 
         assertEquals(ScanStatus.COMPLETED, job.getStatus());
         assertEquals(100, job.getProgress());
+        assertEquals("COMPLETED", job.getZapEngineStatus());
+        assertEquals("COMPLETED", job.getZapSpiderStatus());
+        assertEquals(2, job.getZapSpiderDiscoveredCount());
+        assertEquals("COMPLETED", job.getZapPassiveStatus());
+        assertEquals("COMPLETED", job.getZapActiveStatus());
+        assertEquals(3, job.getZapAlertCount());
         assertEquals("Native and OWASP ZAP scans completed successfully", job.getStatusMessage());
         assertTrue(activeScanWasScoped.get());
         assertTrue(targetOriginWasConfigured.get());
@@ -459,7 +720,7 @@ class ZapIntegrationTest {
         }).when(tx).executeWithoutResult(any());
 
         ZapClientService zapClient = mock(ZapClientService.class);
-        when(zapClient.isAvailable()).thenReturn(true);
+        when(zapClient.checkAvailability()).thenReturn(ZapClientService.AvailabilityStatus.AVAILABLE);
 
         ScanExecutionService executionService = new ScanExecutionService(
                 jobRepo, findingRepo, false, tx, null, null, // allowPrivateTargets = false
@@ -527,6 +788,8 @@ class ZapIntegrationTest {
         // Cancellation checked during spider loop or runClaimed guard
         // Because cancellation was requested before runClaimed, runClaimed returns early
         assertNotEquals(ScanStatus.COMPLETED, job.getStatus());
+        assertEquals("NOT_STARTED", job.getZapEngineStatus());
+        assertEquals("CANCELLED_BEFORE_ZAP", job.getZapFailureReason());
     }
 
     @Test
@@ -538,6 +801,7 @@ class ZapIntegrationTest {
         respond("/JSON/context/action/removeContext/", "{\"Result\":\"OK\"}");
         respond("/JSON/spider/action/scan/", "{\"scan\":\"1\"}");
         respond("/JSON/spider/view/status/", "{\"status\":\"100\"}");
+        respond("/JSON/spider/view/results/", "{\"results\":[]}");
         respond("/JSON/ascan/action/scan/", "{\"scan\":\"2\"}");
         respond("/JSON/ascan/view/status/", "{\"status\":\"0\"}");
         zapMockServer.start();
@@ -558,13 +822,18 @@ class ZapIntegrationTest {
 
         ScanExecutionService executionService = new ScanExecutionService(
                 jobRepo, findingRepo, true, tx, null, null,
-                10, 6, 15, null, null, zapClient, new ZapScanAdapter(), 1);
+                10, 6, 15, null, null, zapClient, new ZapScanAdapter(), 2);
         permitTestTargetOrigin(executionService, job);
         executionService.execute(8L);
 
         assertEquals(ScanStatus.COMPLETED, job.getStatus());
         assertNull(job.getFailureReason());
-        assertTrue(job.getStatusMessage().contains("did not complete"));
+        assertEquals("TIMED_OUT", job.getZapEngineStatus());
+        assertEquals("TIME_BUDGET_EXCEEDED", job.getZapFailureReason());
+        assertEquals("TIMED_OUT", job.getZapActiveStatus());
+        assertEquals("COMPLETED", job.getZapSpiderStatus());
+        assertEquals("NOT_STARTED", job.getZapPassiveStatus());
+        assertTrue(job.getStatusMessage().contains("TIME_BUDGET_EXCEEDED"));
         verify(findingRepo, atLeastOnce()).save(any(ScanFinding.class));
     }
 

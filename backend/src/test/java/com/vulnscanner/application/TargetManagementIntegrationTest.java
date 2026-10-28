@@ -143,15 +143,21 @@ class TargetManagementIntegrationTest {
 
         mockMvc.perform(get("/api/targets/{id}", target.getId())
                         .header("Authorization", "Bearer " + secondToken))
-                .andExpect(status().isNotFound());
+                .andExpect(status().isNotFound())
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString("Private target"))));
         mockMvc.perform(post("/api/targets/{id}/decision", target.getId())
                         .header("Authorization", "Bearer " + secondToken)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"decision\":\"APPROVE\"}"))
-                .andExpect(status().isNotFound());
+                .andExpect(status().isNotFound())
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString("Private target"))));
         mockMvc.perform(delete("/api/targets/{id}", target.getId())
                         .header("Authorization", "Bearer " + secondToken))
-                .andExpect(status().isNotFound());
+                .andExpect(status().isNotFound())
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString("Private target"))));
 
         mockMvc.perform(post("/api/targets")
                         .header("Authorization", "Bearer " + secondToken)

@@ -17,7 +17,6 @@ import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -27,6 +26,11 @@ public class NvdCveService {
     private static final int MAX_NVD_RESPONSE_BYTES = 2_097_152;
     private static final Pattern SOFTWARE_VERSION_PATTERN =
             Pattern.compile("(?i)^([a-zA-Z0-9_-]+)/(\\d+(?:\\.\\d+)*(?:[a-zA-Z0-9_.-]+)?)$");
+    private static final Pattern CVE_ID_PATTERN = Pattern.compile("^CVE-\\d{4}-\\d{4,}$");
+    private static final Pattern CVSS_V3_VECTOR_PATTERN = Pattern.compile(
+            "^CVSS:3\\.[01]/AV:[NALP]/AC:[LH]/PR:[NLH]/UI:[NR]/S:[UC]/C:[NLH]/I:[NLH]/A:[NLH]$");
+    private static final int MAX_NVD_RESULTS = 5;
+    private static final int MAX_DESCRIPTION_LENGTH = 1000;
 
     private final String apiUrl;
     private final String apiKey;
@@ -35,10 +39,10 @@ public class NvdCveService {
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
     private static final int MAX_CACHE_ENTRIES = 256;
-    private final Map<String, List<CveMatch>> cache = Collections.synchronizedMap(
+    private final Map<LookupKey, NvdLookupResult> cache = Collections.synchronizedMap(
             new LinkedHashMap<>(32, 0.75f, true) {
                 @Override
-                protected boolean removeEldestEntry(Map.Entry<String, List<CveMatch>> eldest) {
+                protected boolean removeEldestEntry(Map.Entry<LookupKey, NvdLookupResult> eldest) {
                     return size() > MAX_CACHE_ENTRIES;
                 }
             });
@@ -89,25 +93,30 @@ public class NvdCveService {
         return null;
     }
 
-    public List<CveMatch> findCves(String software, String version) {
-        if (!enabled || software == null || software.isBlank() || version == null || version.isBlank()) {
-            return List.of();
+    public NvdLookupResult lookupCves(String software, String version) {
+        if (software == null || software.isBlank() || version == null || version.isBlank()) {
+            return new NvdLookupResult(NvdLookupStatus.NOT_REQUESTED, List.of());
+        }
+        if (!enabled) {
+            return new NvdLookupResult(NvdLookupStatus.DISABLED, List.of());
         }
 
-        String cacheKey = (software + ":" + version).toLowerCase(Locale.ROOT);
-        List<CveMatch> cached = cache.get(cacheKey);
+        LookupKey cacheKey = new LookupKey(
+                software.toLowerCase(Locale.ROOT), version.toLowerCase(Locale.ROOT));
+        NvdLookupResult cached = cache.get(cacheKey);
         if (cached != null) {
             return cached;
         }
-        List<CveMatch> result = queryNvd(software, version);
-        if (result != null) {
+        NvdLookupResult result = queryNvd(software, version);
+        if (result.status() == NvdLookupStatus.CANDIDATES_FOUND
+                || result.status() == NvdLookupStatus.NO_CANDIDATES
+                || result.status() == NvdLookupStatus.PARTIAL_RESULTS) {
             cache.put(cacheKey, result);
-            return result;
         }
-        return List.of();
+        return result;
     }
 
-    private List<CveMatch> queryNvd(String software, String version) {
+    private NvdLookupResult queryNvd(String software, String version) {
         try {
             String keyword = software + " " + version;
             String encodedKeyword = URLEncoder.encode(keyword, StandardCharsets.UTF_8);
@@ -129,58 +138,53 @@ public class NvdCveService {
 
             if (response.statusCode() == 429) {
                 log.warn("NVD API rate limit exceeded (HTTP 429) querying {}:{}", software, version);
-                return null;
+                return unavailableResult(NvdLookupStatus.RATE_LIMITED);
             }
             if (response.statusCode() >= 500) {
                 log.warn("NVD API service unavailable (HTTP {}) querying {}:{}", response.statusCode(), software, version);
-                return null;
+                return unavailableResult(NvdLookupStatus.UNAVAILABLE);
             }
             if (response.statusCode() != 200) {
                 log.warn("NVD API query for {}:{} returned unexpected HTTP {}", software, version, response.statusCode());
-                return null;
+                return unavailableResult(NvdLookupStatus.UNAVAILABLE);
             }
             String responseBody = new String(response.body(), StandardCharsets.UTF_8);
-            JsonNode responseRoot = objectMapper.readTree(responseBody);
-            if (!responseRoot.path("vulnerabilities").isArray()) {
-                log.warn("NVD API returned an invalid response querying {}:{}", software, version);
-                return null;
-            }
             return parseNvdResponse(responseBody, software, version);
 
         } catch (HttpTimeoutException exception) {
             log.warn("NVD API request timed out querying {}:{}", software, version);
-            return null;
+            return unavailableResult(NvdLookupStatus.TIMEOUT);
         } catch (IOException | InterruptedException exception) {
             if (exception instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
             log.warn("NVD API query failed for {}:{} ({})", software, version, exception.getClass().getSimpleName());
-            return null;
+            return unavailableResult(NvdLookupStatus.UNAVAILABLE);
         } catch (Exception exception) {
             log.warn("Unexpected NVD query failure for {}:{} ({})", software, version,
                     exception.getClass().getSimpleName());
-            return null;
+            return unavailableResult(NvdLookupStatus.UNAVAILABLE);
         }
     }
 
-    List<CveMatch> parseNvdResponse(String json, String software, String version) {
+    NvdLookupResult parseNvdResponse(String json, String software, String version) {
         if (json == null || json.isBlank()) {
-            return List.of();
+            return unavailableResult(NvdLookupStatus.INVALID_RESPONSE);
         }
         try {
             JsonNode root = objectMapper.readTree(json);
             JsonNode vulnerabilities = root.path("vulnerabilities");
-            if (!vulnerabilities.isArray()) {
-                return List.of();
+            JsonNode totalResultsNode = root.path("totalResults");
+            if (!root.isObject() || !isValidVulnerabilityList(vulnerabilities)
+                    || !hasOnlyValidCveIds(vulnerabilities)
+                    || !totalResultsNode.isIntegralNumber() || totalResultsNode.asLong() < vulnerabilities.size()) {
+                return unavailableResult(NvdLookupStatus.INVALID_RESPONSE);
             }
 
             List<CveMatch> results = new ArrayList<>();
             for (JsonNode item : vulnerabilities) {
                 JsonNode cve = item.path("cve");
                 String cveId = cve.path("id").asText();
-                if (cveId == null || !cveId.startsWith("CVE-")) {
-                    continue;
-                }
 
                 String description = "";
                 JsonNode descriptions = cve.path("descriptions");
@@ -188,6 +192,9 @@ public class NvdCveService {
                     for (JsonNode desc : descriptions) {
                         if ("en".equalsIgnoreCase(desc.path("lang").asText(""))) {
                             description = desc.path("value").asText("");
+                            if (description.length() > MAX_DESCRIPTION_LENGTH) {
+                                description = description.substring(0, MAX_DESCRIPTION_LENGTH);
+                            }
                             break;
                         }
                     }
@@ -205,11 +212,44 @@ public class NvdCveService {
                         description
                 ));
             }
-            return results;
+            long totalResults = totalResultsNode.asLong();
+            if (totalResults > vulnerabilities.size()) {
+                return new NvdLookupResult(NvdLookupStatus.PARTIAL_RESULTS, results);
+            }
+            return new NvdLookupResult(results.isEmpty()
+                    ? NvdLookupStatus.NO_CANDIDATES : NvdLookupStatus.CANDIDATES_FOUND, results);
         } catch (Exception exception) {
-            log.warn("Failed to parse NVD response for {}:{}: {}", software, version, exception.getMessage());
-            return List.of();
+            log.warn("Failed to parse NVD response for {}:{}: {}", software, version,
+                    exception.getClass().getSimpleName());
+            return unavailableResult(NvdLookupStatus.INVALID_RESPONSE);
         }
+    }
+
+    private NvdLookupResult unavailableResult(NvdLookupStatus status) {
+        return new NvdLookupResult(status, List.of());
+    }
+
+    private boolean isValidVulnerabilityList(JsonNode vulnerabilities) {
+        if (!vulnerabilities.isArray() || vulnerabilities.size() > MAX_NVD_RESULTS) {
+            return false;
+        }
+        for (JsonNode item : vulnerabilities) {
+            JsonNode cveId = item.path("cve").path("id");
+            if (!item.isObject() || !item.path("cve").isObject()
+                    || !cveId.isTextual()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean hasOnlyValidCveIds(JsonNode vulnerabilities) {
+        for (JsonNode item : vulnerabilities) {
+            if (!CVE_ID_PATTERN.matcher(item.path("cve").path("id").asText()).matches()) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private CvssInfo extractCvss(JsonNode metrics) {
@@ -229,12 +269,34 @@ public class NvdCveService {
     }
 
     private CvssInfo parseCvssData(JsonNode cvssData) {
-        double score = cvssData.path("baseScore").asDouble(0.0);
-        String severity = cvssData.path("baseSeverity").asText("UNKNOWN").toUpperCase(Locale.ROOT);
-        String vector = cvssData.path("vectorString").asText("N/A");
+        JsonNode scoreNode = cvssData.path("baseScore");
+        double score = scoreNode.asDouble(Double.NaN);
+        String severity = cvssData.path("baseSeverity").asText("").toUpperCase(Locale.ROOT);
+        String vector = cvssData.path("vectorString").asText("");
+        if (!scoreNode.isNumber() || !Double.isFinite(score) || score < 0 || score > 10
+                || !isValidCvssSeverity(score, severity) || !CVSS_V3_VECTOR_PATTERN.matcher(vector).matches()) {
+            return new CvssInfo(0.0, "UNKNOWN", "N/A");
+        }
         return new CvssInfo(score, severity, vector);
     }
 
+    private boolean isValidCvssSeverity(double score, String severity) {
+        String expectedSeverity;
+        if (score == 0) {
+            expectedSeverity = "NONE";
+        } else if (score <= 3.9) {
+            expectedSeverity = "LOW";
+        } else if (score <= 6.9) {
+            expectedSeverity = "MEDIUM";
+        } else if (score <= 8.9) {
+            expectedSeverity = "HIGH";
+        } else {
+            expectedSeverity = "CRITICAL";
+        }
+        return expectedSeverity.equals(severity);
+    }
+
     public record SoftwareVersion(String software, String version) {}
+    private record LookupKey(String software, String version) {}
     private record CvssInfo(double score, String severity, String vector) {}
 }

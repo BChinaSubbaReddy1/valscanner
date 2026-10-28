@@ -1,11 +1,14 @@
 package com.vulnscanner.application.scan;
 
+import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.Test;
 
 import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URI;
@@ -14,6 +17,8 @@ import java.time.Duration;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -59,6 +64,81 @@ class PinnedHttpResponseTest {
         assertThrows(IOException.class, () -> send(URI.create("http://user@127.0.0.1/")));
         assertThrows(IOException.class, () -> send(URI.create("http://127.0.0.1:/")));
         assertThrows(IOException.class, () -> send(URI.create("http://127.0.0.1:70000/")));
+    }
+
+    @Test
+    void sendsBoundedUrlEncodedPostBodyThroughPinnedTransport() throws Exception {
+        HttpServer server = HttpServer.create(new InetSocketAddress(LOOPBACK, 0), 0);
+        AtomicReference<String> method = new AtomicReference<>();
+        AtomicReference<String> contentType = new AtomicReference<>();
+        AtomicReference<String> requestBody = new AtomicReference<>();
+        server.createContext("/submit", exchange -> {
+            method.set(exchange.getRequestMethod());
+            contentType.set(exchange.getRequestHeaders().getFirst("Content-Type"));
+            requestBody.set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            byte[] body = "ok".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.start();
+        try {
+            URI uri = URI.create("http://127.0.0.1:" + server.getAddress().getPort() + "/submit");
+            byte[] body = "q=search+term".getBytes(StandardCharsets.UTF_8);
+            PinnedHttpResponse.Response response = PinnedHttpResponse.sendPost(uri,
+                    new InetAddress[]{LOOPBACK}, Duration.ofSeconds(3), 32, "test", body);
+
+            assertEquals(200, response.statusCode());
+            assertEquals("POST", method.get());
+            assertEquals("application/x-www-form-urlencoded", contentType.get());
+            assertEquals("q=search+term", requestBody.get());
+            assertThrows(IOException.class, () -> PinnedHttpResponse.sendPost(uri,
+                    new InetAddress[]{LOOPBACK}, Duration.ofSeconds(3), 32, "test", new byte[8_193]));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
+    void doesNotRetryPostWhenResponseIsLost() throws Exception {
+        try (ServerSocket server = new ServerSocket(0, 2, LOOPBACK)) {
+            ExecutorService executor = Executors.newSingleThreadExecutor();
+            AtomicInteger accepted = new AtomicInteger();
+            try {
+                Future<?> requestReader = executor.submit(() -> {
+                    try (Socket client = server.accept()) {
+                        accepted.incrementAndGet();
+                        client.setSoTimeout(3_000);
+                        InputStream input = client.getInputStream();
+                        int matched = 0;
+                        while (matched < 4) {
+                            int value = input.read();
+                            if (value < 0) {
+                                return;
+                            }
+                            matched = switch (matched) {
+                                case 0 -> value == '\r' ? 1 : 0;
+                                case 1 -> value == '\n' ? 2 : value == '\r' ? 1 : 0;
+                                case 2 -> value == '\r' ? 3 : 0;
+                                case 3 -> value == '\n' ? 4 : 0;
+                                default -> matched;
+                            };
+                        }
+                        input.readNBytes("q=test".length());
+                    } catch (IOException exception) {
+                        throw new RuntimeException(exception);
+                    }
+                });
+                URI uri = URI.create("http://127.0.0.1:" + server.getLocalPort() + "/submit");
+                assertThrows(IOException.class, () -> PinnedHttpResponse.sendPost(uri,
+                        new InetAddress[]{LOOPBACK, LOOPBACK}, Duration.ofSeconds(3), 32,
+                        "test", "q=test".getBytes(StandardCharsets.UTF_8)));
+                requestReader.get();
+                assertEquals(1, accepted.get());
+            } finally {
+                executor.shutdownNow();
+            }
+        }
     }
 
     @Test

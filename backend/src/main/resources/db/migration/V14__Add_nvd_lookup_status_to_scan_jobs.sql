@@ -1,0 +1,2 @@
+ALTER TABLE scan_jobs
+    ADD COLUMN nvd_lookup_status VARCHAR(24) NOT NULL DEFAULT 'NOT_REQUESTED';

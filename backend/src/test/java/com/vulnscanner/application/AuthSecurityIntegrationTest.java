@@ -60,6 +60,42 @@ class AuthSecurityIntegrationTest {
     }
 
     @Test
+    void tamperedJwtSignatureIsRejectedByProtectedEndpoint() throws Exception {
+        User admin = createUser(RoleName.SUPER_ADMIN, "tampered-token-super@example.com");
+        String token = authenticate(admin.getEmail(), "Password123!");
+        String[] tokenParts = token.split("\\.");
+        String signature = tokenParts[2];
+        String replacement = signature.charAt(0) == 'A' ? "B" : "A";
+        String tamperedToken = tokenParts[0] + "." + tokenParts[1] + "."
+                + replacement + signature.substring(1);
+
+        mockMvc.perform(get("/api/users/me").header("Authorization", "Bearer " + tamperedToken))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void revokedJwtIsRejectedByProtectedEndpoint() throws Exception {
+        User admin = createUser(RoleName.SUPER_ADMIN, "revoked-token-super@example.com");
+        String token = authenticate(admin.getEmail(), "Password123!");
+
+        mockMvc.perform(post("/api/auth/logout").header("Authorization", "Bearer " + token))
+                .andExpect(status().isOk());
+        mockMvc.perform(get("/api/users/me").header("Authorization", "Bearer " + token))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void suspendedAccountCannotUsePreviouslyIssuedJwt() throws Exception {
+        User admin = createUser(RoleName.SUPER_ADMIN, "suspended-token-super@example.com");
+        String token = authenticate(admin.getEmail(), "Password123!");
+        admin.setStatus(UserStatus.SUSPENDED);
+        userRepository.saveAndFlush(admin);
+
+        mockMvc.perform(get("/api/users/me").header("Authorization", "Bearer " + token))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
     void registrationIsPublicAndIgnoresStaleBearerTokensWithoutOpeningProtectedRoutes() throws Exception {
         mockMvc.perform(post("/api/auth/register")
                         .contentType(MediaType.APPLICATION_JSON)

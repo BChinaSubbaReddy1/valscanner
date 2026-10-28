@@ -40,6 +40,22 @@ class ZapClientServiceTest {
     }
 
     @Test
+    void spiderDiscoveredCountUsesValidatedResultsArray() throws Exception {
+        server = startServer("/JSON/spider/view/results/", "{\"results\":[\"http://example.test/\",\"http://example.test/a\"]}");
+        ZapClientService client = client();
+
+        assertEquals(2, client.getSpiderDiscoveredCount("1"));
+    }
+
+    @Test
+    void invalidSpiderResultsResponseIsRejected() throws Exception {
+        server = startServer("/JSON/spider/view/results/", "{\"results\":\"not-an-array\"}");
+        ZapClientService client = client();
+
+        assertThrows(IOException.class, () -> client.getSpiderDiscoveredCount("1"));
+    }
+
+    @Test
     void activeScanRequiresAnExplicitScopeContext() throws Exception {
         server = startServer("/JSON/ascan/action/scan/", "{\"scan\":\"1\"}");
         ZapClientService client = client();

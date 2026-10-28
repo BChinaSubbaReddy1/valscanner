@@ -24,3 +24,7 @@ app:
     super-admin:
       email: ${INITIAL_SUPER_ADMIN_EMAIL:}
       password: ${INITIAL_SUPER_ADMIN_PASSWORD:}
+
+scanner:
+  zap:
+    enabled: false

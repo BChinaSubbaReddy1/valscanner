@@ -91,6 +91,31 @@ public class ScanJob {
     @Column(name = "zap_engine_status", nullable = false, length = 24)
     private String zapEngineStatus = "UNKNOWN";
 
+    @Column(name = "zap_requested", nullable = false)
+    private boolean zapRequested = true;
+
+    @Column(name = "zap_failure_reason", length = 250)
+    private String zapFailureReason;
+
+    @Column(name = "zap_spider_status", length = 24)
+    private String zapSpiderStatus = "NOT_STARTED";
+
+    @Column(name = "zap_spider_discovered_count")
+    private Integer zapSpiderDiscoveredCount;
+
+    @Column(name = "zap_passive_status", length = 24)
+    private String zapPassiveStatus = "NOT_STARTED";
+
+    @Column(name = "zap_alert_count")
+    private Integer zapAlertCount;
+
+    @Column(name = "zap_active_status", length = 24)
+    private String zapActiveStatus;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "nvd_lookup_status", nullable = false, length = 24)
+    private NvdLookupStatus nvdLookupStatus = NvdLookupStatus.NOT_REQUESTED;
+
     @Column(name = "discovered_page_count")
     private Integer discoveredPageCount;
 
@@ -108,7 +133,7 @@ public class ScanJob {
         this.organization = organization;
         this.requestedBy = requestedBy;
         this.scanType = scanType;
-        this.zapEngineStatus = scanType == ScanType.PASSIVE_HEADERS ? "NOT_REQUESTED" : "NOT_STARTED";
+        this.zapEngineStatus = "NOT_STARTED";
     }
 
     public void transitionTo(ScanStatus nextStatus, int nextProgress, String safeMessage,
@@ -161,6 +186,24 @@ public class ScanJob {
         copyExecutionDetailsFrom(update);
         if (cancellationRequested && update.status != ScanStatus.CANCELLED) {
             requestCancellation();
+            if ("RUNNING".equals(nativeEngineStatus)) {
+                nativeEngineStatus = "CANCELLED";
+            }
+            if ("RUNNING".equals(zapEngineStatus)) {
+                zapEngineStatus = "CANCELLED";
+                zapFailureReason = "CANCELLED_DURING_ZAP";
+            } else if (zapRequested && "NOT_STARTED".equals(zapEngineStatus)) {
+                zapFailureReason = "CANCELLED_BEFORE_ZAP";
+            }
+            if ("RUNNING".equals(zapSpiderStatus)) {
+                zapSpiderStatus = "CANCELLED";
+            }
+            if ("RUNNING".equals(zapPassiveStatus)) {
+                zapPassiveStatus = "CANCELLED";
+            }
+            if ("RUNNING".equals(zapActiveStatus)) {
+                zapActiveStatus = "CANCELLED";
+            }
             if (status != ScanStatus.CANCELLED) {
                 transitionTo(ScanStatus.CANCELLED, progress, "Scan cancelled during execution", null);
             }
@@ -187,6 +230,14 @@ public class ScanJob {
     private void copyExecutionDetailsFrom(ScanJob source) {
         nativeEngineStatus = source.nativeEngineStatus;
         zapEngineStatus = source.zapEngineStatus;
+        zapRequested = source.zapRequested;
+        zapFailureReason = source.zapFailureReason;
+        zapSpiderStatus = source.zapSpiderStatus;
+        zapSpiderDiscoveredCount = source.zapSpiderDiscoveredCount;
+        zapPassiveStatus = source.zapPassiveStatus;
+        zapAlertCount = source.zapAlertCount;
+        zapActiveStatus = source.zapActiveStatus;
+        nvdLookupStatus = source.nvdLookupStatus;
         discoveredPageCount = source.discoveredPageCount;
         visitedPageCount = source.visitedPageCount;
         testedPassivePageCount = source.testedPassivePageCount;
@@ -198,6 +249,47 @@ public class ScanJob {
 
     public void updateZapEngineStatus(String nextStatus) {
         zapEngineStatus = requireEngineStatus(nextStatus);
+    }
+
+    public void updateZapFailureReason(String reason) {
+        if (reason != null && (reason.isBlank() || reason.length() > 250)) {
+            throw new IllegalArgumentException("A valid ZAP failure reason is required");
+        }
+        zapFailureReason = reason;
+    }
+
+    public void updateZapSpiderStatus(String nextStatus) {
+        zapSpiderStatus = requireEngineStatus(nextStatus);
+    }
+
+    public void updateZapSpiderDiscoveredCount(int count) {
+        if (count < 0) {
+            throw new IllegalArgumentException("ZAP discovered URL count must be non-negative");
+        }
+        zapSpiderDiscoveredCount = count;
+    }
+
+    public void updateZapPassiveStatus(String nextStatus) {
+        zapPassiveStatus = requireEngineStatus(nextStatus);
+    }
+
+    public void updateZapAlertCount(int count) {
+        if (count < 0) {
+            throw new IllegalArgumentException("ZAP alert count must be non-negative");
+        }
+        zapAlertCount = count;
+    }
+
+    public void updateZapActiveStatus(String nextStatus) {
+        if (nextStatus == null) {
+            zapActiveStatus = null;
+        } else {
+            zapActiveStatus = requireEngineStatus(nextStatus);
+        }
+    }
+
+    public void recordNvdLookupStatus(NvdLookupStatus nextStatus) {
+        nvdLookupStatus = nvdLookupStatus.merge(nextStatus);
     }
 
     public void updateCrawlCounts(int discovered, int visited, int passiveTested) {
@@ -220,6 +312,7 @@ public class ScanJob {
     public void requestCancellation() {
         if (status == ScanStatus.PENDING_APPROVAL) {
             cancellationRequested = true;
+            markZapNotStartedAsCancelled();
             transitionTo(ScanStatus.CANCELLED, progress, "Scan request cancelled before approval", null);
             return;
         }
@@ -232,7 +325,14 @@ public class ScanJob {
             throw new IllegalStateException("Scan is already in a terminal state");
         }
         cancellationRequested = true;
+        markZapNotStartedAsCancelled();
         transitionTo(ScanStatus.CANCELLED, progress, "Scan cancelled before execution", null);
+    }
+
+    private void markZapNotStartedAsCancelled() {
+        if (zapRequested && "NOT_STARTED".equals(zapEngineStatus)) {
+            zapFailureReason = "CANCELLED_BEFORE_ZAP";
+        }
     }
 
     public void approve(User reviewer) {
@@ -254,6 +354,9 @@ public class ScanJob {
         reviewedBy = reviewer;
         reviewedAt = Instant.now();
         rejectionReason = reason.trim();
+        if (zapRequested && "NOT_STARTED".equals(zapEngineStatus)) {
+            zapFailureReason = "SCAN_REJECTED_BEFORE_ZAP";
+        }
         transitionTo(ScanStatus.REJECTED, progress, "Scan request rejected", null);
     }
 
@@ -275,6 +378,14 @@ public class ScanJob {
     public String getRejectionReason() { return rejectionReason; }
     public String getNativeEngineStatus() { return nativeEngineStatus; }
     public String getZapEngineStatus() { return zapEngineStatus; }
+    public boolean isZapRequested() { return zapRequested; }
+    public String getZapFailureReason() { return zapFailureReason; }
+    public String getZapSpiderStatus() { return zapSpiderStatus; }
+    public Integer getZapSpiderDiscoveredCount() { return zapSpiderDiscoveredCount; }
+    public String getZapPassiveStatus() { return zapPassiveStatus; }
+    public Integer getZapAlertCount() { return zapAlertCount; }
+    public String getZapActiveStatus() { return zapActiveStatus; }
+    public NvdLookupStatus getNvdLookupStatus() { return nvdLookupStatus; }
     public Integer getDiscoveredPageCount() { return discoveredPageCount; }
     public Integer getVisitedPageCount() { return visitedPageCount; }
     public Integer getTestedPassivePageCount() { return testedPassivePageCount; }

@@ -45,6 +45,7 @@ class ScanManagementIntegrationTest {
     @Autowired private OrganizationRepository organizationRepository;
     @Autowired private TargetRepository targetRepository;
     @Autowired private ScanJobRepository scanJobRepository;
+    @Autowired private ScanFindingRepository scanFindingRepository;
     @Autowired private ScanCrawlPageRepository scanCrawlPageRepository;
     @Autowired private PasswordEncoder passwordEncoder;
 
@@ -167,7 +168,10 @@ class ScanManagementIntegrationTest {
                         .content("{\"reason\":\"testing rejection\"}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.status").value("REJECTED"))
-                .andExpect(jsonPath("$.data.rejectionReason").value("testing rejection"));
+                .andExpect(jsonPath("$.data.rejectionReason").value("testing rejection"))
+                .andExpect(jsonPath("$.data.executionSummary.zapRequested").value(true))
+                .andExpect(jsonPath("$.data.executionSummary.zapFailureReason")
+                        .value("SCAN_REJECTED_BEFORE_ZAP"));
         mockMvc.perform(post("/api/scans/{scanId}/approve", scanId)
                         .header("Authorization", "Bearer " + adminToken))
                 .andExpect(status().isConflict());
@@ -226,6 +230,79 @@ class ScanManagementIntegrationTest {
         mockMvc.perform(get("/api/scans/{scanId}/crawl-pages", scanId)
                         .header("Authorization", "Bearer " + login(otherAnalyst.getEmail())))
                 .andExpect(status().isNotFound());
+    }
+
+    @Test
+    void foreignOrganizationCannotReadOrMutateScanResourcesById() throws Exception {
+        Organization organization = approvedOrganization("Scan Resource Tenant");
+        Organization otherOrganization = approvedOrganization("Other Scan Resource Tenant");
+        User admin = createUser(RoleName.ADMIN, "scan-resource-admin@example.com", organization);
+        User analyst = createUser(RoleName.SECURITY_ANALYST, "scan-resource-analyst@example.com", organization);
+        User otherAdmin = createUser(RoleName.ADMIN, "other-scan-resource-admin@example.com", otherOrganization);
+        User otherAnalyst = createUser(RoleName.SECURITY_ANALYST,
+                "other-scan-resource-analyst@example.com", otherOrganization);
+        User superAdmin = createUser(RoleName.SUPER_ADMIN, "scan-resource-super-admin@example.com", null);
+        Target target = createTarget(organization, admin, TargetStatus.APPROVED);
+        long completedScanId = createScan(login(analyst.getEmail()), target.getId());
+        ScanJob completedScan = scanJobRepository.findById(completedScanId).orElseThrow();
+        completedScan.transitionTo(ScanStatus.QUEUED, 0, "Queued", null);
+        completedScan.transitionTo(ScanStatus.RUNNING, 10, "Running", null);
+        completedScan.transitionTo(ScanStatus.COMPLETED, 100, "Completed", null);
+        scanJobRepository.saveAndFlush(completedScan);
+        String foreignEvidence = "FOREIGN_ORGANIZATION_SCAN_EVIDENCE";
+        scanFindingRepository.saveAndFlush(new ScanFinding(completedScan, "FOREIGN_FINDING", "HIGH",
+                "FOREIGN_ORGANIZATION_COMPONENT", foreignEvidence, "Sensitive rationale", "Sensitive remediation",
+                "TEST", "OBSERVED"));
+        scanCrawlPageRepository.saveAndFlush(new ScanCrawlPage(
+                completedScan, "https://foreign.example/private-page", 0, 200, 128, 0));
+
+        long pendingScanId = createScan(login(analyst.getEmail()), target.getId());
+        String otherAnalystToken = login(otherAnalyst.getEmail());
+        String otherAdminToken = login(otherAdmin.getEmail());
+        String superAdminToken = login(superAdmin.getEmail());
+
+        mockMvc.perform(get("/api/scans/{scanId}", completedScanId)
+                        .header("Authorization", "Bearer " + otherAnalystToken))
+                .andExpect(status().isNotFound())
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString(foreignEvidence))));
+        mockMvc.perform(get("/api/scans/{scanId}", completedScanId)
+                        .header("Authorization", "Bearer " + superAdminToken))
+                .andExpect(status().isForbidden())
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString(foreignEvidence))));
+        mockMvc.perform(get("/api/scans/{scanId}/findings", completedScanId)
+                        .header("Authorization", "Bearer " + otherAnalystToken))
+                .andExpect(status().isNotFound())
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString(foreignEvidence))));
+        mockMvc.perform(get("/api/scans/{scanId}/crawl-pages", completedScanId)
+                        .header("Authorization", "Bearer " + otherAnalystToken))
+                .andExpect(status().isNotFound())
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString("foreign.example"))));
+        mockMvc.perform(post("/api/scans/{scanId}/cancel", completedScanId)
+                        .header("Authorization", "Bearer " + otherAnalystToken))
+                .andExpect(status().isNotFound())
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString(foreignEvidence))));
+        mockMvc.perform(post("/api/scans/{scanId}/approve", pendingScanId)
+                        .header("Authorization", "Bearer " + otherAdminToken))
+                .andExpect(status().isNotFound())
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString(foreignEvidence))));
+        mockMvc.perform(post("/api/scans/{scanId}/reject", pendingScanId)
+                        .header("Authorization", "Bearer " + otherAdminToken)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"reason\":\"Unauthorized cross-tenant attempt\"}"))
+                .andExpect(status().isNotFound())
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString(foreignEvidence))));
+
+        assertEquals(ScanStatus.COMPLETED,
+                scanJobRepository.findById(completedScanId).orElseThrow().getStatus());
+        assertEquals(ScanStatus.PENDING_APPROVAL,
+                scanJobRepository.findById(pendingScanId).orElseThrow().getStatus());
     }
 
     @Test
