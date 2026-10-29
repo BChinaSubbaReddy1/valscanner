@@ -27,6 +27,8 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
@@ -55,11 +57,14 @@ public class ScanExecutionService {
     private static final int DEFAULT_MAX_DETECTION_REQUESTS = 6;
     private static final int DEFAULT_REQUEST_TIMEOUT_SECONDS = 15;
     private static final Set<Long> CLAIMED = ConcurrentHashMap.newKeySet();
+    private static final ReentrantLock ZAP_EXECUTION_LOCK = new ReentrantLock(true);
 
     private final ScanJobRepository scanJobRepository;
     private final ScanFindingRepository findingRepository;
     @Value("${scanner.allowed-private-target-origins:}")
     private String allowedPrivateTargetOrigins = "";
+    @Value("${scanner.localhost-target-origin-mapping:}")
+    private String localhostTargetOriginMapping = "";
     @Value("${scanner.active-post-form-allowlist:}")
     private String activePostFormAllowlist = "";
     private final TransactionTemplate transactionTemplate;
@@ -289,13 +294,14 @@ public class ScanExecutionService {
         return claimed[0];
     }
 
-    private void runNativeStages(ScanJob job) throws ScanExecutionException {
+    private void runNativeStages(ScanJob job, Map<String, Set<String>> resolvedAddressesByHost)
+            throws ScanExecutionException {
         job.updateNativeEngineStatus("RUNNING");
         persistExecutionState(job);
         job.transitionTo(ScanStatus.CRAWLING, 10, "Discovering same-origin pages", null);
         persistExecutionState(job);
 
-        CrawlResult crawl = crawl(job);
+        CrawlResult crawl = crawl(job, resolvedAddressesByHost);
         if (cancellationRequested(job)) {
             job.updateNativeEngineStatus("CANCELLED");
             if (job.isZapRequested() && "NOT_STARTED".equals(job.getZapEngineStatus())) {
@@ -325,9 +331,18 @@ public class ScanExecutionService {
     private void runZapScan(ScanJob job) throws ScanExecutionException {
         // Enforce SSRF validation before contacting ZAP or dispatching scan
         URI origin;
+        URI zapOrigin;
+        String targetUrl;
+        Map<String, Set<String>> resolvedAddressesByHost = new HashMap<>();
         try {
             origin = new URI(job.getTarget().getUrl());
-            validateResolvedAddresses(origin, new HashMap<>());
+            validateResolvedAddresses(origin, resolvedAddressesByHost);
+            TargetOriginMapping mapping = localhostTargetOriginMapping(origin);
+            zapOrigin = mapping == null ? origin : mapping.destinationOrigin();
+            if (mapping != null) {
+                validateResolvedAddresses(zapOrigin, resolvedAddressesByHost);
+            }
+            targetUrl = targetUrlForOrigin(origin, mapping);
         } catch (UnknownHostException exception) {
             throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID,
                     "Target hostname could not be resolved");
@@ -342,7 +357,7 @@ public class ScanExecutionService {
             persistExecutionState(job);
         }
 
-        runNativeStages(job);
+        runNativeStages(job, resolvedAddressesByHost);
         if (job.getStatus() != ScanStatus.SCANNING) {
             return;
         }
@@ -362,31 +377,47 @@ public class ScanExecutionService {
                     "Native checks completed; OWASP ZAP is disabled, so ZAP findings are omitted");
             return;
         }
-        ZapClientService.AvailabilityStatus availability = zapClientService.checkAvailability();
-        if (availability != ZapClientService.AvailabilityStatus.AVAILABLE) {
-            boolean timedOut = availability == ZapClientService.AvailabilityStatus.TIMED_OUT;
-            job.updateZapEngineStatus(timedOut ? "TIMED_OUT" : "UNAVAILABLE");
-            job.updateZapFailureReason(timedOut
-                    ? "ZAP_HEALTH_CHECK_TIMEOUT" : "ZAP_HEALTH_CHECK_FAILED");
-            persistExecutionState(job);
-            completeWithPartialZapResults(job,
-                    timedOut
-                            ? "Native checks completed; OWASP ZAP health check timed out"
-                            : "Native checks completed; OWASP ZAP is unavailable, so ZAP findings are omitted");
+        try {
+            if (!acquireZapExecutionLock(job)) {
+                return;
+            }
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            if (!cancelIfRequested(job, "Scan cancelled while waiting for OWASP ZAP")) {
+                job.updateZapEngineStatus("FAILED");
+                job.updateZapFailureReason("ZAP_EXECUTION_WAIT_INTERRUPTED");
+                completeWithPartialZapResults(job,
+                        "Native checks completed; OWASP ZAP failed (ZAP_EXECUTION_WAIT_INTERRUPTED)");
+            }
             return;
         }
-        job.updateZapEngineStatus("RUNNING");
-        persistExecutionState(job);
-
-        String targetUrl = job.getTarget().getUrl();
         String spiderScanId = null;
         String activeScanId = null;
         boolean spiderFinished = false;
         boolean activeFinished = false;
         ZapClientService.ScopeContext context = null;
-
         try {
-            context = zapClientService.createTargetContext(origin, "scanner-" + job.getId() + "-" + UUID.randomUUID());
+            ZapClientService.AvailabilityStatus availability = zapClientService.checkAvailability();
+            if (availability != ZapClientService.AvailabilityStatus.AVAILABLE) {
+                boolean timedOut = availability == ZapClientService.AvailabilityStatus.TIMED_OUT;
+                job.updateZapEngineStatus(timedOut ? "TIMED_OUT" : "UNAVAILABLE");
+                job.updateZapFailureReason(timedOut
+                        ? "ZAP_HEALTH_CHECK_TIMEOUT" : "ZAP_HEALTH_CHECK_FAILED");
+                persistExecutionState(job);
+                completeWithPartialZapResults(job,
+                        timedOut
+                                ? "Native checks completed; OWASP ZAP health check timed out"
+                                : "Native checks completed; OWASP ZAP is unavailable, so ZAP findings are omitted");
+                return;
+            }
+            job.updateZapEngineStatus("RUNNING");
+            persistExecutionState(job);
+            Set<String> existingAlertIds = zapClientService.getAlerts(targetUrl).stream()
+                    .map(ZapAlert::id)
+                    .filter(id -> id != null && !id.isBlank())
+                    .collect(java.util.stream.Collectors.toUnmodifiableSet());
+            context = zapClientService.createTargetContext(
+                    zapOrigin, "scanner-" + job.getId() + "-" + UUID.randomUUID());
             long deadline = System.nanoTime() + zapMaxDuration.toNanos();
             job.updateProgress(job.getProgress(), "OWASP ZAP spider discovering pages");
             persistExecutionState(job);
@@ -513,7 +544,12 @@ public class ScanExecutionService {
             if (cancelIfRequested(job, "Scan cancelled before OWASP ZAP alert processing")) {
                 return;
             }
-            List<ZapAlert> alerts = zapClientService.getAlerts(targetUrl);
+            List<ZapAlert> alerts = zapClientService.getAlerts(targetUrl).stream()
+                    .filter(alert -> alert.id() != null && !alert.id().isBlank())
+                    .filter(alert -> !existingAlertIds.contains(alert.id()))
+                    .filter(alert -> isSameOriginZapAlert(zapOrigin, alert))
+                    .map(alert -> restoreSavedTargetOrigin(alert, origin, zapOrigin))
+                    .toList();
             if (System.nanoTime() > deadline) {
                 throw new ScanExecutionException(ScanFailureReason.TIME_BUDGET_EXCEEDED,
                         "OWASP ZAP scan exceeded its time budget");
@@ -575,6 +611,29 @@ public class ScanExecutionService {
                 zapClientService.stopSpider(spiderScanId);
             }
             zapClientService.removeContext(context);
+            ZAP_EXECUTION_LOCK.unlock();
+        }
+    }
+
+    private boolean acquireZapExecutionLock(ScanJob job) throws InterruptedException {
+        long deadline = System.nanoTime() + zapMaxDuration.toNanos();
+        while (true) {
+            if (cancelIfRequested(job, "Scan cancelled while waiting for OWASP ZAP")) {
+                return false;
+            }
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) {
+                job.updateZapEngineStatus("TIMED_OUT");
+                job.updateZapFailureReason("ZAP_EXECUTION_WAIT_TIMEOUT");
+                persistExecutionState(job);
+                completeWithPartialZapResults(job,
+                        "Native checks completed; OWASP ZAP timed out waiting for an execution slot");
+                return false;
+            }
+            if (ZAP_EXECUTION_LOCK.tryLock(Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(250)),
+                    TimeUnit.NANOSECONDS)) {
+                return true;
+            }
         }
     }
 
@@ -641,7 +700,8 @@ public class ScanExecutionService {
         });
     }
 
-    private CrawlResult crawl(ScanJob job) throws ScanExecutionException {
+    private CrawlResult crawl(ScanJob job, Map<String, Set<String>> resolvedAddressesByHost)
+            throws ScanExecutionException {
         URI origin;
         try {
             origin = new URI(job.getTarget().getUrl());
@@ -652,7 +712,9 @@ public class ScanExecutionService {
         Set<URI> visited = new LinkedHashSet<>();
         Set<URI> discovered = new LinkedHashSet<>();
         List<CrawledPage> pages = new ArrayList<>();
-        ScanContext context = new ScanContext(maxRequests, maxDetectionRequests);
+        ScanContext context = new ScanContext(maxRequests, maxDetectionRequests, resolvedAddressesByHost);
+        int duplicateRequestsSkipped = 0;
+        int outOfScopeRequestsSkipped = 0;
         URI normalizedOrigin = normalize(origin);
         discovered.add(normalizedOrigin);
         queue.add(new CrawlRequest(normalizedOrigin, 0));
@@ -662,7 +724,12 @@ public class ScanExecutionService {
             }
             CrawlRequest next = queue.removeFirst();
             URI uri = normalize(next.uri());
-            if (!sameOrigin(origin, uri) || !visited.add(uri)) {
+            if (!sameOrigin(origin, uri)) {
+                outOfScopeRequestsSkipped++;
+                continue;
+            }
+            if (!visited.add(uri)) {
+                duplicateRequestsSkipped++;
                 continue;
             }
             ScanResponse response = requestTarget(uri, context, false);
@@ -672,7 +739,17 @@ public class ScanExecutionService {
             PageDiscovery discovery = htmlDocument
                     ? discoverPage(origin, responseUri, firstHeader(response.headers(), "content-type"),
                             response.body())
-                    : new PageDiscovery(List.of(), List.of(), List.of());
+                    : new PageDiscovery(List.of(), List.of(), List.of(), LinkDiscoveryStats.EMPTY);
+            boolean depthLimitReached = next.depth() >= MAX_CRAWL_DEPTH;
+            int linksOmittedByDepthLimit = depthLimitReached ? discovery.links().size() : 0;
+            LOG.info("Native crawler page analyzed: scan={} depth={} html={} candidateLinks={} "
+                            + "acceptedSameOriginLinks={} rejectedCrossOriginLinks={} rejectedInvalidLinks={} "
+                            + "duplicateLinks={} depthLimitReached={} linksOmittedByDepthLimit={}",
+                    job.getId(), next.depth(), htmlDocument, discovery.linkStats().candidateLinks(),
+                    discovery.linkStats().acceptedSameOriginLinks(),
+                    discovery.linkStats().rejectedCrossOriginLinks(),
+                    discovery.linkStats().rejectedInvalidLinks(), discovery.linkStats().duplicateLinks(),
+                    depthLimitReached, linksOmittedByDepthLimit);
             pages.add(new CrawledPage(responseUri, response));
             if (!cancellationRequested(job) && crawlPageRepository != null && htmlDocument) {
                 crawlPageRepository.save(new ScanCrawlPage(job, responseUri.toString(), next.depth(),
@@ -690,6 +767,13 @@ public class ScanExecutionService {
                 }
             }
         }
+        boolean requestLimitReached = visited.size() >= maxRequests && !queue.isEmpty();
+        LOG.info("Native crawler finished: scan={} discoveredPages={} visitedPages={} "
+                        + "duplicateRequestsSkipped={} outOfScopeRequestsSkipped={} requestLimitReached={} "
+                        + "queuedLinksNotVisited={}",
+                job.getId(), discovered.size(), visited.size(), duplicateRequestsSkipped,
+                outOfScopeRequestsSkipped, requestLimitReached,
+                requestLimitReached ? queue.size() : 0);
         if (pages.isEmpty()) {
             if (cancellationRequested(job)) {
                 return new CrawlResult(List.of(), discovered.size(), 0);
@@ -907,21 +991,29 @@ public class ScanExecutionService {
                 || !hasValidRawAuthority(uri)) {
             throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID, "Target URL is not safe to scan");
         }
-        InetAddress[] addresses = resolveAddresses(uri.getHost());
+        TargetOriginMapping mapping = localhostTargetOriginMapping(uri);
+        String resolutionHost = mapping == null ? uri.getHost() : mapping.destinationOrigin().getHost();
+        InetAddress[] addresses = resolveAddresses(resolutionHost);
         if (addresses.length == 0) {
             throw new UnknownHostException("Target did not resolve to an address");
         }
         Set<String> resolvedAddresses = new HashSet<>();
         boolean explicitlyAllowedPrivateTarget = isAllowedPrivateTargetOrigin(uri);
         for (InetAddress address : addresses) {
-            if (isUnsafeAddress(address)
-                    || (isPrivate(address) && !explicitlyAllowedPrivateTarget)) {
+            boolean unsafeAddress = isUnsafeAddress(address);
+            boolean privateAddressNotAllowed = !unsafeAddress
+                    && isPrivate(address) && !explicitlyAllowedPrivateTarget;
+            if (unsafeAddress || privateAddressNotAllowed) {
+                String category = unsafeAddress ? "UNSAFE_ADDRESS" : "PRIVATE_ADDRESS_NOT_ALLOWED";
+                String origin = uri.getScheme().toLowerCase(Locale.ROOT) + "://" + uri.getRawAuthority();
+                LOG.warn("Target address validation rejected: category={} origin={} address={}",
+                        category, origin, address.getHostAddress());
                 throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID,
                         "Target resolves to a disallowed network address");
             }
             resolvedAddresses.add(address.getHostAddress().toLowerCase(Locale.ROOT));
         }
-        String hostKey = uri.getHost().toLowerCase(Locale.ROOT);
+        String hostKey = resolutionHost.toLowerCase(Locale.ROOT);
         Set<String> previouslyResolved = resolvedAddressesByHost.putIfAbsent(hostKey, resolvedAddresses);
         if (previouslyResolved != null && !previouslyResolved.equals(resolvedAddresses)) {
             throw new ScanExecutionException(ScanFailureReason.TARGET_URL_INVALID,
@@ -985,6 +1077,79 @@ public class ScanExecutionService {
             }
         }
         return matchesTarget;
+    }
+
+    private TargetOriginMapping localhostTargetOriginMapping(URI target) {
+        if (localhostTargetOriginMapping == null || localhostTargetOriginMapping.isBlank()) {
+            return null;
+        }
+        String[] origins = localhostTargetOriginMapping.split("=", -1);
+        if (origins.length != 2) {
+            throw new IllegalStateException(
+                    "scanner.localhost-target-origin-mapping must contain source=destination origins");
+        }
+        URI source = parseConfiguredOrigin(origins[0]);
+        URI destination = parseConfiguredOrigin(origins[1]);
+        if (!"localhost".equalsIgnoreCase(source.getHost())
+                || !"host.docker.internal".equalsIgnoreCase(destination.getHost())
+                || !source.getScheme().equalsIgnoreCase(destination.getScheme())
+                || effectivePort(source) != effectivePort(destination)) {
+            throw new IllegalStateException(
+                    "scanner.localhost-target-origin-mapping must map localhost to host.docker.internal "
+                            + "using the same scheme and port");
+        }
+        return sameOrigin(target, source) ? new TargetOriginMapping(source, destination) : null;
+    }
+
+    private URI parseConfiguredOrigin(String configuredOrigin) {
+        URI origin;
+        try {
+            origin = URI.create(configuredOrigin.trim());
+        } catch (IllegalArgumentException exception) {
+            throw new IllegalStateException(
+                    "scanner.localhost-target-origin-mapping contains an invalid origin", exception);
+        }
+        String scheme = origin.getScheme();
+        int port = origin.getPort();
+        if (!origin.isAbsolute() || origin.isOpaque() || origin.getRawAuthority() == null
+                || origin.getHost() == null || origin.getHost().isBlank()
+                || origin.getRawUserInfo() != null
+                || (port != -1 && (port < 1 || port > 65535))
+                || (origin.getRawPath() != null && !origin.getRawPath().isEmpty()
+                        && !"/".equals(origin.getRawPath()))
+                || origin.getRawQuery() != null || origin.getRawFragment() != null
+                || (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme))
+                || !hasValidRawAuthority(origin)) {
+            throw new IllegalStateException(
+                    "scanner.localhost-target-origin-mapping entries must be HTTP(S) origins");
+        }
+        return origin;
+    }
+
+    private String targetUrlForOrigin(URI target, TargetOriginMapping mapping) {
+        if (mapping == null) {
+            return target.toString();
+        }
+        String targetValue = target.toString();
+        int authorityStart = targetValue.indexOf("://") + 3;
+        int suffixStart = authorityStart + target.getRawAuthority().length();
+        return mapping.destinationOrigin().getScheme() + "://"
+                + mapping.destinationOrigin().getRawAuthority() + targetValue.substring(suffixStart);
+    }
+
+    private ZapAlert restoreSavedTargetOrigin(ZapAlert alert, URI savedOrigin, URI zapOrigin) {
+        if (sameOrigin(savedOrigin, zapOrigin) || alert.url() == null || alert.url().isBlank()) {
+            return alert;
+        }
+        URI alertUri = URI.create(alert.url());
+        int schemeSeparator = alert.url().indexOf("://");
+        int authorityStart = schemeSeparator + 3;
+        int suffixStart = authorityStart + alertUri.getRawAuthority().length();
+        String savedUrl = savedOrigin.getScheme() + "://" + savedOrigin.getRawAuthority()
+                + alert.url().substring(suffixStart);
+        return new ZapAlert(alert.pluginId(), alert.alert(), alert.risk(), alert.confidence(), savedUrl,
+                alert.param(), alert.attack(), alert.evidence(), alert.description(), alert.solution(),
+                alert.reference(), alert.cweid(), alert.wascid(), alert.id());
     }
 
     boolean isCloudMetadata(InetAddress address) {
@@ -1482,10 +1647,11 @@ public class ScanExecutionService {
     private PageDiscovery discoverPage(URI origin, URI base, String contentType, byte[] body) {
         Document document = Jsoup.parse(new String(body, responseCharset(contentType)), base.toString());
         Set<URI> links = new LinkedHashSet<>();
+        LinkDiscoveryCounters linkCounters = new LinkDiscoveryCounters();
         List<DiscoveredForm> forms = new ArrayList<>();
         List<PostFormCandidate> postForms = new ArrayList<>();
         for (Element element : document.select("a[href], area[href]")) {
-            addSameOriginLink(origin, element.absUrl("href"), links);
+            addSameOriginLink(origin, element.absUrl("href"), links, linkCounters);
         }
         for (Element form : document.select("form")) {
             if (forms.size() >= MAX_DISCOVERED_FORMS_PER_PAGE) {
@@ -1499,12 +1665,13 @@ public class ScanExecutionService {
                 continue;
             }
             String actionUrl = form.hasAttr("action") ? form.absUrl("action") : base.toString();
-            URI action = validateSameOriginLink(origin, actionUrl);
+            LinkValidation actionValidation = validateSameOriginLinkDetailed(origin, actionUrl);
+            URI action = actionValidation.uri();
+            if (method.equals("GET")) {
+                recordLinkCandidate(actionValidation, links, linkCounters);
+            }
             if (action == null) {
                 continue;
-            }
-            if (method.equals("GET")) {
-                links.add(action);
             }
             LinkedHashSet<String> names = new LinkedHashSet<>();
             for (Element field : form.select("input[name], textarea[name], select[name], button[name]")) {
@@ -1524,7 +1691,8 @@ public class ScanExecutionService {
                 }
             }
         }
-        return new PageDiscovery(List.copyOf(links), List.copyOf(forms), List.copyOf(postForms));
+        return new PageDiscovery(List.copyOf(links), List.copyOf(forms), List.copyOf(postForms),
+                linkCounters.snapshot());
     }
 
     private Charset responseCharset(String contentType) {
@@ -1639,27 +1807,48 @@ public class ScanExecutionService {
                 + "(?:[/_-]|$).*");
     }
 
-    private URI addSameOriginLink(URI origin, String absoluteUrl, Set<URI> links) {
-        URI candidate = validateSameOriginLink(origin, absoluteUrl);
-        if (candidate != null) {
-            links.add(candidate);
+    private URI addSameOriginLink(URI origin, String absoluteUrl, Set<URI> links,
+                                  LinkDiscoveryCounters linkCounters) {
+        return recordLinkCandidate(validateSameOriginLinkDetailed(origin, absoluteUrl), links, linkCounters);
+    }
+
+    private URI recordLinkCandidate(LinkValidation validation, Set<URI> links,
+                                    LinkDiscoveryCounters linkCounters) {
+        linkCounters.candidateLinks++;
+        if (validation.uri() == null) {
+            if (validation.rejection() == LinkRejection.CROSS_ORIGIN) {
+                linkCounters.rejectedCrossOriginLinks++;
+            } else {
+                linkCounters.rejectedInvalidLinks++;
+            }
+            return null;
         }
-        return candidate;
+        if (links.add(validation.uri())) {
+            linkCounters.acceptedSameOriginLinks++;
+        } else {
+            linkCounters.duplicateLinks++;
+        }
+        return validation.uri();
     }
 
     private URI validateSameOriginLink(URI origin, String absoluteUrl) {
+        return validateSameOriginLinkDetailed(origin, absoluteUrl).uri();
+    }
+
+    private LinkValidation validateSameOriginLinkDetailed(URI origin, String absoluteUrl) {
         if (absoluteUrl == null || absoluteUrl.isBlank()) {
-            return null;
+            return new LinkValidation(null, LinkRejection.INVALID_URL);
         }
         try {
             URI candidate = normalize(URI.create(absoluteUrl));
             if (sameOrigin(origin, candidate)) {
-                return candidate;
+                return new LinkValidation(candidate, null);
             }
+            return new LinkValidation(null, LinkRejection.CROSS_ORIGIN);
         } catch (IllegalArgumentException ignored) {
             // Invalid markup is not a scan failure.
+            return new LinkValidation(null, LinkRejection.INVALID_URL);
         }
-        return null;
     }
 
     private URI normalize(URI uri) {
@@ -1690,6 +1879,29 @@ public class ScanExecutionService {
                 && effectivePort(left) == effectivePort(right);
     }
 
+    private boolean isSameOriginZapAlert(URI origin, ZapAlert alert) {
+        if (alert.url() == null || alert.url().isBlank()) {
+            return false;
+        }
+        try {
+            URI alertUri = URI.create(alert.url());
+            String scheme = alertUri.getScheme();
+            int port = alertUri.getPort();
+            return alertUri.isAbsolute()
+                    && !alertUri.isOpaque()
+                    && alertUri.getRawAuthority() != null
+                    && alertUri.getHost() != null
+                    && !alertUri.getHost().isBlank()
+                    && (port == -1 || (port >= 1 && port <= 65535))
+                    && ("http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme))
+                    && alertUri.getRawUserInfo() == null
+                    && hasValidRawAuthority(alertUri)
+                    && sameOrigin(origin, alertUri);
+        } catch (IllegalArgumentException exception) {
+            return false;
+        }
+    }
+
     private int effectivePort(URI uri) {
         if (uri.getPort() != -1) {
             return uri.getPort();
@@ -1707,8 +1919,28 @@ public class ScanExecutionService {
     private record CrawlRequest(URI uri, int depth) {}
     private record CrawlResult(List<CrawledPage> pages, int discoveredPageCount, int visitedPageCount) {}
     private record CrawledPage(URI uri, ScanResponse response) {}
+    private record TargetOriginMapping(URI sourceOrigin, URI destinationOrigin) {}
     private record PageDiscovery(List<URI> links, List<DiscoveredForm> forms,
-                                 List<PostFormCandidate> postForms) {}
+                                 List<PostFormCandidate> postForms, LinkDiscoveryStats linkStats) {}
+    private record LinkDiscoveryStats(int candidateLinks, int acceptedSameOriginLinks,
+                                      int rejectedCrossOriginLinks, int rejectedInvalidLinks,
+                                      int duplicateLinks) {
+        private static final LinkDiscoveryStats EMPTY = new LinkDiscoveryStats(0, 0, 0, 0, 0);
+    }
+    private static final class LinkDiscoveryCounters {
+        private int candidateLinks;
+        private int acceptedSameOriginLinks;
+        private int rejectedCrossOriginLinks;
+        private int rejectedInvalidLinks;
+        private int duplicateLinks;
+
+        private LinkDiscoveryStats snapshot() {
+            return new LinkDiscoveryStats(candidateLinks, acceptedSameOriginLinks,
+                    rejectedCrossOriginLinks, rejectedInvalidLinks, duplicateLinks);
+        }
+    }
+    private enum LinkRejection { CROSS_ORIGIN, INVALID_URL }
+    private record LinkValidation(URI uri, LinkRejection rejection) {}
     private record PostFormCandidate(URI action, List<FormParameter> parameters) {}
     private record FormParameter(String name, String value) {}
     private record ScanResponse(int statusCode, Map<String, List<String>> headers, byte[] body, URI finalUri) {}
@@ -1726,9 +1958,11 @@ public class ScanExecutionService {
         private int requestCount;
         private int detectionRequestCount;
 
-        private ScanContext(int maxRequests, int maxDetectionRequests) {
+        private ScanContext(int maxRequests, int maxDetectionRequests,
+                            Map<String, Set<String>> resolvedAddressesByHost) {
             this.maxRequests = maxRequests;
             this.maxDetectionRequests = maxDetectionRequests;
+            this.resolvedAddressesByHost.putAll(resolvedAddressesByHost);
         }
 
         private boolean tryConsumeRequest(boolean detectionRequest) throws ScanExecutionException {

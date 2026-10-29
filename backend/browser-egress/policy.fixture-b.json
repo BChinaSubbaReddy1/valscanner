@@ -1,0 +1,13 @@
+{
+  "scan_id": "integration-fixture-scan-b",
+  "expires_at": "2099-01-01T00:00:00Z",
+  "origins": [
+    {
+      "scheme": "http",
+      "host": "fixture-decoy.test",
+      "port": 8080,
+      "addresses": ["172.31.0.11"],
+      "private_target_authorized": true
+    }
+  ]
+}

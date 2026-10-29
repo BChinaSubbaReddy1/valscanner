@@ -36,7 +36,10 @@ services:
       SERVER_PORT: 8080
       INITIAL_SUPER_ADMIN_EMAIL: ${INITIAL_SUPER_ADMIN_EMAIL:-}
       INITIAL_SUPER_ADMIN_PASSWORD: ${INITIAL_SUPER_ADMIN_PASSWORD:-}
-      SCANNER_ALLOWED_PRIVATE_TARGET_ORIGINS: ${SCANNER_ALLOWED_PRIVATE_TARGET_ORIGINS:-http://juice-shop:3000,http://dvwa:80}
+      SCANNER_ALLOWED_PRIVATE_TARGET_ORIGINS: "${SCANNER_ALLOWED_PRIVATE_TARGET_ORIGINS:-http://juice-shop:3000,http://dvwa:80},http://localhost:5173,http://host.docker.internal:5173"
+      SCANNER_LOCALHOST_TARGET_ORIGIN_MAPPING: ${SCANNER_LOCALHOST_TARGET_ORIGIN_MAPPING:-http://localhost:5173=http://host.docker.internal:5173}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "127.0.0.1:${BACKEND_HOST_PORT:-8081}:8080"
     networks:

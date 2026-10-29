@@ -9,14 +9,19 @@ import com.vulnscanner.application.target.Target;
 import com.vulnscanner.application.target.TargetStatus;
 import com.vulnscanner.application.user.User;
 import com.vulnscanner.application.user.UserStatus;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.slf4j.LoggerFactory;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.net.InetSocketAddress;
 import java.net.InetAddress;
+import java.net.Inet6Address;
 import java.net.URI;
+import java.net.ServerSocket;
 import java.net.UnknownHostException;
 import java.net.http.HttpClient;
 import java.net.URLDecoder;
@@ -252,7 +257,10 @@ class ScanExecutionServiceTest {
                     + "<a href=\"./child\">duplicate</a>"
                     + "<a href=\"/style.css\">static</a>"
                     + "<a href=\"http://127.0.0.1:" + secondaryServer.getAddress().getPort()
-                    + "/outside\">outside</a>").getBytes();
+                    + "/outside?token=do-not-log\">outside</a>"
+                    + "<a href=\"javascript:alert(1)\">invalid</a>"
+                    + "<form method=\"GET\" action=\"http://example.invalid/path?secret=do-not-log\"></form>")
+                    .getBytes();
             exchange.getResponseHeaders().add("Content-Type", "text/html");
             exchange.sendResponseHeaders(200, body.length);
             exchange.getResponseBody().write(body);
@@ -324,7 +332,17 @@ class ScanExecutionServiceTest {
         ScanExecutionService service = new ScanExecutionService(
                 jobs, findings, true, null, null, crawlPages);
         permitTestTarget(service, job);
-        service.runClaimed(2L);
+        ch.qos.logback.classic.Logger logger = (ch.qos.logback.classic.Logger)
+                LoggerFactory.getLogger(ScanExecutionService.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            service.runClaimed(2L);
+        } finally {
+            logger.detachAppender(appender);
+            appender.stop();
+        }
 
         ArgumentCaptor<ScanCrawlPage> pagesCaptor = ArgumentCaptor.forClass(ScanCrawlPage.class);
         verify(crawlPages, times(2)).save(pagesCaptor.capture());
@@ -351,6 +369,21 @@ class ScanExecutionServiceTest {
         assertEquals(4, job.getDiscoveredPageCount());
         assertEquals(4, job.getVisitedPageCount());
         assertEquals(4, job.getTestedPassivePageCount());
+        List<String> crawlerDiagnostics = appender.list.stream()
+                .map(ILoggingEvent::getFormattedMessage)
+                .toList();
+        String rootDiagnostic = crawlerDiagnostics.stream()
+                .filter(message -> message.startsWith("Native crawler page analyzed:") && message.contains("depth=0"))
+                .findFirst().orElseThrow();
+        assertTrue(rootDiagnostic.contains("candidateLinks=6"));
+        assertTrue(rootDiagnostic.contains("acceptedSameOriginLinks=2"));
+        assertTrue(rootDiagnostic.contains("rejectedCrossOriginLinks=2"));
+        assertTrue(rootDiagnostic.contains("rejectedInvalidLinks=1"));
+        assertTrue(rootDiagnostic.contains("duplicateLinks=1"));
+        assertTrue(crawlerDiagnostics.stream().anyMatch(message ->
+                message.startsWith("Native crawler finished:") && message.contains("requestLimitReached=false")));
+        assertFalse(String.join(" ", crawlerDiagnostics).contains("do-not-log"));
+        assertFalse(String.join(" ", crawlerDiagnostics).contains("/outside"));
         ArgumentCaptor<ScanFinding> findingsCaptor = ArgumentCaptor.forClass(ScanFinding.class);
         verify(findings, atLeastOnce()).save(findingsCaptor.capture());
         assertTrue(findingsCaptor.getAllValues().stream().anyMatch(finding ->
@@ -434,6 +467,237 @@ class ScanExecutionServiceTest {
     }
 
     @Test
+    void privateTargetAllowlistCanPermitOnlyTheExactIpv6LoopbackOrigin() throws Exception {
+        ScanExecutionService service = serviceResolving(InetAddress.getByName("::1"));
+        ReflectionTestUtils.setField(service, "allowedPrivateTargetOrigins", "http://[::1]:5173");
+
+        service.validateResolvedAddresses(URI.create("http://[::1]:5173/"), new java.util.HashMap<>());
+        assertThrows(ScanExecutionService.ScanExecutionException.class,
+                () -> service.validateResolvedAddresses(
+                        URI.create("http://[::1]:5174/"), new java.util.HashMap<>()));
+    }
+
+    @Test
+    void localhostOriginAllowlistAcceptsOnlyResolvedIpv4AndIpv6LoopbackAddresses() throws Exception {
+        URI target = URI.create("http://localhost:5173/");
+        for (String address : List.of("127.0.0.1", "::1")) {
+            ScanExecutionService service = serviceResolving(InetAddress.getByName(address));
+            ReflectionTestUtils.setField(service, "allowedPrivateTargetOrigins", "http://localhost:5173");
+            service.validateResolvedAddresses(target, new java.util.HashMap<>());
+        }
+
+        ScanExecutionService unapproved = serviceResolving(InetAddress.getByName("127.0.0.1"));
+        assertThrows(ScanExecutionService.ScanExecutionException.class,
+                () -> unapproved.validateResolvedAddresses(target, new java.util.HashMap<>()));
+    }
+
+    @Test
+    void localBackendConnectsToLoopbackAndKeepsTheSavedLocalhostAuthority() throws Exception {
+        List<String> receivedHosts = new CopyOnWriteArrayList<>();
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            receivedHosts.add(exchange.getRequestHeaders().getFirst("Host"));
+            byte[] body = "local frontend".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.start();
+
+        long scanId = 140L;
+        Organization organization = approvedOrganization(scanId);
+        String targetUrl = "http://localhost:" + server.getAddress().getPort() + "/";
+        Target target = approvedTarget(organization, targetUrl);
+        ScanJob job = approvedJob(organization, target);
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        when(jobs.findByIdForExecutionUpdate(scanId)).thenReturn(Optional.of(job));
+        InetAddress localAddress = InetAddress.getByName("127.0.0.1");
+        ScanExecutionService service = new ScanExecutionService(
+                jobs, mock(ScanFindingRepository.class), false, null) {
+            @Override
+            InetAddress[] resolveAddresses(String host) {
+                assertEquals("localhost", host);
+                return new InetAddress[]{localAddress};
+            }
+        };
+        ReflectionTestUtils.setField(service, "allowedPrivateTargetOrigins",
+                "http://localhost:" + server.getAddress().getPort());
+
+        service.runClaimed(scanId);
+
+        assertEquals(ScanStatus.COMPLETED, job.getStatus(), job.getStatusMessage());
+        assertEquals(targetUrl, target.getUrl());
+        assertEquals(List.of("localhost:" + server.getAddress().getPort()), receivedHosts);
+    }
+
+    @Test
+    void dockerLocalhostMappingPinsHostGatewayAddressAndRevalidatesSameOriginRedirects() throws Exception {
+        List<String> receivedHosts = new CopyOnWriteArrayList<>();
+        AtomicInteger finalRequests = new AtomicInteger();
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            receivedHosts.add(exchange.getRequestHeaders().getFirst("Host"));
+            exchange.getResponseHeaders().add("Location", "/final");
+            exchange.sendResponseHeaders(302, -1);
+            exchange.close();
+        });
+        server.createContext("/final", exchange -> {
+            finalRequests.incrementAndGet();
+            receivedHosts.add(exchange.getRequestHeaders().getFirst("Host"));
+            byte[] body = "docker-reachable frontend".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.start();
+
+        long scanId = 141L;
+        Organization organization = approvedOrganization(scanId);
+        int port = server.getAddress().getPort();
+        String targetUrl = "http://localhost:" + port + "/";
+        Target target = approvedTarget(organization, targetUrl);
+        ScanJob job = approvedJob(organization, target);
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        when(jobs.findByIdForExecutionUpdate(scanId)).thenReturn(Optional.of(job));
+        InetAddress gatewayAddress = InetAddress.getByName("127.0.0.1");
+        ScanExecutionService service = new ScanExecutionService(
+                jobs, mock(ScanFindingRepository.class), false, null) {
+            @Override
+            InetAddress[] resolveAddresses(String host) {
+                assertEquals("host.docker.internal", host);
+                return new InetAddress[]{gatewayAddress};
+            }
+        };
+        ReflectionTestUtils.setField(service, "allowedPrivateTargetOrigins",
+                "http://localhost:" + port + ",http://host.docker.internal:" + port);
+        ReflectionTestUtils.setField(service, "localhostTargetOriginMapping",
+                "http://localhost:" + port + "=http://host.docker.internal:" + port);
+
+        service.runClaimed(scanId);
+
+        assertEquals(ScanStatus.COMPLETED, job.getStatus(), job.getStatusMessage());
+        assertEquals(targetUrl, target.getUrl());
+        assertEquals(1, finalRequests.get());
+        assertEquals(List.of("localhost:" + port, "localhost:" + port), receivedHosts);
+    }
+
+    @Test
+    void dockerLocalhostMappingDoesNotAllowUnsafeDestinationOrDnsRebinding() throws Exception {
+        URI target = URI.create("http://localhost:5173/");
+        ScanExecutionService unsafe = serviceResolving(InetAddress.getByName("169.254.169.254"));
+        ReflectionTestUtils.setField(unsafe, "allowedPrivateTargetOrigins",
+                "http://localhost:5173,http://host.docker.internal:5173");
+        ReflectionTestUtils.setField(unsafe, "localhostTargetOriginMapping",
+                "http://localhost:5173=http://host.docker.internal:5173");
+        assertThrows(ScanExecutionService.ScanExecutionException.class,
+                () -> unsafe.validateResolvedAddresses(target, new java.util.HashMap<>()));
+
+        ScanExecutionService privateDestination = serviceResolving(InetAddress.getByName("10.0.0.8"));
+        ReflectionTestUtils.setField(privateDestination, "allowedPrivateTargetOrigins", "http://localhost:5173");
+        ReflectionTestUtils.setField(privateDestination, "localhostTargetOriginMapping",
+                "http://localhost:5173=http://host.docker.internal:5173");
+        java.util.Map<String, java.util.Set<String>> privateDestinationResolution = new java.util.HashMap<>();
+        privateDestination.validateResolvedAddresses(target, privateDestinationResolution);
+        assertThrows(ScanExecutionService.ScanExecutionException.class,
+                () -> privateDestination.validateResolvedAddresses(
+                        URI.create("http://host.docker.internal:5173/"), privateDestinationResolution));
+
+        AtomicInteger resolutions = new AtomicInteger();
+        ScanExecutionService rebinding = new ScanExecutionService(
+                mock(ScanJobRepository.class), mock(ScanFindingRepository.class), false, null) {
+            @Override
+            InetAddress[] resolveAddresses(String host) throws UnknownHostException {
+                assertEquals("host.docker.internal", host);
+                return new InetAddress[]{InetAddress.getByName(
+                        resolutions.getAndIncrement() == 0 ? "127.0.0.1" : "127.0.0.2")};
+            }
+        };
+        ReflectionTestUtils.setField(rebinding, "allowedPrivateTargetOrigins",
+                "http://localhost:5173,http://host.docker.internal:5173");
+        ReflectionTestUtils.setField(rebinding, "localhostTargetOriginMapping",
+                "http://localhost:5173=http://host.docker.internal:5173");
+        java.util.Map<String, java.util.Set<String>> priorResolution = new java.util.HashMap<>();
+        rebinding.validateResolvedAddresses(target, priorResolution);
+        assertThrows(ScanExecutionService.ScanExecutionException.class,
+                () -> rebinding.validateResolvedAddresses(target, priorResolution));
+    }
+
+    @Test
+    void mappedLocalhostDnsRebindingIsRejectedBeforeNativeRequest() throws Exception {
+        AtomicInteger requests = new AtomicInteger();
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            requests.incrementAndGet();
+            exchange.sendResponseHeaders(200, -1);
+            exchange.close();
+        });
+        server.start();
+
+        long scanId = 143L;
+        Organization organization = approvedOrganization(scanId);
+        int port = server.getAddress().getPort();
+        Target target = approvedTarget(organization, "http://localhost:" + port + "/");
+        ScanJob job = approvedJob(organization, target);
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        when(jobs.findByIdForExecutionUpdate(scanId)).thenReturn(Optional.of(job));
+        AtomicInteger resolutions = new AtomicInteger();
+        ScanExecutionService service = new ScanExecutionService(
+                jobs, mock(ScanFindingRepository.class), false, null) {
+            @Override
+            InetAddress[] resolveAddresses(String host) throws UnknownHostException {
+                assertEquals("host.docker.internal", host);
+                return new InetAddress[]{InetAddress.getByName(
+                        resolutions.getAndIncrement() < 2 ? "127.0.0.1" : "127.0.0.2")};
+            }
+        };
+        ReflectionTestUtils.setField(service, "allowedPrivateTargetOrigins",
+                "http://localhost:" + port + ",http://host.docker.internal:" + port);
+        ReflectionTestUtils.setField(service, "localhostTargetOriginMapping",
+                "http://localhost:" + port + "=http://host.docker.internal:" + port);
+
+        service.runClaimed(scanId);
+
+        assertEquals(ScanStatus.FAILED, job.getStatus());
+        assertEquals(ScanFailureReason.TARGET_URL_INVALID.name(), job.getFailureReason());
+        assertEquals("FAILED", job.getNativeEngineStatus());
+        assertEquals(0, requests.get());
+    }
+
+    @Test
+    void unreachableAllowedLocalhostFailsAsOutboundRequestRatherThanAddressValidation() throws Exception {
+        int port;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            port = socket.getLocalPort();
+        }
+        long scanId = 142L;
+        Organization organization = approvedOrganization(scanId);
+        String targetUrl = "http://localhost:" + port + "/";
+        Target target = approvedTarget(organization, targetUrl);
+        ScanJob job = approvedJob(organization, target);
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        when(jobs.findByIdForExecutionUpdate(scanId)).thenReturn(Optional.of(job));
+        InetAddress localAddress = InetAddress.getByName("127.0.0.1");
+        ScanExecutionService service = new ScanExecutionService(
+                jobs, mock(ScanFindingRepository.class), false, null) {
+            @Override
+            InetAddress[] resolveAddresses(String host) {
+                assertEquals("localhost", host);
+                return new InetAddress[]{localAddress};
+            }
+        };
+        ReflectionTestUtils.setField(service, "allowedPrivateTargetOrigins",
+                "http://localhost:" + port);
+
+        service.runClaimed(scanId);
+
+        assertEquals(ScanStatus.FAILED, job.getStatus());
+        assertEquals(ScanFailureReason.OUTBOUND_REQUEST_FAILED.name(), job.getFailureReason());
+        assertEquals("FAILED", job.getNativeEngineStatus());
+        assertEquals("NOT_STARTED", job.getZapEngineStatus());
+        assertEquals("SCAN_FAILED_BEFORE_ZAP", job.getZapFailureReason());
+    }
+
+    @Test
     void rejectsIpv4AndIpv6LoopbackAndUnsafeLinkLocalAndMetadataAddresses() throws Exception {
         for (String address : List.of("127.0.0.1", "::1", "169.254.10.20", "fe80::1",
                 "169.254.169.254", "169.254.170.2", "fd00:ec2::254")) {
@@ -443,6 +707,187 @@ class ScanExecutionServiceTest {
                             URI.create("http://target.example:8080/"), new java.util.HashMap<>()),
                     address);
         }
+    }
+
+    @Test
+    void rejectsIpv4MappedIpv6AddressesEvenWhenPrivateOriginIsAllowed() throws Exception {
+        URI target = URI.create("http://target.example:8080/");
+        Inet6Address[] mappedAddresses = {
+                Inet6Address.getByAddress(null,
+                        new byte[]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, (byte) 0xff, (byte) 0xff, 8, 8, 8, 8}, -1),
+                Inet6Address.getByAddress(null,
+                        new byte[]{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, (byte) 0xff, (byte) 0xff,
+                                (byte) 192, (byte) 168, 1, 10}, -1)
+        };
+
+        for (Inet6Address mappedAddress : mappedAddresses) {
+            assertEquals(16, mappedAddress.getAddress().length);
+            ScanExecutionService service = serviceResolving(mappedAddress);
+            ReflectionTestUtils.setField(service, "allowedPrivateTargetOrigins",
+                    "http://target.example:8080");
+
+            ScanExecutionService.ScanExecutionException exception = assertThrows(
+                    ScanExecutionService.ScanExecutionException.class,
+                    () -> service.validateResolvedAddresses(target, new java.util.HashMap<>()));
+            assertEquals(ScanFailureReason.TARGET_URL_INVALID,
+                    ReflectionTestUtils.invokeMethod(exception, "reason"));
+        }
+
+        ScanExecutionService publicIpv4 = serviceResolving(
+                InetAddress.getByAddress(new byte[]{8, 8, 8, 8}));
+        publicIpv4.validateResolvedAddresses(target, new java.util.HashMap<>());
+
+        ScanExecutionService privateIpv4 = serviceResolving(
+                InetAddress.getByAddress(new byte[]{(byte) 192, (byte) 168, 1, 10}));
+        ScanExecutionService.ScanExecutionException privateIpv4Exception = assertThrows(
+                ScanExecutionService.ScanExecutionException.class,
+                () -> privateIpv4.validateResolvedAddresses(target, new java.util.HashMap<>()));
+        assertEquals(ScanFailureReason.TARGET_URL_INVALID,
+                ReflectionTestUtils.invokeMethod(privateIpv4Exception, "reason"));
+    }
+
+    @Test
+    void logsUnsafeAndUnapprovedPrivateAddressCategories() throws Exception {
+        URI target = URI.create("http://target.example:8080/");
+        Inet6Address unsafeAddress = Inet6Address.getByAddress(null,
+                new byte[]{(byte) 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, -1);
+        InetAddress privateAddress = InetAddress.getByAddress(
+                new byte[]{(byte) 192, (byte) 168, 1, 10});
+        ch.qos.logback.classic.Logger logger = (ch.qos.logback.classic.Logger)
+                LoggerFactory.getLogger(ScanExecutionService.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+
+        try {
+            ScanExecutionService unsafeService = serviceResolving(unsafeAddress);
+            assertThrows(ScanExecutionService.ScanExecutionException.class,
+                    () -> unsafeService.validateResolvedAddresses(target, new java.util.HashMap<>()));
+
+            ScanExecutionService privateService = serviceResolving(privateAddress);
+            assertThrows(ScanExecutionService.ScanExecutionException.class,
+                    () -> privateService.validateResolvedAddresses(target, new java.util.HashMap<>()));
+        } finally {
+            logger.detachAppender(appender);
+            appender.stop();
+        }
+
+        List<String> diagnostics = appender.list.stream()
+                .map(ILoggingEvent::getFormattedMessage)
+                .toList();
+        assertTrue(diagnostics.stream().anyMatch(message ->
+                message.contains("category=UNSAFE_ADDRESS")
+                        && message.contains("origin=http://target.example:8080")
+                        && message.contains("address=" + unsafeAddress.getHostAddress())));
+        assertTrue(diagnostics.stream().anyMatch(message ->
+                message.contains("category=PRIVATE_ADDRESS_NOT_ALLOWED")
+                        && message.contains("origin=http://target.example:8080")
+                        && message.contains("address=" + privateAddress.getHostAddress())));
+    }
+
+    @Test
+    void rejectsIpv6MulticastDuringTargetValidationEvenWhenPrivateOriginIsAllowed() throws Exception {
+        long scanId = 108L;
+        Inet6Address multicastAddress = Inet6Address.getByAddress(null,
+                new byte[]{(byte) 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, -1);
+        assertEquals(16, multicastAddress.getAddress().length);
+
+        Organization organization = approvedOrganization(scanId);
+        Target target = approvedTarget(organization, "http://target.example:8080/");
+        ScanJob job = approvedJob(organization, target);
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        when(jobs.findByIdForExecutionUpdate(scanId)).thenReturn(Optional.of(job));
+        ScanFindingRepository findings = mock(ScanFindingRepository.class);
+        ZapClientService zap = mock(ZapClientService.class);
+        ScanExecutionService service = new ScanExecutionService(
+                jobs, findings, false, null, null, null,
+                10, 6, 15, null, null, zap, new ZapScanAdapter()) {
+            @Override
+            InetAddress[] resolveAddresses(String host) {
+                return new InetAddress[]{multicastAddress};
+            }
+        };
+        ReflectionTestUtils.setField(service, "allowedPrivateTargetOrigins",
+                "http://target.example:8080");
+
+        service.runClaimed(scanId);
+
+        assertEquals(ScanStatus.FAILED, job.getStatus());
+        assertEquals(ScanFailureReason.TARGET_URL_INVALID.name(), job.getFailureReason());
+        assertTrue(job.getStatusMessage().contains("Target resolves to a disallowed network address"));
+        assertEquals("NOT_STARTED", job.getNativeEngineStatus());
+        assertEquals("NOT_STARTED", job.getZapEngineStatus());
+        verify(zap, never()).checkAvailability();
+        verify(zap, never()).startSpider(anyString(), anyString());
+        verify(findings, never()).save(any());
+    }
+
+    @Test
+    void allowsIpv6UniqueLocalAddressOnlyForExactPrivateOrigin() throws Exception {
+        URI exactOrigin = URI.create("http://target.example:8080/");
+        Inet6Address uniqueLocalAddress = Inet6Address.getByAddress(null,
+                new byte[]{(byte) 0xfc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, -1);
+        ScanExecutionService service = serviceResolving(uniqueLocalAddress);
+
+        ScanExecutionService.ScanExecutionException unconfiguredException = assertThrows(
+                ScanExecutionService.ScanExecutionException.class,
+                () -> service.validateResolvedAddresses(exactOrigin, new java.util.HashMap<>()));
+        assertEquals(ScanFailureReason.TARGET_URL_INVALID,
+                ReflectionTestUtils.invokeMethod(unconfiguredException, "reason"));
+
+        ReflectionTestUtils.setField(service, "allowedPrivateTargetOrigins", "http://target.example:8080");
+        service.validateResolvedAddresses(exactOrigin, new java.util.HashMap<>());
+
+        assertThrows(ScanExecutionService.ScanExecutionException.class,
+                () -> service.validateResolvedAddresses(
+                        URI.create("http://target.example:8081/"), new java.util.HashMap<>()));
+        assertThrows(ScanExecutionService.ScanExecutionException.class,
+                () -> service.validateResolvedAddresses(
+                        URI.create("http://other.example:8080/"), new java.util.HashMap<>()));
+        assertThrows(ScanExecutionService.ScanExecutionException.class,
+                () -> service.validateResolvedAddresses(
+                        URI.create("https://target.example:8080/"), new java.util.HashMap<>()));
+
+        Inet6Address multicastAddress = Inet6Address.getByAddress(null,
+                new byte[]{(byte) 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}, -1);
+        ScanExecutionService unsafeAddressService = serviceResolving(multicastAddress);
+        ReflectionTestUtils.setField(unsafeAddressService, "allowedPrivateTargetOrigins",
+                "http://target.example:8080");
+        assertThrows(ScanExecutionService.ScanExecutionException.class,
+                () -> unsafeAddressService.validateResolvedAddresses(exactOrigin, new java.util.HashMap<>()));
+    }
+
+    @Test
+    void privateTargetValidationFailureKeepsClientMessageAndDoesNotStartScannerEngines() throws Exception {
+        long scanId = 109L;
+        InetAddress privateAddress = InetAddress.getByAddress(
+                new byte[]{(byte) 192, (byte) 168, 1, 10});
+        Organization organization = approvedOrganization(scanId);
+        Target target = approvedTarget(organization, "http://target.example:8080/");
+        ScanJob job = approvedJob(organization, target);
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        when(jobs.findByIdForExecutionUpdate(scanId)).thenReturn(Optional.of(job));
+        ScanFindingRepository findings = mock(ScanFindingRepository.class);
+        ZapClientService zap = mock(ZapClientService.class);
+        ScanExecutionService service = new ScanExecutionService(
+                jobs, findings, false, null, null, null,
+                10, 6, 15, null, null, zap, new ZapScanAdapter()) {
+            @Override
+            InetAddress[] resolveAddresses(String host) {
+                return new InetAddress[]{privateAddress};
+            }
+        };
+
+        service.runClaimed(scanId);
+
+        assertEquals(ScanStatus.FAILED, job.getStatus());
+        assertEquals(ScanFailureReason.TARGET_URL_INVALID.name(), job.getFailureReason());
+        assertEquals("Target resolves to a disallowed network address", job.getStatusMessage());
+        assertEquals("NOT_STARTED", job.getNativeEngineStatus());
+        assertEquals("NOT_STARTED", job.getZapEngineStatus());
+        verify(zap, never()).checkAvailability();
+        verify(zap, never()).startSpider(anyString(), anyString());
+        verify(findings, never()).save(any());
     }
 
     @Test
@@ -683,13 +1128,28 @@ class ScanExecutionServiceTest {
                 jobs, mock(ScanFindingRepository.class), true, null, null, null, 2, 6, 5);
         permitTestTarget(service, job);
 
-        service.runClaimed(105L);
+        ch.qos.logback.classic.Logger logger = (ch.qos.logback.classic.Logger)
+                LoggerFactory.getLogger(ScanExecutionService.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            service.runClaimed(105L);
+        } finally {
+            logger.detachAppender(appender);
+            appender.stop();
+        }
 
         assertEquals(ScanStatus.COMPLETED, job.getStatus(), job.getStatusMessage());
         assertEquals(2, requests.get());
         assertEquals(3, job.getDiscoveredPageCount());
         assertEquals(2, job.getVisitedPageCount());
         assertEquals(2, job.getTestedPassivePageCount());
+        assertTrue(appender.list.stream()
+                .map(ILoggingEvent::getFormattedMessage)
+                .anyMatch(message -> message.startsWith("Native crawler finished:")
+                        && message.contains("requestLimitReached=true")
+                        && message.contains("queuedLinksNotVisited=1")));
     }
 
     @Test
@@ -1419,6 +1879,35 @@ class ScanExecutionServiceTest {
         assertEquals("FAILED", crawlingJob.getZapSpiderStatus());
         assertTrue(crawlingJob.getStatusMessage().contains("restart"));
         verify(jobs).save(crawlingJob);
+    }
+
+    @Test
+    void rejectedExecutorSubmissionPersistsAnExplicitFailedState() {
+        Organization organization = approvedOrganization(104L);
+        ScanJob queuedJob = approvedJob(organization,
+                approvedTarget(organization, "https://example.test/"));
+        ReflectionTestUtils.setField(queuedJob, "id", 104L);
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        when(jobs.findById(104L)).thenReturn(Optional.of(queuedJob));
+        when(jobs.findByIdForExecutionUpdate(104L)).thenReturn(Optional.of(queuedJob));
+        org.springframework.transaction.support.TransactionTemplate transactionTemplate =
+                mock(org.springframework.transaction.support.TransactionTemplate.class);
+        doAnswer(invocation -> {
+            ((java.util.function.Consumer<org.springframework.transaction.TransactionStatus>)
+                    invocation.getArgument(0)).accept(null);
+            return null;
+        }).when(transactionTemplate).executeWithoutResult(any());
+        ScanExecutionService service = new ScanExecutionService(
+                jobs, mock(ScanFindingRepository.class), true, transactionTemplate,
+                null, null, 10, 6, 15);
+
+        service.markRejected(104L);
+
+        assertEquals(ScanStatus.FAILED, queuedJob.getStatus());
+        assertEquals(ScanFailureReason.EXECUTOR_UNAVAILABLE.name(), queuedJob.getFailureReason());
+        assertEquals("SCAN_FAILED_BEFORE_ZAP", queuedJob.getZapFailureReason());
+        assertTrue(queuedJob.getStatusMessage().contains("queue is full"));
+        verify(jobs).save(queuedJob);
     }
 
     @Test

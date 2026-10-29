@@ -2,7 +2,7 @@
 
 ## Scope inspected
 
-The workspace contains a Spring Boot 3.3.5 / Java 21 Maven backend with JWT authentication, registration and approval, organizations, user/role persistence, audit-event persistence, and bounded scan execution. Password-reset endpoints are unavailable until a real delivery integration exists. Organization-scoped targets, approval-gated scan jobs, passive checks, findings, same-origin crawl-page discovery, report endpoints, and JSON/CSV/PDF exports are implemented. Native active checks and schedules are not implemented; explicit `ZAP_ACTIVE` requests use the scoped ZAP integration. There is no separate `TargetUrlValidator`; target URL syntax validation is currently implemented in `TargetService`, while execution-time scheme, credential, DNS, and network-address checks are enforced by `ScanExecutionService`. The audit and changes apply only to the backend present here.
+The workspace contains a Spring Boot 3.3.5 / Java 21 Maven backend with JWT authentication, registration and approval, organizations, user/role persistence, audit-event persistence, and bounded scan execution. Password-reset endpoints are unavailable until a real delivery integration exists. Organization-scoped targets, approval-gated scan jobs, passive checks, findings, same-origin crawl-page discovery, report endpoints, and JSON/CSV/PDF exports are implemented. Every scan type runs the scoped ZAP spider and passive analysis; only explicit `ZAP_ACTIVE` requests enable ZAP active scanning and native active probes. Schedules are not implemented. There is no separate `TargetUrlValidator`; target URL syntax validation is currently implemented in `TargetService`, while execution-time scheme, credential, DNS, and network-address checks are enforced by `ScanExecutionService`. The audit and changes apply only to the backend present here.
 
 ## Existing registration and security behavior
 
@@ -59,7 +59,7 @@ Super Admin-only Organization Admin account endpoints:
 
 These account endpoints do not grant scanner-data access. A Super Admin cannot manage their own account through them or suspend/deactivate the last active Organization Admin in an organization. Existing organization-registration review endpoints remain under `/api/organizations/{id}` and retain the Super Admin-only policy.
 
-Scan-job endpoints under `/api/scans` allow active Organization Admins and Security Analysts in an approved organization to create requests for approved targets. Requests start at `PENDING_APPROVAL`; only a same-organization Organization Admin can approve or reject them. Analysts can list/read/cancel only their own requests; admins can list/read/cancel their organization’s requests and review pending requests. Super Admins have no scanner operational-data or approval access. Successful approval commits `QUEUED` state before post-commit executor submission. The pipeline is `PASSIVE_HEADERS`; execution progresses through `CRAWLING` and `SCANNING`, performs at most 10 bounded same-origin requests to depth 2, never follows redirects, and defaults to rejecting private or metadata-network destinations.
+Scan-job endpoints under `/api/scans` allow active Security Analysts in an approved organization to submit requests for approved targets. Requests start at `PENDING_APPROVAL`; only a same-organization Organization Admin can approve or reject them. Analysts can list/read/cancel only their own requests; admins can list/read/cancel their organization’s requests and review pending requests. Super Admins have no scanner operational-data or approval access. Successful approval commits `QUEUED` state before post-commit executor submission. All supported scan types perform the bounded native crawl and run ZAP spider/passive analysis; only `ZAP_ACTIVE` enables the ZAP active scan and native active probes. Execution performs at most 10 bounded same-origin native requests to depth 2, follows same-origin redirects only after validation, rejects cross-origin redirects, and defaults to rejecting private or metadata-network destinations.
 
 ## Statistics and privacy definitions
 
@@ -79,12 +79,13 @@ V2 remains the schema change for initial admin registration association. Analyst
 
 ## Verification
 
-- `mvn compile` passed: Java 21 compilation completed successfully.
-- `mvn test` passed: 38 tests across six test classes, 0 failures, 0 errors, 0 skipped.
+- Current verification (2026-10-29): `mvn test` passed, 172 tests, 0 failures, 0 errors, 0 skipped; frontend `npm test` passed, 53 tests; `npm run build` passed.
+- Focused scan execution/report verification passed: 50 tests, 0 failures, 0 errors, 0 skipped.
+- Earlier verification entries in this report are historical snapshots and have been superseded by the current results above.
 - `ScanExecutionServiceTest` includes controlled local-fixture positive and negative SQLi/reflection cases plus active-request budget enforcement.
 - `ScanManagementIntegrationTest.crawlPagesAreReturnedOnlyForAnAuthorizedScan` verifies same-tenant retrieval and cross-tenant 404 behavior for crawl metadata.
 - Focused registration, organization-management, and target-management tests passed before the full-suite runs.
-- Tests use H2 with Flyway disabled. MySQL 8 Flyway migration execution/schema validation was not performed because the Docker engine was unavailable and no isolated MySQL test database was confirmed.
+- Tests use H2 with Flyway disabled. MySQL 8 Flyway migration execution/schema validation was not performed because no isolated MySQL test database was confirmed.
 
 Phase 6A validation also confirmed by static inspection that V1-V8 are ordered and
 that entity mappings for `scan_jobs`, `scan_findings`, and `scan_crawl_pages` match
@@ -94,7 +95,7 @@ mutation was performed.
 
 ## Remaining scope and risks
 
-- Persistent tenant-scoped scan requests, analyst-owned access, organization-admin approval/rejection, post-commit queueing, cancellation, findings storage/retrieval, bounded passive execution, same-origin endpoint discovery, authorized crawl-page retrieval, and report exports are implemented. `PASSIVE_HEADERS` makes passive requests only. `ZAP_ACTIVE` is the only active scan type and requires an available, origin-scoped ZAP service; there is no native active fallback for it. POST-body and authenticated-test-account coverage, browser execution, robots policy, and schedules are not implemented.
+- Persistent tenant-scoped scan requests, analyst-owned access, organization-admin approval/rejection, post-commit queueing, cancellation, findings storage/retrieval, bounded native execution, same-origin endpoint discovery, authorized crawl-page retrieval, and report exports are implemented. Every scan type requests ZAP spider/passive analysis; only `ZAP_ACTIVE` adds active probes. POST-body and authenticated-test-account coverage, browser execution, robots policy, and schedules are not implemented.
 
 ## Phase capability status
 
@@ -267,7 +268,8 @@ The inspected target is an OWASP project information page, not evidence that a
 running Juice Shop application was scanned. The scan records are real
 persisted results and were not fabricated by the frontend.
 
-The final regression commands for this continuation were:
+Historical regression results recorded during an earlier continuation (superseded
+by the current verification at the end of this report):
 
 - `mvn compile`: **VERIFIED**, `BUILD SUCCESS`.
 - `mvn test`: **VERIFIED**, 39 tests run, 0 failures, 0 errors, 0 skipped,
@@ -275,14 +277,19 @@ The final regression commands for this continuation were:
 
 ## Active detector limits
 
-- `PASSIVE_HEADERS` does not submit SQLi/XSS payloads.
-- The explicit `ZAP_ACTIVE` route runs native bounded GET-parameter probes and ZAP active scan; `ZAP_PASSIVE` only spiders and imports passive alerts.
+- `PASSIVE_HEADERS` and `ZAP_PASSIVE` do not submit SQLi/XSS payloads; both run the ZAP spider and passive analysis.
+- The explicit `ZAP_ACTIVE` route runs native bounded GET-parameter probes and ZAP active scan.
 - `scanner.max-requests` controls the native crawler budget (default 10); `scanner.max-detection-requests` limits native active probes (default 6); `scanner.request-timeout-seconds` (default 15) is an explicit full-response deadline with a 1 MiB response cap.
 - At most three non-sensitive query parameters are considered per crawled URL. Password, secret, token, session, cookie, auth, and key-like parameter names are skipped.
 - Each eligible parameter receives two quote-based SQL checks and one unique-marker reflection check. Requests remain GET-only, same-origin, redirect-free, DNS-pinned, response-size bounded, and cancellation-aware.
 - SQLi findings require a clean baseline plus database-error evidence and a differential signal. XSS findings require raw marker reflection in the tested SVG-tag context; encoded reflection is not reported.
-- ZAP uses a temporary context restricted to the exact target origin, spider depth 2 / 10 children per node, active-scan duration/rule limits, an alert cap, and a 90-second worker deadline. ZAP `ZAP_ACTIVE` never falls back to native-only scanning.
-- Crawl scope is the configured target origin: scheme, host, and effective port must all match. Relative URLs are normalized and fragments removed. Redirects are not followed, so a `Location` destination is never requested. `discoveredLinks` counts accepted normalized links extracted from HTML documents only; CSS, JavaScript, image, font, and other non-HTML responses are requested only within the normal budget and are not persisted as crawl-page records.
+- ZAP uses a temporary context restricted to the exact target origin, spider depth 2 / 10 children per node, active-scan duration/rule limits, an alert cap, and a 90-second worker deadline. Every scan requests ZAP; `DISABLED`, `UNAVAILABLE`, `TIMED_OUT`, and `FAILED` statuses preserve the reason and do not claim ZAP completion. Native results can still complete as partial results if ZAP does not complete.
+- ZAP alerts are filtered against a pre-run alert-ID snapshot and exact scan-origin scheme/host/effective port; malformed and foreign-origin alert URLs are excluded. ZAP calls are serialized by a fair process-local lock. This does not coordinate multiple backend replicas or external users of the same ZAP daemon; distributed deployment requires shared coordination or isolated ZAP instances. Live ZAP API compatibility and multi-replica attribution remain unverified.
+- Crawl scope is the configured target origin: scheme, host, and effective port must all match. Relative URLs are normalized and fragments removed. Same-origin redirects are followed only after destination validation; cross-origin destinations are never requested. `discoveredLinks` counts accepted normalized links extracted from HTML documents only; CSS, JavaScript, image, font, and other non-HTML responses are requested only within the normal budget and are not persisted as crawl-page records.
+- The native scanner parses static HTML responses and does not execute JavaScript. JavaScript-driven routes therefore may be absent from native page counts; ZAP spider counts are reported separately but do not guarantee DOM-rendered SPA or authenticated-flow coverage.
+- Native response-header checks use direct pinned sockets to the target, not Squid. ZAP traffic traverses Squid, which can add `Via` and `Cache-Status` response headers; current native checks do not attribute those headers to the target. No live ZAP regression currently proves how every passive rule handles intermediary-added headers.
+- `CVE_KEYWORD_CANDIDATE` severity is deliberately kept LOW because NVD keyword matching does not verify product/version applicability. An NVD CVSS score, severity, and vector are retained in evidence only when valid metrics exist; missing metrics are stated as unavailable, not as a zero score. Finding severity is not the NVD CVSS severity for these candidates.
+- A local `http://[::1]:5173/` target is denied by default. In a container, `::1` points to the container itself, not the Windows host. Explicit private-target exceptions are exact scheme/host/port entries; the configured host bridge name and port are the supported local-host route when the app is reachable there. Arbitrary loopback/private origins remain denied.
 
 ## Frontend integration requirements
 
@@ -357,13 +364,17 @@ Removed obsolete invitation runtime types: `OrganizationInvitation.java`, `Organ
 ## Current backend security hardening pass
 
 - Bootstrap Super Admin provisioning has no email or password fallback. No email skips provisioning; a configured email without a nonblank password fails startup; an explicitly configured account is saved with a password hash.
-- `PASSIVE_HEADERS` is passive-only. Native bounded SQLi/XSS probes run only for explicit `ZAP_ACTIVE` jobs; the ZAP active scan uses a temporary exact-origin context. Active ZAP requests do not fall back to native-only scanning.
+- `PASSIVE_HEADERS` does not run native active SQLi/XSS probes. Every scan type requests ZAP spidering/passive analysis; native parameter probes and ZAP active scanning run only for explicit `ZAP_ACTIVE` jobs, using a temporary exact-origin context.
 - Worker claiming and state/progress writes use short transactions; the target HTTP, ZAP polling, and NVD requests execute outside scan-row-lock transactions. Workers re-read the persisted cancellation flag between requests and polling operations.
+- The executor defaults to 2 core workers, 4 maximum workers, and a 20-item queue; `AbortPolicy` rejects overflow, and rejected queued jobs transition to `FAILED` with `EXECUTOR_UNAVAILABLE`. In-process duplicate claims and concurrent same-origin ZAP calls are covered by regression tests.
+- `ScanRecoveryRunner` currently marks every nonterminal job failed at application startup. This is safe only for the current single-backend deployment: with multiple backend replicas sharing the database, one replica could mark another replica's active job failed. There is no worker lease/heartbeat or distributed recovery lock; horizontal backend scaling is unsupported until that coordination is added.
 - ZAP missing IDs/status, malformed alert responses, polling failures, and incomplete/time-expired scans fail rather than completing successfully. Scoped ZAP spider/active work has bounded depth, response size, alert count, API read deadline, and worker time budget; the integration does not enforce a strict aggregate outbound-request-count quota.
 - Native and ZAP findings are sanitized before storage; finding and report responses also redact historical sensitive strings. CSV formula-leading fields are neutralized. The one-page PDF summary reports the exact count omitted when its display budget is reached.
 - Password-reset delivery is not implemented. Both reset endpoints return `503 Service Unavailable` and do not persist raw reset tokens.
 - NVD results are cached in a 256-entry LRU only after valid successful responses. Keyword-search results are labeled low-severity candidates with unverified applicability, not confirmed affected-product findings.
 - Native and ZAP/NVD HTTP response reads have explicit deadlines and response-size caps. Unexpected scan-worker logs include only scan ID and exception class, not exception text or target response content.
 - No database schema migration was added. The API change is limited to password-reset requests returning `503`; scan and finding response shapes are unchanged.
-- Current verification: `mvn compile` **BUILD SUCCESS**; `mvn test` **75 tests, 0 failures, 0 errors, 0 skipped**; `mvn package` **BUILD SUCCESS** with the same 75-test result. Tests use H2 and controlled local HTTP/ZAP fixtures.
+- Final local verification (2026-10-29): backend `mvn test` passed 172 tests with 0 failures, errors, or skips; frontend `npm test` passed 53 tests; `npm run build` succeeded. Tests use H2 and controlled local HTTP/ZAP fixtures.
 - Live MySQL/Flyway, live OWASP ZAP, live NVD, and restart persistence are not established by the local regression tests in this pass. ZAP API behavior and parameter compatibility are also not verified against a live ZAP instance.
+- Runtime egress verification on 2026-10-29: the old Squid ACL pinned Juice Shop/DVWA to IPs opposite their current container addresses. Restarting Juice Shop via the merged Compose project restarted Squid, regenerated ACLs for current addresses, and `squid -k parse` succeeded. Through the ZAP container and proxy, loopback and IPv4/IPv6 metadata returned 403; Juice Shop and the explicitly allowlisted `host.docker.internal:5173` returned 200; DVWA returned 302. These controlled GET checks validate the currently running proxy path, not a live ZAP scan or general public egress.
+- The full policy harness was not run because it sends a request to a configured public IP. No public target was contacted.

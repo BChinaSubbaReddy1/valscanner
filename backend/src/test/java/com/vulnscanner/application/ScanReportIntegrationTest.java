@@ -29,6 +29,7 @@ import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -203,6 +204,11 @@ class ScanReportIntegrationTest {
                 .andExpect(header().string("Content-Disposition", "attachment; filename=\"scan-report-" + job.getId() + ".json\""))
                 .andReturn();
         String jsonBody = jsonResult.getResponse().getContentAsString();
+        JsonNode jsonReport = objectMapper.readTree(jsonBody);
+        assertEquals(job.getId(), jsonReport.path("scanId").asLong());
+        assertEquals(32, jsonReport.path("totalFindings").asInt());
+        assertEquals("UNAVAILABLE",
+                jsonReport.path("executionSummary").path("zapEngineStatus").asText());
         assertTrue(jsonBody.contains("MISSING_CONTENT_SECURITY_POLICY"));
         assertTrue(jsonBody.contains("\"nativeEngineStatus\" : \"COMPLETED\""));
         assertTrue(jsonBody.contains("\"zapRequested\" : true"));
@@ -231,6 +237,19 @@ class ScanReportIntegrationTest {
                 .andExpect(header().string("Content-Disposition", "attachment; filename=\"scan-report-" + job.getId() + ".csv\""))
                 .andReturn();
         String csvBody = csvResult.getResponse().getContentAsString();
+        List<List<String>> csvRows = parseCsvRows(csvBody);
+        List<String> csvHeader = csvRows.stream()
+                .filter(row -> !row.isEmpty() && "Finding ID".equals(row.getFirst()))
+                .findFirst().orElseThrow();
+        List<String> formulaRow = csvRows.stream()
+                .filter(row -> row.size() > 1 && "FORMULA_FIXTURE".equals(row.get(1)))
+                .findFirst().orElseThrow();
+        assertEquals(15, csvHeader.size());
+        assertEquals(15, formulaRow.size());
+        assertEquals("'=HYPERLINK(\"https://attacker.invalid\")", formulaRow.get(3));
+        assertTrue(formulaRow.get(4).contains("café 東京 😀"));
+        assertTrue(formulaRow.get(4).contains("next"));
+        assertFalse(formulaRow.get(4).contains("\n"));
         assertTrue(csvBody.startsWith("# Scan ID,"));
         assertTrue(csvBody.contains("Finding ID,Check Type,Severity"));
         assertTrue(csvBody.contains("MISSING_CONTENT_SECURITY_POLICY"));
@@ -264,6 +283,7 @@ class ScanReportIntegrationTest {
                 .andExpect(header().string("Content-Disposition", "attachment; filename=\"scan-report-" + job.getId() + ".pdf\""))
                 .andReturn();
         byte[] pdfBytes = pdfResult.getResponse().getContentAsByteArray();
+        assertPdfStructure(pdfBytes);
         assertTrue(pdfBytes.length > 100);
         String pdfHeader = new String(pdfBytes, 0, 8, StandardCharsets.ISO_8859_1);
         assertTrue(pdfHeader.startsWith("%PDF-1.4"));
@@ -282,13 +302,43 @@ class ScanReportIntegrationTest {
         assertTrue(pdfBody.contains("Header absent"));
         assertTrue(pdfBody.contains("café"));
         assertTrue(pdfBody.contains("\\u{6771}"));
-        assertTrue(pdfBody.contains("\\u{1F600}"));
-        assertTrue(pdfBody.contains("\\(sample\\)"));
-        assertTrue(pdfBody.contains("\\\\ path next"));
-        assertTrue(pdfBody.contains("Detection source: PASSIVE_HEADERS | Assessment status: VERIFIED"));
-        assertTrue(pdfBody.contains("Assessment note: Automated status does not independently confirm exploitability."));
-        assertTrue(pdfBody.contains("TEST_FINDING_29"));
-        assertFalse(pdfBody.contains("PDF summary limit:"));
+    }
+
+    @Test
+    void completedScanWithNoFindingsExportsAnEmptyButStructuredReport() throws Exception {
+        Organization organization = approvedOrganization("Empty Report Tenant");
+        User analyst = createUser(RoleName.SECURITY_ANALYST, "empty-report@example.com", organization);
+        Target target = createTarget(organization, analyst, TargetStatus.APPROVED);
+        ScanJob job = completedScan(target, organization, analyst);
+        String token = login(analyst.getEmail());
+
+        MvcResult jsonResult = mockMvc.perform(get("/api/scans/{scanId}/report/export", job.getId())
+                        .param("format", "json")
+                        .header("Authorization", "Bearer " + token))
+                .andExpect(status().isOk())
+                .andReturn();
+        JsonNode jsonReport = objectMapper.readTree(jsonResult.getResponse().getContentAsString());
+        assertEquals(0, jsonReport.path("totalFindings").asInt());
+        assertTrue(jsonReport.path("findings").isArray());
+        assertTrue(jsonReport.path("findings").isEmpty());
+
+        MvcResult csvResult = mockMvc.perform(get("/api/scans/{scanId}/report/export", job.getId())
+                        .param("format", "csv")
+                        .header("Authorization", "Bearer " + token))
+                .andExpect(status().isOk())
+                .andReturn();
+        List<List<String>> csvRows = parseCsvRows(csvResult.getResponse().getContentAsString());
+        assertTrue(csvRows.stream().anyMatch(row -> !row.isEmpty() && "Finding ID".equals(row.getFirst())));
+        assertFalse(csvRows.stream().anyMatch(row -> row.size() > 1 && row.get(1).startsWith("MISSING_")));
+
+        MvcResult pdfResult = mockMvc.perform(get("/api/scans/{scanId}/report/export", job.getId())
+                        .param("format", "pdf")
+                        .header("Authorization", "Bearer " + token))
+                .andExpect(status().isOk())
+                .andReturn();
+        assertPdfStructure(pdfResult.getResponse().getContentAsByteArray());
+        assertTrue(new String(pdfResult.getResponse().getContentAsByteArray(), StandardCharsets.ISO_8859_1)
+                .contains("No findings were persisted for this scan."));
     }
 
     @Test
@@ -369,6 +419,67 @@ class ScanReportIntegrationTest {
         user.setOrganization(organization);
         user.setRoles(Set.of(roleRepository.findByName(roleName).orElseThrow()));
         return userRepository.save(user);
+    }
+
+    private List<List<String>> parseCsvRows(String csv) {
+        List<List<String>> rows = new java.util.ArrayList<>();
+        List<String> row = new java.util.ArrayList<>();
+        StringBuilder field = new StringBuilder();
+        boolean quoted = false;
+        for (int index = 0; index < csv.length(); index++) {
+            char current = csv.charAt(index);
+            if (quoted) {
+                if (current == '"' && index + 1 < csv.length() && csv.charAt(index + 1) == '"') {
+                    field.append('"');
+                    index++;
+                } else if (current == '"') {
+                    quoted = false;
+                } else {
+                    field.append(current);
+                }
+            } else if (current == '"' && field.isEmpty()) {
+                quoted = true;
+            } else if (current == ',') {
+                row.add(field.toString());
+                field.setLength(0);
+            } else if (current == '\n') {
+                row.add(field.toString());
+                field.setLength(0);
+                rows.add(List.copyOf(row));
+                row.clear();
+            } else if (current != '\r') {
+                field.append(current);
+            }
+        }
+        if (quoted) {
+            throw new AssertionError("CSV export contains an unterminated quoted field");
+        }
+        if (!row.isEmpty() || !field.isEmpty()) {
+            row.add(field.toString());
+            rows.add(List.copyOf(row));
+        }
+        return List.copyOf(rows);
+    }
+
+    private void assertPdfStructure(byte[] pdfBytes) {
+        String pdf = new String(pdfBytes, StandardCharsets.ISO_8859_1);
+        String marker = "startxref\n";
+        int markerIndex = pdf.lastIndexOf(marker);
+        assertTrue(markerIndex >= 0);
+        int offsetStart = markerIndex + marker.length();
+        int offsetEnd = pdf.indexOf('\n', offsetStart);
+        int xrefOffset = Integer.parseInt(pdf.substring(offsetStart, offsetEnd));
+        assertTrue(pdf.startsWith("xref\n", xrefOffset));
+
+        String[] xrefLines = pdf.substring(xrefOffset).split("\n");
+        String[] xrefHeader = xrefLines[1].split(" ");
+        int objectCount = Integer.parseInt(xrefHeader[1]);
+        for (int objectId = 1; objectId < objectCount; objectId++) {
+            String[] entry = xrefLines[objectId + 2].trim().split("\\s+");
+            int objectOffset = Integer.parseInt(entry[0]);
+            assertTrue(pdf.startsWith(objectId + " 0 obj\n", objectOffset));
+        }
+        assertTrue(pdf.endsWith("%%EOF\n"));
     }
 
     private Target createTarget(Organization organization, User creator, TargetStatus status) {

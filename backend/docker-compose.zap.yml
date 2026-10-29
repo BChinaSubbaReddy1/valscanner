@@ -57,11 +57,15 @@ services:
     depends_on:
       juice-shop:
         condition: service_started
+        restart: true
       dvwa:
         condition: service_started
+        restart: true
     restart: unless-stopped
     environment:
-      SCANNER_ALLOWED_PRIVATE_TARGET_ORIGINS: ${SCANNER_ALLOWED_PRIVATE_TARGET_ORIGINS:-http://juice-shop:3000,http://dvwa:80}
+      SCANNER_ALLOWED_PRIVATE_TARGET_ORIGINS: "${SCANNER_ALLOWED_PRIVATE_TARGET_ORIGINS:-http://juice-shop:3000,http://dvwa:80},http://localhost:5173,http://host.docker.internal:5173"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     entrypoint:
       - /bin/sh
       - /usr/local/bin/zap-egress-entrypoint.sh

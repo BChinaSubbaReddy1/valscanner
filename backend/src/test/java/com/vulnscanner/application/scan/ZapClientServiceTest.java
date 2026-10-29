@@ -56,6 +56,33 @@ class ZapClientServiceTest {
     }
 
     @Test
+    void alertRetrievalPreservesZAPAlertIdentifiersForScanAttribution() throws Exception {
+        server = startServer("/JSON/core/view/alerts/",
+                "{\"alerts\":[{\"id\":\"42\",\"url\":\"http://example.test/\",\"alert\":\"Example\",\"pluginId\":\"10001\"}]}");
+        ZapClientService client = client();
+
+        assertEquals("42", client.getAlerts("http://example.test/").getFirst().id());
+    }
+
+    @Test
+    void alertRetrievalRejectsAlertsWithoutIdentifiers() throws Exception {
+        server = startServer("/JSON/core/view/alerts/",
+                "{\"alerts\":[{\"alert\":\"Example\",\"pluginId\":\"10001\"}]}");
+        ZapClientService client = client();
+
+        assertThrows(IOException.class, () -> client.getAlerts("http://example.test/"));
+    }
+
+    @Test
+    void alertRetrievalRejectsAlertsWithoutUrls() throws Exception {
+        server = startServer("/JSON/core/view/alerts/",
+                "{\"alerts\":[{\"id\":\"42\",\"alert\":\"Example\",\"pluginId\":\"10001\"}]}");
+        ZapClientService client = client();
+
+        assertThrows(IOException.class, () -> client.getAlerts("http://example.test/"));
+    }
+
+    @Test
     void activeScanRequiresAnExplicitScopeContext() throws Exception {
         server = startServer("/JSON/ascan/action/scan/", "{\"scan\":\"1\"}");
         ZapClientService client = client();

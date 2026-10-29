@@ -1,0 +1,48 @@
+{
+  "scan_id": "integration-fixture-only",
+  "expires_at": "2099-01-01T00:00:00Z",
+  "origins": [
+    {
+      "scheme": "http",
+      "host": "fixture-target.test",
+      "port": 8080,
+      "addresses": ["172.31.0.10"],
+      "private_target_authorized": true
+    },
+    {
+      "scheme": "http",
+      "host": "fixture-ipv6.test",
+      "port": 8082,
+      "addresses": ["fd42:31::10"],
+      "private_target_authorized": true
+    },
+    {
+      "scheme": "https",
+      "host": "fixture-target.test",
+      "port": 8443,
+      "addresses": ["172.31.0.10"],
+      "private_target_authorized": true
+    },
+    {
+      "scheme": "http",
+      "host": "mixed.fixture.test",
+      "port": 8080,
+      "addresses": ["172.31.0.10"],
+      "private_target_authorized": true
+    },
+    {
+      "scheme": "http",
+      "host": "rebind.fixture.test",
+      "port": 8080,
+      "addresses": ["172.31.0.10"],
+      "private_target_authorized": true
+    },
+    {
+      "scheme": "http",
+      "host": "egress-sentinel.test",
+      "port": 9090,
+      "addresses": ["172.32.0.10"],
+      "private_target_authorized": true
+    }
+  ]
+}

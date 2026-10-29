@@ -61,10 +61,13 @@ Public HTTP and HTTPS targets do not need to be added to `.env`. The worker reso
 each hostname at scan time, rejects unsafe DNS answers, and connects to a validated
 address. It follows only same-origin redirects and validates each destination before
 following it. Loopback, private, link-local, multicast, unspecified, metadata, and
-other special-use destinations are blocked by default. Private Docker labs are
-authorized only by exact entries in `SCANNER_ALLOWED_PRIVATE_TARGET_ORIGINS`
-(the Compose defaults are the `juice-shop:3000` and `dvwa:80` service origins); this
-setting does not allow arbitrary private addresses.
+other special-use destinations are blocked by default. Private targets are authorized
+only by exact entries in `SCANNER_ALLOWED_PRIVATE_TARGET_ORIGINS`; this setting does
+not allow arbitrary private addresses. Local runs allow only `http://localhost:5173`
+by default. Compose additionally maps that exact origin to `host.docker.internal:5173`
+so the backend and ZAP reach the Windows-hosted frontend rather than their own
+container loopback. The saved target remains `localhost`; the Docker ZAP egress proxy
+still requires the exact mapped host-and-port and resolved address.
 
 Every newly submitted scan runs its selected native checks followed by the ZAP spider
 and passive analysis. `PASSIVE_HEADERS` and `ZAP_PASSIVE` do not enable active probes;
@@ -84,8 +87,9 @@ ZAP outbound HTTP(S) requests use the `zap-egress` Squid proxy. It blocks loopba
 private, link-local, metadata, multicast, and special-use destination ranges; exact
 private lab host-and-port origins from `SCANNER_ALLOWED_PRIVATE_TARGET_ORIGINS` are
 the only private-destination exceptions, and are further bound to the addresses
-resolved when the proxy starts. Restart the proxy after changing a lab target's
-address. Explicit special-use and IPv6 metadata denials take precedence over those
+resolved when the proxy starts. Compose explicitly restarts the proxy when a lab
+target is restarted through Compose; for address changes made outside that lifecycle,
+restart `zap-egress` so its startup ACL is regenerated. Explicit special-use and IPv6 metadata denials take precedence over those
 exceptions. The proxy is internal to the Compose network and
 does not publish a host port. ZAP itself is attached only to the internal API and proxy
 networks, so it has no direct route to targets or the internet. Only the egress proxy
@@ -100,6 +104,14 @@ The native scanner has configured request and response limits; ZAP has separate
 spider/active scan limits.
 POST-body, authenticated-account, and browser-execution coverage is not provided by
 the native scanner.
+
+The exact-origin allowlist does not make `http://[::1]:5173/` a host target from
+inside a container: IPv6 loopback is the container itself. For a different host-run
+development-server port, configure an exact localhost origin mapping and matching
+private-origin entries; do not allow arbitrary loopback or private origins. The
+Compose recovery runner assumes one backend
+instance; horizontal backend replicas are unsupported because startup recovery has
+no worker lease and could mark another instance's active scan failed.
 
 Password-reset endpoints return `503 Service Unavailable` until a delivery integration
 is configured. They do not create or store reset tokens in this configuration.

@@ -1,0 +1,328 @@
+services:
+  egress-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: gateway.py
+    environment:
+      EGRESS_POLICY_FILE: /etc/browser-egress/policy.json
+      EGRESS_EXPECTED_SCAN_ID: integration-fixture-only
+      EGRESS_LISTEN_HOST: 172.30.0.2
+    volumes:
+      - ./policy.fixture.json:/etc/browser-egress/policy.json:ro
+    dns:
+      - 172.31.0.53
+    dns_opt:
+      - ndots:1
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,noexec,nosuid,nodev
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 32
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('172.30.0.2', 3128), timeout=3).close()"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    networks:
+      browser-worker:
+        ipv4_address: 172.30.0.2
+      browser-fixtures:
+        ipv4_address: 172.31.0.2
+      browser-outbound: {}
+
+  fixture-target:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: fixture_server.py
+    environment:
+      TLS_PORT: "8443"
+      TLS_CERT_FILE: /run/fixture/fixture-cert.pem
+      TLS_KEY_FILE: /run/fixture/fixture-key.pem
+      IPV6_HTTP_PORT: "8082"
+    volumes:
+      - ./fixture-cert.pem:/run/fixture/fixture-cert.pem:ro
+      - ./fixture-key.pem:/run/fixture/fixture-key.pem:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    cpus: 0.25
+    pids_limit: 16
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8080), timeout=3).close()"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    networks:
+      browser-fixtures:
+        ipv4_address: 172.31.0.10
+        ipv6_address: fd42:31::10
+
+  fixture-decoy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: fixture_server.py
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    cpus: 0.25
+    pids_limit: 16
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8080), timeout=3).close()"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    networks:
+      browser-fixtures:
+        ipv4_address: 172.31.0.11
+        ipv6_address: fd42:31::11
+
+  fixture-dns:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: dns_fixture.py
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    mem_limit: 64m
+    cpus: 0.25
+    pids_limit: 16
+    networks:
+      browser-fixtures:
+        ipv4_address: 172.31.0.53
+        ipv6_address: fd42:31::53
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(3); s.sendto(bytes.fromhex('0001010000010000000000000e666978747572652d74617267657404746573740000010001'),('127.0.0.1',53)); s.recvfrom(512)"
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  egress-sentinel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: fixture_server.py
+    user: "0:0"
+    environment:
+      HTTP_PORT: "9090"
+      UDP_PORTS: "53,443,9999"
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 64m
+    cpus: 0.25
+    pids_limit: 16
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 9090), timeout=3).close()"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    networks:
+      browser-outbound:
+        ipv4_address: 172.32.0.10
+        ipv6_address: fd42:32::10
+
+  test-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: worker_test.py
+    depends_on:
+      egress-gateway:
+        condition: service_healthy
+      fixture-target:
+        condition: service_healthy
+      fixture-decoy:
+        condition: service_healthy
+      egress-sentinel:
+        condition: service_healthy
+      fixture-dns:
+        condition: service_healthy
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 96m
+    cpus: 0.5
+    pids_limit: 16
+    networks:
+      - browser-worker
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    dns:
+      - 172.30.0.2
+    dns_opt:
+      - timeout:1
+      - attempts:1
+    environment:
+      HTTP_PROXY: http://172.30.0.2:3128
+      HTTPS_PROXY: http://172.30.0.2:3128
+      http_proxy: http://172.30.0.2:3128
+      https_proxy: http://172.30.0.2:3128
+      BOUNDARY_BLOCKED_IPS: ${BOUNDARY_BLOCKED_IPS:-}
+      SCAN_B_GATEWAY_IP: 172.33.0.2
+
+  egress-gateway-scan-b:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: gateway.py
+    environment:
+      EGRESS_POLICY_FILE: /etc/browser-egress/policy.json
+      EGRESS_EXPECTED_SCAN_ID: integration-fixture-scan-b
+      EGRESS_LISTEN_HOST: 172.33.0.2
+    volumes:
+      - ./policy.fixture-b.json:/etc/browser-egress/policy.json:ro
+    dns:
+      - 172.31.0.53
+    dns_opt:
+      - ndots:1
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,noexec,nosuid,nodev
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 32
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('172.33.0.2', 3128), timeout=3).close()"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+    networks:
+      browser-worker-b:
+        ipv4_address: 172.33.0.2
+        ipv6_address: fd42:33::2
+      browser-fixtures:
+        ipv4_address: 172.31.0.3
+        ipv6_address: fd42:31::3
+      browser-outbound: {}
+
+  test-worker-scan-b:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: worker_isolation_test.py
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 96m
+    cpus: 0.5
+    pids_limit: 16
+    networks:
+      - browser-worker-b
+    dns:
+      - 172.33.0.2
+    dns_opt:
+      - timeout:1
+      - attempts:1
+    environment:
+      HTTP_PROXY: http://172.33.0.2:3128
+      HTTPS_PROXY: http://172.33.0.2:3128
+      http_proxy: http://172.33.0.2:3128
+      https_proxy: http://172.33.0.2:3128
+      SCAN_A_GATEWAY_IP: 172.30.0.2
+
+  egress-gateway-expiry:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: expiry_gateway.py
+    environment:
+      EGRESS_LISTEN_HOST: 172.34.0.2
+      EGRESS_EXPECTED_SCAN_ID: integration-expiry-fixture
+      BOUNDARY_EXPIRES_AT: ${BOUNDARY_EXPIRES_AT:-}
+    dns:
+      - 172.31.0.53
+    dns_opt:
+      - ndots:1
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m,noexec,nosuid,nodev
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 32
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('172.34.0.2', 3128), timeout=3).close()"]
+      interval: 1s
+      timeout: 5s
+      retries: 10
+    networks:
+      browser-worker-c:
+        ipv4_address: 172.34.0.2
+        ipv6_address: fd42:34::2
+      browser-fixtures:
+        ipv4_address: 172.31.0.4
+        ipv6_address: fd42:31::4
+
+  test-worker-expiry:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: worker_expiry_test.py
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 96m
+    cpus: 0.5
+    pids_limit: 16
+    networks:
+      - browser-worker-c
+    environment:
+      HTTP_PROXY: http://172.34.0.2:3128
+      HTTPS_PROXY: http://172.34.0.2:3128
+      BOUNDARY_EXPIRES_AT: ${BOUNDARY_EXPIRES_AT:-}
+
+networks:
+  browser-worker:
+    internal: true
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+        - subnet: fd42:30::/64
+  browser-fixtures:
+    internal: true
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+        - subnet: fd42:31::/64
+  browser-worker-b:
+    internal: true
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.33.0.0/24
+        - subnet: fd42:33::/64
+  browser-worker-c:
+    internal: true
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.34.0.0/24
+        - subnet: fd42:34::/64
+  browser-outbound:
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.32.0.0/24
+        - subnet: fd42:32::/64

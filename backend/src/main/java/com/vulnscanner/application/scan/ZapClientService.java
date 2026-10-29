@@ -25,6 +25,7 @@ import java.util.List;
 public class ZapClientService {
     private static final Logger log = LoggerFactory.getLogger(ZapClientService.class);
     private static final int MAX_ALERTS = 1000;
+    private static final int ALERT_PAGE_SIZE = 200;
     private static final int MAX_API_RESPONSE_BYTES = 2_097_152;
 
     private final String baseUrl;
@@ -245,35 +246,48 @@ public class ZapClientService {
 
     public List<ZapAlert> getAlerts(String targetBaseUrl) throws IOException, InterruptedException {
         String encodedUrl = URLEncoder.encode(targetBaseUrl, StandardCharsets.UTF_8);
-        String path = "/JSON/core/view/alerts/?baseurl=" + encodedUrl;
-        JsonNode json = executeRequest(path);
-        JsonNode alertsNode = json.path("alerts");
-        if (!alertsNode.isArray()) {
-            throw new IOException("ZAP returned an invalid alerts response");
-        }
-        if (alertsNode.size() > MAX_ALERTS) {
-            throw new IOException("ZAP alert response exceeded the configured limit");
-        }
-
         List<ZapAlert> alerts = new ArrayList<>();
-        for (JsonNode node : alertsNode) {
-            alerts.add(new ZapAlert(
-                    node.path("pluginId").asText(""),
-                    node.path("alert").asText(""),
-                    node.path("risk").asText("Informational"),
-                    node.path("confidence").asText("Low"),
-                    node.path("url").asText(targetBaseUrl),
-                    node.path("param").asText(""),
-                    node.path("attack").asText(""),
-                    node.path("evidence").asText(""),
-                    node.path("description").asText(""),
-                    node.path("solution").asText(""),
-                    node.path("reference").asText(""),
-                    node.path("cweid").asText(""),
-                    node.path("wascid").asText("")
-            ));
+        for (int start = 0; ; start += ALERT_PAGE_SIZE) {
+            String path = "/JSON/core/view/alerts/?baseurl=" + encodedUrl
+                    + "&start=" + start + "&count=" + ALERT_PAGE_SIZE;
+            JsonNode json = executeRequest(path);
+            JsonNode alertsNode = json.path("alerts");
+            if (!alertsNode.isArray()) {
+                throw new IOException("ZAP returned an invalid alerts response");
+            }
+            if (alerts.size() + alertsNode.size() > MAX_ALERTS) {
+                throw new IOException("ZAP alert response exceeded the configured limit");
+            }
+            for (JsonNode node : alertsNode) {
+                String alertId = node.path("id").asText("");
+                if (alertId.isBlank()) {
+                    throw new IOException("ZAP returned an alert without an identifier");
+                }
+                String alertUrl = node.path("url").asText("");
+                if (alertUrl.isBlank()) {
+                    throw new IOException("ZAP returned an alert without a URL");
+                }
+                alerts.add(new ZapAlert(
+                        node.path("pluginId").asText(""),
+                        node.path("alert").asText(""),
+                        node.path("risk").asText("Informational"),
+                        node.path("confidence").asText("Low"),
+                        alertUrl,
+                        node.path("param").asText(""),
+                        node.path("attack").asText(""),
+                        node.path("evidence").asText(""),
+                        node.path("description").asText(""),
+                        node.path("solution").asText(""),
+                        node.path("reference").asText(""),
+                        node.path("cweid").asText(""),
+                        node.path("wascid").asText(""),
+                        alertId
+                ));
+            }
+            if (alertsNode.size() < ALERT_PAGE_SIZE) {
+                return List.copyOf(alerts);
+            }
         }
-        return alerts;
     }
 
     private String requiredScanId(JsonNode response, String scanType) throws IOException {

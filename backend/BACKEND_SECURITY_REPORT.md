@@ -39,15 +39,17 @@ Suspension is distinct from deactivation. Only active accounts can authenticate;
 
 ## Residual risks and unverified scope
 
-1. **Scanner scope is intentionally limited**: the queue worker, same-origin bounded crawler, passive response-header checks, finding persistence, and cancellation handling are implemented for `PASSIVE_HEADERS`. There is no report/export API or active vulnerability testing. Outbound requests are bounded, do not follow redirects, reject private/link-local/multicast/cloud-metadata destinations by default, and pin each hostname to a stable public DNS address set for the duration of a scan. A future production deployment should still add network-level egress controls because application-level DNS validation cannot eliminate every race in an untrusted network.
-2. **Migration environment**: tests use H2 and do not execute Flyway against MySQL. Run Flyway V4–V6 and schema validation in an isolated MySQL 8 staging environment before deployment.
+1. **Scanner scope is bounded, not comprehensive**: each supported scan type runs native checks, ZAP spidering, and ZAP passive analysis; only explicit `ZAP_ACTIVE` requests add native GET-parameter probes and ZAP active scanning. JSON, CSV, and PDF reports are available. Native crawling parses static HTML without JavaScript execution; ZAP spider counts do not guarantee dynamic SPA or authenticated-flow coverage. Native execution is bounded and blocks redirects to other origins, private/link-local/multicast/cloud-metadata destinations by default while pinning validated DNS addresses. ZAP traffic is routed through Squid. Controlled live proxy checks passed after Compose refreshed its stale lab-IP ACL, but a live ZAP scan was not performed. Multi-replica ZAP alert attribution and recovery are unsupported.
+2. **Migration environment**: tests use H2 and do not execute Flyway against MySQL. Run the current Flyway migrations and schema validation in an isolated MySQL 8 staging environment before deployment.
 3. **Legacy data**: review existing organization/user associations and pending organization ownership before rollout. No existing tenant association is inferred from names.
 4. **Legacy data**: existing Customer and invitation rows are retained but unsupported by application workflows. Decide their archival/deactivation disposition before any future data-cleanup migration.
 5. **Production identity provisioning**: configure bootstrap credentials through protected environment settings and rotate/remove initial credentials as required by operations policy.
 
 ## Verification
 
-- `mvn test`: passed, 28 tests, 0 failures, 0 errors, 0 skipped.
-- `mvn clean package`: passed; 28 tests, 0 failures, 0 errors, 0 skipped, executable JAR produced.
-- Focused target-management integration tests passed. They exercise tenant isolation, role-specific visibility, target creation, approval, soft deletion, URL validation, and audit persistence.
-- Tests use H2 with Flyway disabled. MySQL 8 Flyway migration execution was not possible because the Docker engine was unavailable and no isolated MySQL test database was confirmed.
+- Current validation (2026-10-29): backend `mvn test` passed, 172 tests, 0 failures, 0 errors, 0 skipped; frontend `npm test` passed, 53 tests; `npm run build` succeeded.
+- Focused scan execution and report tests passed, 50 tests, 0 failures, 0 errors, 0 skipped.
+- Existing target-management integration tests exercise tenant isolation, role-specific visibility, target creation, approval, soft deletion, URL validation, and audit persistence.
+- Tests use H2 with Flyway disabled. MySQL 8 Flyway migration execution was not performed because no isolated MySQL test database was confirmed.
+- These results are local test/build evidence only; they do not establish live ZAP/Squid behavior or production database migration success.
+- Controlled egress checks on 2026-10-29 confirmed loopback and IPv4/IPv6 metadata denials (403), and allowed lab/host-bridge GETs (Juice Shop 200 after one transient 503; host bridge 200; DVWA 302). The full policy harness was not run because it probes a public IP. The current recovery runner assumes a single backend instance; startup of another instance could fail jobs active on the first instance.
