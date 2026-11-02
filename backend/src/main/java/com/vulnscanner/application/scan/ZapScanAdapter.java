@@ -12,7 +12,8 @@ public class ZapScanAdapter {
         String severity = mapSeverity(alert.risk());
         String verificationStatus = mapVerificationStatus(checkType);
 
-        String component = alert.url() != null ? alert.url() : "";
+        String endpoint = FindingSanitizer.safeEndpoint(alert.url());
+        String component = endpoint != null ? endpoint : "";
         if (alert.param() != null && !alert.param().isBlank()) {
             component = component + " [" + alert.param().trim() + "]";
         }
@@ -47,6 +48,11 @@ public class ZapScanAdapter {
                 bounded(FindingSanitizer.sanitize(alert.cweid()), 16),
                 bounded(FindingSanitizer.sanitize(alert.wascid()), 16)
         );
+        finding.setObservationDetails(endpoint,
+                alert.method() == null || alert.method().isBlank()
+                        ? null : bounded(alert.method().trim().toUpperCase(Locale.ROOT), 10),
+                alert.param() == null || alert.param().isBlank()
+                        ? null : bounded(FindingSanitizer.sanitize(alert.param().trim()), 255));
         return finding;
     }
 

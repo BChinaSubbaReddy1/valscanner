@@ -48,7 +48,10 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.POST, "/api/auth/register").permitAll()
                         .requestMatchers(
                                 "/api/auth/login",
+                                "/api/auth/verify-login-otp",
+                                "/api/auth/resend-login-otp",
                                 "/api/auth/forgot-password",
+                                "/api/auth/verify-reset-otp",
                                 "/api/auth/reset-password",
                                 "/actuator/health",
                                 "/v3/api-docs/**",

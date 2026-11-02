@@ -72,8 +72,10 @@ export function AuthProvider({ children }) {
     return () => window.removeEventListener('auth:session-expired', onSessionExpired);
   }, []);
 
-  const login = async (credentials) => {
-    const result = await authApi.login(credentials);
+  const login = async (credentials) => authApi.login(credentials);
+
+  const verifyLoginOtp = async (challengeToken, otp) => {
+    const result = await authApi.verifyLoginOtp({ challengeToken, otp });
     let nextSession = normalizeSession(result);
 
     if (!nextSession.token) {
@@ -132,6 +134,7 @@ export function AuthProvider({ children }) {
     isAuthenticated: Boolean(session?.token),
     loading: false,
     login,
+    verifyLoginOtp,
     register,
     logout,
     refreshUser,

@@ -6,71 +6,85 @@ import com.vulnscanner.application.organization.Organization;
 import com.vulnscanner.application.organization.OrganizationStatus;
 import com.vulnscanner.application.organization.OrganizationRepository;
 import com.vulnscanner.application.role.RoleName;
-import com.vulnscanner.application.security.JwtService;
 import com.vulnscanner.application.role.RoleRepository;
+import com.vulnscanner.application.security.JwtService;
+import com.vulnscanner.application.user.PasswordResetChallenge;
+import com.vulnscanner.application.user.PasswordResetChallengeRepository;
+import com.vulnscanner.application.user.PasswordResetTokenRepository;
 import com.vulnscanner.application.user.User;
 import com.vulnscanner.application.user.UserRepository;
 import com.vulnscanner.application.user.UserStatus;
-import org.springframework.security.authentication.AuthenticationManager;
-import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.mail.MailException;
 import org.springframework.security.crypto.password.PasswordEncoder;
-import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.web.server.ResponseStatusException;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Base64;
+import java.util.HexFormat;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.Set;
 
 @Service
 public class AuthService {
-    private final AuthenticationManager authenticationManager;
+    private static final Logger LOG = LoggerFactory.getLogger(AuthService.class);
+    private static final Duration OTP_LIFETIME = Duration.ofMinutes(10);
+    private static final Duration RESET_TOKEN_LIFETIME = Duration.ofMinutes(15);
+    private static final Duration RESEND_COOLDOWN = Duration.ofSeconds(60);
+    private static final Duration RESEND_WINDOW = Duration.ofHours(1);
+    private static final int MAX_OTP_ATTEMPTS = 5;
+    private static final int MAX_RESENDS = 3;
+
     private final UserRepository userRepository;
     private final PasswordEncoder passwordEncoder;
     private final RoleRepository roleRepository;
     private final OrganizationRepository organizationRepository;
     private final AuditEventRepository auditEventRepository;
     private final JwtService jwtService;
+    private final PasswordResetChallengeRepository passwordResetChallengeRepository;
+    private final PasswordResetTokenRepository passwordResetTokenRepository;
+    private final PasswordResetEmailService passwordResetEmailService;
+    private final PasswordResetRateLimiter passwordResetRateLimiter;
+    private final Clock clock;
+    private final SecureRandom secureRandom = new SecureRandom();
 
-    public AuthService(AuthenticationManager authenticationManager,
-                       UserRepository userRepository,
+    public AuthService(UserRepository userRepository,
                        PasswordEncoder passwordEncoder,
                        RoleRepository roleRepository,
                        OrganizationRepository organizationRepository,
                        AuditEventRepository auditEventRepository,
-                       JwtService jwtService) {
-        this.authenticationManager = authenticationManager;
+                       JwtService jwtService,
+                       PasswordResetChallengeRepository passwordResetChallengeRepository,
+                       PasswordResetTokenRepository passwordResetTokenRepository,
+                       PasswordResetEmailService passwordResetEmailService,
+                       PasswordResetRateLimiter passwordResetRateLimiter,
+                       Clock clock) {
         this.userRepository = userRepository;
         this.passwordEncoder = passwordEncoder;
         this.roleRepository = roleRepository;
         this.organizationRepository = organizationRepository;
         this.auditEventRepository = auditEventRepository;
         this.jwtService = jwtService;
+        this.passwordResetChallengeRepository = passwordResetChallengeRepository;
+        this.passwordResetTokenRepository = passwordResetTokenRepository;
+        this.passwordResetEmailService = passwordResetEmailService;
+        this.passwordResetRateLimiter = passwordResetRateLimiter;
+        this.clock = clock;
     }
 
     public void logout(String authHeader) {
         if (authHeader != null && authHeader.startsWith("Bearer ")) {
             jwtService.invalidateToken(authHeader.substring(7));
         }
-    }
-
-    @Transactional
-    public LoginResponse login(LoginRequest request) {
-        String email = request.email().trim().toLowerCase(Locale.ROOT);
-        authenticationManager.authenticate(
-                new UsernamePasswordAuthenticationToken(email, request.password()));
-        User user = userRepository.findByEmail(email).orElseThrow();
-        if (user.getStatus() == UserStatus.DISABLED || user.getStatus() == UserStatus.LOCKED) {
-            throw new IllegalStateException("Account is not active");
-        }
-        if (user.getOrganization() != null && user.getOrganization().getStatus() != OrganizationStatus.APPROVED) {
-            throw new IllegalStateException("Organization is not approved");
-        }
-        String token = jwtService.generateToken(user);
-        return new LoginResponse(token, "Bearer", user.getId(), user.getEmail(),
-                user.getRoles().stream()
-                        .filter(role -> role.getName() != RoleName.CUSTOMER)
-                        .map(role -> role.getName().name()).toList());
     }
 
     @Transactional
@@ -154,17 +168,144 @@ public class AuthService {
     }
 
     @Transactional
-    public void requestPasswordReset(ForgotPasswordRequest request) {
-        throw passwordResetUnavailable();
+    public void requestPasswordReset(ForgotPasswordRequest request, String remoteAddress) {
+        if (!passwordResetRateLimiter.tryAcquirePasswordReset(remoteAddress)) {
+            throw new RateLimitExceededException();
+        }
+        if (!passwordResetEmailService.isConfigured()) {
+            LOG.warn("Password reset email is not configured");
+            throw new IllegalStateException("Password reset email is temporarily unavailable; contact support.");
+        }
+
+        String email = request.email().trim().toLowerCase(Locale.ROOT);
+        Optional<User> matchingUser = userRepository.findByEmailIgnoreCaseForUpdate(email);
+        if (matchingUser.isEmpty()) {
+            return;
+        }
+
+        User user = matchingUser.get();
+        Instant now = clock.instant();
+        Optional<PasswordResetChallenge> currentChallenge =
+                passwordResetChallengeRepository.findByUserIdForUpdate(user.getId());
+        PasswordResetChallenge challenge;
+        if (currentChallenge.isPresent()
+                && now.isBefore(currentChallenge.get().getCreatedAt().plus(RESEND_WINDOW))) {
+            challenge = currentChallenge.get();
+            if (now.isBefore(challenge.getLastSentAt().plus(RESEND_COOLDOWN))
+                    || challenge.getResendCount() >= MAX_RESENDS) {
+                return;
+            }
+            String otp = generateOtp();
+            challenge.resend(passwordEncoder.encode(otp), now.plus(OTP_LIFETIME), now);
+            passwordResetChallengeRepository.save(challenge);
+            sendResetOtp(email, otp);
+            return;
+        }
+
+        currentChallenge.ifPresent(passwordResetChallengeRepository::delete);
+        String otp = generateOtp();
+        challenge = new PasswordResetChallenge(user, passwordEncoder.encode(otp), now.plus(OTP_LIFETIME), now);
+        passwordResetChallengeRepository.save(challenge);
+        sendResetOtp(email, otp);
     }
 
     @Transactional
     public void resetPassword(ResetPasswordRequest request) {
-        throw passwordResetUnavailable();
+        String tokenHash = sha256(request.token());
+        Optional<PasswordResetChallenge> candidate =
+                passwordResetChallengeRepository.findByResetTokenHash(tokenHash);
+        if (candidate.isEmpty()) {
+            throw invalidResetToken();
+        }
+        userRepository.findByIdForUpdate(candidate.get().getUser().getId())
+                .orElseThrow(this::invalidResetToken);
+        PasswordResetChallenge challenge = passwordResetChallengeRepository
+                .findByResetTokenHashForUpdate(tokenHash).orElseThrow(this::invalidResetToken);
+        Instant now = clock.instant();
+        if (challenge.getVerifiedAt() == null || challenge.getResetTokenExpiresAt() == null
+                || !now.isBefore(challenge.getResetTokenExpiresAt())) {
+            throw invalidResetToken();
+        }
+
+        User user = challenge.getUser();
+        user.setPassword(passwordEncoder.encode(request.password()));
+        userRepository.save(user);
+        passwordResetChallengeRepository.delete(challenge);
+        passwordResetTokenRepository.deleteByUser(user);
     }
 
-    private ResponseStatusException passwordResetUnavailable() {
-        return new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
-                "Password reset delivery is not configured");
+    @Transactional
+    public Optional<String> verifyPasswordResetOtp(VerifyPasswordResetOtpRequest request, String remoteAddress) {
+        if (!passwordResetRateLimiter.tryAcquirePasswordReset(remoteAddress)) {
+            throw new RateLimitExceededException();
+        }
+
+        String email = request.email().trim().toLowerCase(Locale.ROOT);
+        Optional<User> matchingUser = userRepository.findByEmailIgnoreCaseForUpdate(email);
+        if (matchingUser.isEmpty()) {
+            return Optional.empty();
+        }
+        Optional<PasswordResetChallenge> currentChallenge =
+                passwordResetChallengeRepository.findByUserIdForUpdate(matchingUser.get().getId());
+        if (currentChallenge.isEmpty()) {
+            return Optional.empty();
+        }
+
+        PasswordResetChallenge challenge = currentChallenge.get();
+        Instant now = clock.instant();
+        if (challenge.getVerifiedAt() != null) {
+            return Optional.empty();
+        }
+        if (!now.isBefore(challenge.getOtpExpiresAt())
+                || challenge.getAttemptCount() >= MAX_OTP_ATTEMPTS) {
+            passwordResetChallengeRepository.delete(challenge);
+            return Optional.empty();
+        }
+        if (!passwordEncoder.matches(request.otp(), challenge.getOtpHash())) {
+            challenge.recordFailedAttempt();
+            if (challenge.getAttemptCount() >= MAX_OTP_ATTEMPTS) {
+                passwordResetChallengeRepository.delete(challenge);
+            } else {
+                passwordResetChallengeRepository.save(challenge);
+            }
+            return Optional.empty();
+        }
+
+        String resetToken = generateResetToken();
+        challenge.verify(sha256(resetToken), now.plus(RESET_TOKEN_LIFETIME), now);
+        passwordResetChallengeRepository.save(challenge);
+        return Optional.of(resetToken);
+    }
+
+    private void sendResetOtp(String email, String otp) {
+        try {
+            passwordResetEmailService.sendOtp(email, otp);
+        } catch (MailException deliveryFailure) {
+            LOG.warn("Password reset email delivery failed");
+            throw new IllegalStateException("Password reset email is temporarily unavailable; contact support.");
+        }
+    }
+
+    private String generateOtp() {
+        return String.format(Locale.ROOT, "%06d", secureRandom.nextInt(1_000_000));
+    }
+
+    private String generateResetToken() {
+        byte[] token = new byte[32];
+        secureRandom.nextBytes(token);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(token);
+    }
+
+    private String sha256(String value) {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                    .digest(value.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException exception) {
+            throw new IllegalStateException("SHA-256 is unavailable", exception);
+        }
+    }
+
+    private IllegalArgumentException invalidResetToken() {
+        return new IllegalArgumentException("Invalid or expired password reset token");
     }
 }

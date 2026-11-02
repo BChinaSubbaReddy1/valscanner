@@ -17,6 +17,12 @@ public record ScanFindingResponse(
         String sourceConfidence,
         String sourceReference,
         String sourceCweId,
-        String sourceWascId
+        String sourceWascId,
+        int priorityScore,
+        String priorityLevel,
+        String priorityExplanation,
+        String endpointUrl,
+        String httpMethod,
+        String parameterName
 ) {
 }

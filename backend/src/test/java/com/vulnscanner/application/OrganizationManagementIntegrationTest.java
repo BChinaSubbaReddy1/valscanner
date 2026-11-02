@@ -3,6 +3,7 @@ package com.vulnscanner.application;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.vulnscanner.application.audit.AuditEventRepository;
+import com.vulnscanner.application.auth.PasswordResetEmailService;
 import com.vulnscanner.application.organization.Organization;
 import com.vulnscanner.application.organization.OrganizationRepository;
 import com.vulnscanner.application.organization.OrganizationStatus;
@@ -17,6 +18,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.http.MediaType;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.context.ActiveProfiles;
@@ -28,6 +30,7 @@ import java.util.Set;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
+import static org.mockito.Mockito.when;
 
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -43,9 +46,11 @@ class OrganizationManagementIntegrationTest {
     @Autowired private OrganizationRepository organizationRepository;
     @Autowired private PasswordEncoder passwordEncoder;
     @Autowired private AuditEventRepository auditEventRepository;
+    @MockBean private PasswordResetEmailService passwordResetEmailService;
 
     @BeforeEach
     void initializeRoles() {
+        when(passwordResetEmailService.isConfigured()).thenReturn(true);
         for (RoleName name : new RoleName[]{
                 RoleName.SUPER_ADMIN, RoleName.ADMIN, RoleName.SECURITY_ANALYST}) {
             roleRepository.findByName(name).orElseGet(() -> roleRepository.save(new Role(name)));
@@ -139,7 +144,7 @@ class OrganizationManagementIntegrationTest {
                         .header("Authorization", "Bearer " + adminToken))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.status").value("ACTIVE"));
-        assertEquals(200, loginStatus(analyst.getEmail()));
+        assertEquals(202, loginStatus(analyst.getEmail()));
 
         mockMvc.perform(post("/api/organizations/me/users/{id}/deactivate", analyst.getId())
                         .header("Authorization", "Bearer " + adminToken))
@@ -336,17 +341,12 @@ class OrganizationManagementIntegrationTest {
     }
 
     private int loginStatus(String email) throws Exception {
-        return mockMvc.perform(post("/api/auth/login").contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"email\":\"" + email + "\",\"password\":\"" + PASSWORD + "\"}"))
-                .andReturn().getResponse().getStatus();
+        return LoginOtpTestSupport.loginStatus(mockMvc, email, PASSWORD);
     }
 
     private String login(String email) throws Exception {
-        String body = mockMvc.perform(post("/api/auth/login").contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"email\":\"" + email + "\",\"password\":\"" + PASSWORD + "\"}"))
-                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
-        JsonNode response = objectMapper.readTree(body);
-        return response.path("data").path("token").asText();
+        return LoginOtpTestSupport.completeLogin(
+                mockMvc, objectMapper, passwordResetEmailService, email, PASSWORD);
     }
 
     private Organization approvedOrganization(String name) {

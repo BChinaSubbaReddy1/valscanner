@@ -46,7 +46,7 @@ Organization Admin APIs derive organization identity from the current authentica
 - `POST /api/organizations/me/users/{userId}/restore`
 - `POST /api/organizations/me/users/{userId}/deactivate` (soft deactivation)
 
-Target management is under `/api/targets`: admins list, create, decide, and soft-delete targets within their approved organization; analysts list/read only approved targets in their own approved organization. The request/response fields and status transitions are specified in `RBAC_PERMISSION_MATRIX.md`.
+Target management is under `/api/targets`: admins list, create, decide, and soft-delete targets within their approved organization, and manage analyst assignments for approved targets. Analysts list/read only individually assigned, currently approved targets in their own approved organization. Assignment creation and revocation are tenant-associated audit events; the request/response fields and status transitions are specified in `RBAC_PERMISSION_MATRIX.md`.
 
 Approval, suspension, restoration, and deactivation actions require no request body. Organization Admins may approve/manage only `SECURITY_ANALYST` users in their own approved organization; they cannot manage themselves, Super Admins, or Organization Admin accounts. Legacy `CUSTOMER` accounts are not part of these workflows. Audit events retain actor, action, target, organization, and timestamp without user-entered decision text.
 
@@ -59,7 +59,7 @@ Super Admin-only Organization Admin account endpoints:
 
 These account endpoints do not grant scanner-data access. A Super Admin cannot manage their own account through them or suspend/deactivate the last active Organization Admin in an organization. Existing organization-registration review endpoints remain under `/api/organizations/{id}` and retain the Super Admin-only policy.
 
-Scan-job endpoints under `/api/scans` allow active Security Analysts in an approved organization to submit requests for approved targets. Requests start at `PENDING_APPROVAL`; only a same-organization Organization Admin can approve or reject them. Analysts can list/read/cancel only their own requests; admins can list/read/cancel their organization’s requests and review pending requests. Super Admins have no scanner operational-data or approval access. Successful approval commits `QUEUED` state before post-commit executor submission. All supported scan types perform the bounded native crawl and run ZAP spider/passive analysis; only `ZAP_ACTIVE` enables the ZAP active scan and native active probes. Execution performs at most 10 bounded same-origin native requests to depth 2, follows same-origin redirects only after validation, rejects cross-origin redirects, and defaults to rejecting private or metadata-network destinations.
+Scan-job endpoints under `/api/scans` allow active Security Analysts in an approved organization to submit requests only for individually assigned, approved targets. Requests start at `PENDING_APPROVAL`; only a same-organization Organization Admin can approve or reject them. Analysts can list and access scans and their findings, crawl pages, and reports only while assigned to the scan's currently approved target, regardless of which Analyst requested it; Admins can access their organization's scans and review pending requests. Assignment revocation or target deactivation immediately blocks Analyst access, including direct ID requests and report exports. Super Admins have no scanner operational-data or approval access. Successful approval commits `QUEUED` state before post-commit executor submission. All supported scan types perform the bounded native crawl and run ZAP spider/passive analysis; only `ZAP_ACTIVE` enables the ZAP active scan and native active probes. Execution performs at most 10 bounded same-origin native requests to depth 2, follows same-origin redirects only after validation, rejects cross-origin redirects, and defaults to rejecting private or metadata-network destinations.
 
 ## Statistics and privacy definitions
 
@@ -73,13 +73,14 @@ User dashboard, approval, and account-management responses use a display name de
 
 ## Database and data integrity
 
-Flyway V3 adds only query indexes; the `SUSPENDED` value is stored in the existing string-backed status column and requires no column change. V4 remains unchanged, including its legacy invitation table; no existing invitation rows or Customer users/role rows are deleted. V5 adds target persistence; V6 adds scan-job and finding tables with tenant/target/requester foreign keys. User deletion is soft, preserving user-role, organization, audit, and historical-record references. No MySQL production/staging database was modified.
+Flyway V3 adds only query indexes; the `SUSPENDED` value is stored in the existing string-backed status column and requires no column change. V4 remains unchanged, including its legacy invitation table; no existing invitation rows or Customer users/role rows are deleted. V5 adds target persistence; V6 adds scan-job and finding tables with tenant/target/requester foreign keys; V18 adds a unique target/analyst assignment relation with target, analyst, and assigning-admin foreign keys. Revocation deletes the active relation only after recording the actor and target in the audit log. User deletion is soft, preserving user-role, organization, audit, and historical-record references. No MySQL production/staging database was modified.
 
 V2 remains the schema change for initial admin registration association. Analyst registration requires no schema change because `users.organization_id` already stores the explicit association. Review legacy organization/user mappings before deploying migrations; no organization owner is inferred from a matching name.
 
 ## Verification
 
-- Current verification (2026-10-29): `mvn test` passed, 172 tests, 0 failures, 0 errors, 0 skipped; frontend `npm test` passed, 53 tests; `npm run build` passed.
+- Current backend verification (2026-10-30): `mvn test` passed, 210 tests, 0 failures, 0 errors, 0 skipped; `mvn -DskipTests package` succeeded. Target-assignment integration tests cover organization scoping, assignment/revocation, scan creation/history, findings, crawl pages, dashboard aggregates, reports, and exports.
+- Earlier verification (2026-10-29): `mvn test` passed, 172 tests, 0 failures, 0 errors, 0 skipped; frontend `npm test` passed, 53 tests; `npm run build` passed. No frontend files were accessed or changed in the target-assignment implementation.
 - Focused scan execution/report verification passed: 50 tests, 0 failures, 0 errors, 0 skipped.
 - Earlier verification entries in this report are historical snapshots and have been superseded by the current results above.
 - `ScanExecutionServiceTest` includes controlled local-fixture positive and negative SQLi/reflection cases plus active-request budget enforcement.
@@ -102,7 +103,7 @@ mutation was performed.
 | Capability | Status | Evidence / limitation |
 |---|---|---|
 | Authentication and current-user JWT revalidation | VERIFIED | JWT signature/expiry/blacklist plus database status, role, and organization reload |
-| Tenant-scoped targets, scans, findings, and crawl pages | VERIFIED | Service-level organization/requester predicates; `/api/scans/{scanId}/crawl-pages` returns persisted metadata only after the same access check |
+| Tenant-scoped targets, scans, findings, crawl pages, and reports | VERIFIED | Assignment-aware service authorization, organization/target relationship checks, and 404 for unassigned, revoked, or cross-tenant IDs; report exports use the same check |
 | Passive response-header and cookie checks | VERIFIED | Bounded worker tests controlled responses and persists evidence-backed findings; each `Set-Cookie` is parsed independently, values are redacted, and missing attributes are `OBSERVED` rather than verified exploitability |
 | Same-origin crawler and SSRF controls | VERIFIED | Depth/request/response/time limits, redirects disabled, target-origin scheme/host/effective-port comparison, address restrictions, DNS-set pinning, fragment normalization, HTML-only crawl-page records, and cancellation |
 | Dashboard aggregates | VERIFIED | Organization and analyst counts use persisted tenant-scoped repository queries; platform dashboard exposes organization metadata counts only |

@@ -1,5 +1,6 @@
 package com.vulnscanner.application.scan;
 
+import com.vulnscanner.application.common.UrlSanitizer;
 import jakarta.persistence.*;
 
 import java.nio.charset.StandardCharsets;
@@ -58,13 +59,16 @@ public class ScanCrawlPage {
     public ScanCrawlPage(ScanJob scanJob, String url, int depth, int statusCode,
                          int responseBytes, int discoveredLinks, List<DiscoveredForm> discoveredForms) {
         this.scanJob = scanJob;
-        this.url = url;
+        this.url = UrlSanitizer.safeEndpoint(url);
         this.urlHash = hashUrl(url);
         this.depth = depth;
         this.statusCode = statusCode;
         this.responseBytes = responseBytes;
         this.discoveredLinks = discoveredLinks;
-        this.discoveredForms = discoveredForms == null ? List.of() : List.copyOf(discoveredForms);
+        this.discoveredForms = discoveredForms == null ? List.of() : discoveredForms.stream()
+                .map(form -> new DiscoveredForm(UrlSanitizer.safeEndpoint(form.actionUrl()),
+                        form.method(), form.parameterNames()))
+                .toList();
     }
 
     public Long getId() { return id; }

@@ -14,6 +14,9 @@ public interface TargetRepository extends JpaRepository<Target, Long> {
 
     List<Target> findByOrganization_IdAndStatusOrderByCreatedAtDesc(Long organizationId, TargetStatus status);
 
+    List<Target> findByIdInAndOrganization_IdAndStatusOrderByCreatedAtDesc(
+            List<Long> ids, Long organizationId, TargetStatus status);
+
     Optional<Target> findByIdAndOrganization_IdAndStatusNot(Long id, Long organizationId, TargetStatus status);
 
     Optional<Target> findByIdAndOrganization_IdAndStatus(Long id, Long organizationId, TargetStatus status);

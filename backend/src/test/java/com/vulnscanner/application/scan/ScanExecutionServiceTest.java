@@ -27,6 +27,7 @@ import java.net.http.HttpClient;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -235,6 +236,268 @@ class ScanExecutionServiceTest {
                 "MISSING_CONTENT_TYPE_OPTIONS".equals(finding.getCheckType())));
         verify(findings, never()).save(argThat(finding ->
                 "MISSING_REFERRER_POLICY".equals(finding.getCheckType())));
+    }
+
+    @Test
+    void frameProtectionRequiresAnExactCspDirective() throws Exception {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            String csp = switch (path) {
+                case "/" -> "frame-ancestors 'self'";
+                case "/invalid" -> "not-frame-ancestors 'none'";
+                case "/valid" -> "default-src 'self'; Frame-Ancestors 'none'";
+                default -> "";
+            };
+            exchange.getResponseHeaders().add("Content-Type", "text/html");
+            if ("/invalid-xfo".equals(path)) {
+                exchange.getResponseHeaders().add("X-Frame-Options", "not-protection");
+            } else if ("/valid-xfo".equals(path)) {
+                exchange.getResponseHeaders().add("X-Frame-Options", "SAMEORIGIN");
+            }
+            if (!csp.isEmpty()) {
+                exchange.getResponseHeaders().add("Content-Security-Policy", csp);
+            }
+            String body = "/".equals(path)
+                    ? "<a href=\"/invalid\">invalid</a><a href=\"/valid\">valid</a>"
+                            + "<a href=\"/invalid-xfo\">invalid XFO</a><a href=\"/valid-xfo\">valid XFO</a>"
+                    : "<html><body>fixture</body></html>";
+            byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, bytes.length);
+            exchange.getResponseBody().write(bytes);
+            exchange.close();
+        });
+        server.start();
+
+        Organization organization = approvedOrganization(105L);
+        Target target = approvedTarget(organization,
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/");
+        ScanJob job = approvedJob(organization, target);
+        setId(job, 105L);
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        ScanFindingRepository findings = mock(ScanFindingRepository.class);
+        when(jobs.findByIdForExecutionUpdate(105L)).thenReturn(Optional.of(job));
+
+        ScanExecutionService service = new ScanExecutionService(jobs, findings, false, null);
+        permitTestTarget(service, job);
+        service.runClaimed(105L);
+
+        assertEquals(ScanStatus.COMPLETED, job.getStatus(), job.getStatusMessage());
+        ArgumentCaptor<ScanFinding> captor = ArgumentCaptor.forClass(ScanFinding.class);
+        verify(findings, atLeastOnce()).save(captor.capture());
+        List<ScanFinding> frameFindings = captor.getAllValues().stream()
+                .filter(finding -> "MISSING_FRAME_PROTECTION".equals(finding.getCheckType()))
+                .toList();
+        assertEquals(2, frameFindings.size());
+        assertTrue(frameFindings.stream()
+                .anyMatch(finding -> finding.getAffectedComponent().contains("/invalid")));
+        ScanFinding invalidXFrameOptions = frameFindings.stream()
+                .filter(finding -> finding.getAffectedComponent().contains("/invalid-xfo"))
+                .findFirst().orElseThrow();
+        assertTrue(invalidXFrameOptions.getEvidence().contains("not-protection"));
+        assertFalse(frameFindings.stream()
+                .anyMatch(finding -> finding.getAffectedComponent().contains("/valid-xfo")));
+    }
+
+    @Test
+    void evaluatesNativePassiveFrameProtectionAgainstIndependentLocalFixtureLabels() throws Exception {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            boolean protectedFixture = "/protected".equals(exchange.getRequestURI().getPath());
+            exchange.getResponseHeaders().add("Content-Type", "text/html");
+            if (protectedFixture) {
+                exchange.getResponseHeaders().add("Content-Security-Policy", "frame-ancestors 'none'");
+            }
+            byte[] body = "<html><body>local evaluation fixture</body></html>"
+                    .getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.start();
+
+        Organization organization = approvedOrganization(107L);
+        Target vulnerableTarget = approvedTarget(organization,
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/unprotected");
+        Target protectedTarget = approvedTarget(organization,
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/protected");
+        ScanJob vulnerableJob = approvedJob(organization, vulnerableTarget);
+        ScanJob protectedJob = approvedJob(organization, protectedTarget);
+        setId(vulnerableJob, 107L);
+        setId(protectedJob, 108L);
+
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        ScanFindingRepository findings = mock(ScanFindingRepository.class);
+        when(jobs.findByIdForExecutionUpdate(107L)).thenReturn(Optional.of(vulnerableJob));
+        when(jobs.findByIdForExecutionUpdate(108L)).thenReturn(Optional.of(protectedJob));
+        ScanExecutionService service = new ScanExecutionService(jobs, findings, false, null);
+        permitTestTarget(service, vulnerableJob);
+
+        service.runClaimed(107L);
+        service.runClaimed(108L);
+
+        ArgumentCaptor<ScanFinding> captor = ArgumentCaptor.forClass(ScanFinding.class);
+        verify(findings, atLeastOnce()).save(captor.capture());
+        List<ScanFinding> persisted = captor.getAllValues();
+        boolean vulnerableDetected = persisted.stream()
+                .anyMatch(finding -> finding.getScanJob().getId().equals(107L)
+                        && "MISSING_FRAME_PROTECTION".equals(finding.getCheckType()));
+        boolean protectedDetected = persisted.stream()
+                .anyMatch(finding -> finding.getScanJob().getId().equals(108L)
+                        && "MISSING_FRAME_PROTECTION".equals(finding.getCheckType()));
+
+        Map<FindingEvaluationMetrics.Dimension, FindingEvaluationMetrics.Result> evaluation =
+                FindingEvaluationMetrics.evaluateCases(List.of(
+                        new FindingEvaluationMetrics.EvaluationCase(
+                                "local-frame-unprotected", "SECURITY_MISCONFIGURATION", "NATIVE",
+                                true, FindingEvaluationMetrics.Outcome.EXECUTED, vulnerableDetected),
+                        new FindingEvaluationMetrics.EvaluationCase(
+                                "local-frame-protected", "SECURITY_MISCONFIGURATION", "NATIVE",
+                                false, FindingEvaluationMetrics.Outcome.EXECUTED, protectedDetected)
+                ));
+        FindingEvaluationMetrics.Result result = evaluation.get(
+                new FindingEvaluationMetrics.Dimension("SECURITY_MISCONFIGURATION", "NATIVE"));
+        assertEquals(1, result.truePositive());
+        assertEquals(0, result.falsePositive());
+        assertEquals(0, result.falseNegative());
+        assertEquals(1, result.trueNegative());
+        assertEquals(1.0, result.accuracy().orElseThrow());
+        assertEquals(1.0, result.detectionCoverage().orElseThrow());
+    }
+
+    @Test
+    void evaluatesAdditionalLabeledLocalFixturesFromPersistedScannerFindings() throws Exception {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            String path = exchange.getRequestURI().getPath();
+            String query = URLDecoder.decode(
+                    exchange.getRequestURI().getRawQuery() == null
+                            ? "" : exchange.getRequestURI().getRawQuery(), StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type",
+                    path.startsWith("/xss-") ? "text/html" : "text/plain");
+            String body;
+            if (path.startsWith("/frame-")) {
+                exchange.getResponseHeaders().add("Content-Type", "text/html");
+                if ("/frame-protected".equals(path)) {
+                    exchange.getResponseHeaders().add("X-Frame-Options", "DENY");
+                }
+                body = "<html><body>fixture</body></html>";
+            } else if ("/cookie-vulnerable".equals(path)) {
+                exchange.getResponseHeaders().add("Set-Cookie", "sessionid=lab-session-secret; Path=/");
+                body = "cookie fixture";
+            } else if ("/cookie-protected".equals(path)) {
+                exchange.getResponseHeaders().add("Set-Cookie",
+                        "sessionid=lab-session-secret; Secure; HttpOnly; SameSite=Lax; Max-Age=3600; Path=/");
+                body = "cookie fixture";
+            } else if ("/sql-vulnerable".equals(path) && query.contains("' OR '1'='1")) {
+                body = "SQL syntax error in controlled fixture";
+            } else if ("/xss-vulnerable".equals(path) && query.contains("vscanxss")) {
+                body = "<html><body>" + query.substring(query.indexOf('=') + 1) + "</body></html>";
+            } else {
+                body = "<html><body>safe fixture</body></html>";
+            }
+            byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, bytes.length);
+            exchange.getResponseBody().write(bytes);
+            exchange.close();
+        });
+        server.start();
+
+        Organization organization = approvedOrganization(700L);
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        ScanFindingRepository findings = mock(ScanFindingRepository.class);
+        Map<Long, ScanJob> jobsById = new java.util.LinkedHashMap<>();
+        Map<String, Long> fixtureJobs = new java.util.LinkedHashMap<>();
+        List<String> fixtures = List.of(
+                "frame-vulnerable", "frame-protected",
+                "cookie-vulnerable", "cookie-protected",
+                "sql-vulnerable", "sql-protected",
+                "xss-vulnerable", "xss-protected");
+        long id = 700L;
+        for (String fixture : fixtures) {
+            boolean active = fixture.startsWith("sql-") || fixture.startsWith("xss-");
+            ScanType type = active ? ScanType.ZAP_ACTIVE : ScanType.PASSIVE_HEADERS;
+            String query = active ? (fixture.startsWith("sql-") ? "?id=1" : "?q=fixture") : "";
+            Target target = approvedTarget(organization,
+                    "http://127.0.0.1:" + server.getAddress().getPort() + "/" + fixture + query);
+            ScanJob job = approvedJob(organization, target);
+            ReflectionTestUtils.setField(job, "scanType", type);
+            setId(job, id);
+            jobsById.put(id, job);
+            fixtureJobs.put(fixture, id);
+            id++;
+        }
+        when(jobs.findByIdForExecutionUpdate(anyLong())).thenAnswer(invocation ->
+                Optional.ofNullable(jobsById.get(invocation.getArgument(0))));
+
+        ScanExecutionService service = new ScanExecutionService(jobs, findings, true, null);
+        for (Map.Entry<Long, ScanJob> entry : jobsById.entrySet()) {
+            permitTestTarget(service, entry.getValue());
+            service.runClaimed(entry.getKey());
+            assertEquals(ScanStatus.COMPLETED, entry.getValue().getStatus(),
+                    entry.getKey() + ": " + entry.getValue().getStatusMessage());
+        }
+
+        ArgumentCaptor<ScanFinding> captor = ArgumentCaptor.forClass(ScanFinding.class);
+        verify(findings, atLeastOnce()).save(captor.capture());
+        List<ScanFinding> persistedFindings = captor.getAllValues();
+        java.util.function.BiPredicate<String, String> detected = (fixture, checkType) ->
+                persistedFindings.stream().anyMatch(finding ->
+                        fixtureJobs.get(fixture).equals(finding.getScanJob().getId())
+                                && checkType.equals(finding.getCheckType()));
+        List<FindingEvaluationMetrics.EvaluationCase> evaluationCases = List.of(
+                new FindingEvaluationMetrics.EvaluationCase("frame-vulnerable",
+                        "SECURITY_MISCONFIGURATION", "NATIVE", true,
+                        FindingEvaluationMetrics.Outcome.EXECUTED,
+                        detected.test("frame-vulnerable", "MISSING_FRAME_PROTECTION")),
+                new FindingEvaluationMetrics.EvaluationCase("frame-protected",
+                        "SECURITY_MISCONFIGURATION", "NATIVE", false,
+                        FindingEvaluationMetrics.Outcome.EXECUTED,
+                        detected.test("frame-protected", "MISSING_FRAME_PROTECTION")),
+                new FindingEvaluationMetrics.EvaluationCase("cookie-vulnerable",
+                        "COOKIE_SECURITY", "NATIVE", true,
+                        FindingEvaluationMetrics.Outcome.EXECUTED,
+                        detected.test("cookie-vulnerable", "COOKIE_MISSING_HTTP_ONLY")),
+                new FindingEvaluationMetrics.EvaluationCase("cookie-protected",
+                        "COOKIE_SECURITY", "NATIVE", false,
+                        FindingEvaluationMetrics.Outcome.EXECUTED,
+                        detected.test("cookie-protected", "COOKIE_MISSING_HTTP_ONLY")),
+                new FindingEvaluationMetrics.EvaluationCase("sql-vulnerable",
+                        "SQL_INJECTION", "NATIVE", true,
+                        FindingEvaluationMetrics.Outcome.EXECUTED,
+                        detected.test("sql-vulnerable", "SQL_INJECTION_SUSPECTED")),
+                new FindingEvaluationMetrics.EvaluationCase("sql-protected",
+                        "SQL_INJECTION", "NATIVE", false,
+                        FindingEvaluationMetrics.Outcome.EXECUTED,
+                        detected.test("sql-protected", "SQL_INJECTION_SUSPECTED")),
+                new FindingEvaluationMetrics.EvaluationCase("xss-vulnerable",
+                        "XSS", "NATIVE", true,
+                        FindingEvaluationMetrics.Outcome.EXECUTED,
+                        detected.test("xss-vulnerable", "REFLECTED_XSS_POTENTIAL")),
+                new FindingEvaluationMetrics.EvaluationCase("xss-protected",
+                        "XSS", "NATIVE", false,
+                        FindingEvaluationMetrics.Outcome.EXECUTED,
+                        detected.test("xss-protected", "REFLECTED_XSS_POTENTIAL"))
+        );
+        Map<FindingEvaluationMetrics.Dimension, FindingEvaluationMetrics.Result> results =
+                FindingEvaluationMetrics.evaluateCases(evaluationCases);
+        for (String category : List.of(
+                "SECURITY_MISCONFIGURATION", "COOKIE_SECURITY", "SQL_INJECTION", "XSS")) {
+            FindingEvaluationMetrics.Result result = results.get(
+                    new FindingEvaluationMetrics.Dimension(category, "NATIVE"));
+            assertEquals(1, result.truePositive(), category);
+            assertEquals(0, result.falsePositive(), category);
+            assertEquals(0, result.falseNegative(), category);
+            assertEquals(1, result.trueNegative(), category);
+            assertEquals(1.0, result.precision().orElseThrow(), category);
+            assertEquals(1.0, result.recall().orElseThrow(), category);
+            assertEquals(1.0, result.f1Score().orElseThrow(), category);
+            assertEquals(1.0, result.accuracy().orElseThrow(), category);
+            assertEquals(1.0, result.detectionCoverage().orElseThrow(), category);
+        }
+        assertTrue(persistedFindings.stream()
+                .filter(finding -> finding.getCheckType().startsWith("COOKIE_"))
+                .noneMatch(finding -> finding.getEvidence().contains("lab-session-secret")));
     }
 
     @Test
@@ -1384,7 +1647,7 @@ class ScanExecutionServiceTest {
             queries.add(query == null ? "" : query);
             String decoded = URLDecoder.decode(query == null ? "" : query, StandardCharsets.UTF_8);
             String body;
-            if (decoded.contains("' OR '1'='1") || decoded.contains("' OR '1'='2")) {
+            if (decoded.contains("' OR '1'='1")) {
                 body = "Database error: SQL syntax near query";
             } else if (decoded.contains("vscanxss")) {
                 body = "<html>" + decoded.substring(decoded.indexOf('=') + 1) + "</html>";
@@ -1451,7 +1714,7 @@ class ScanExecutionServiceTest {
         Organization organization = approvedOrganization(26L);
         Target target = approvedTarget(organization,
                 "http://127.0.0.1:" + server.getAddress().getPort()
-                        + "/?id=1&keep=a%20b&id=2&tail=x%2By&literal=a+b"
+                        + "/custom?keyboard=1&keep=a%20b&keyboard=2&tail=x%2By&literal=a+b"
                         + "&encoded=a%2Bb&space=a%20b&&flag&flag=");
         ScanJob job = approvedJob(organization, target);
         ReflectionTestUtils.setField(job, "scanType", ScanType.ZAP_ACTIVE);
@@ -1482,7 +1745,10 @@ class ScanExecutionServiceTest {
         assertEquals("HIGH", sqlFinding.getSeverity());
         assertEquals("SUSPECTED", sqlFinding.getVerificationStatus());
         assertEquals("ACTIVE_QUERY_PARAMETER", sqlFinding.getDetectionSource());
-        assertTrue(sqlFinding.getAffectedComponent().contains("[id]"));
+        assertTrue(sqlFinding.getAffectedComponent().contains("[keyboard]"));
+        assertEquals("GET", sqlFinding.getHttpMethod());
+        assertTrue(sqlFinding.getEndpointUrl().contains("?keyboard&keep"));
+        assertEquals("keyboard", sqlFinding.getParameterName());
         assertTrue(sqlFinding.getEvidence().contains("database error signature"));
         ScanFinding xssFinding = captor.getAllValues().stream()
                 .filter(finding -> "REFLECTED_XSS_POTENTIAL".equals(finding.getCheckType()))
@@ -1490,24 +1756,73 @@ class ScanExecutionServiceTest {
         assertEquals("MEDIUM", xssFinding.getSeverity());
         assertEquals("POTENTIAL", xssFinding.getVerificationStatus());
         assertEquals("ACTIVE_QUERY_PARAMETER", xssFinding.getDetectionSource());
-        assertTrue(xssFinding.getAffectedComponent().contains("[id]"));
+        assertTrue(xssFinding.getAffectedComponent().contains("[keyboard]"));
+        assertEquals("GET", xssFinding.getHttpMethod());
+        assertEquals("keyboard", xssFinding.getParameterName());
         assertTrue(xssFinding.getEvidence().contains("unique test marker"));
+        assertTrue(job.getAdaptiveCheckSummary().contains("GET_QUERY"));
+        assertTrue(job.getAdaptiveCheckSummary().contains("SQL_INJECTION, REFLECTED_XSS"));
+        assertFalse(job.getAdaptiveCheckSummary().contains("keyboard=1"));
         assertEquals(10, requests.get());
         assertEquals(10, rawQueries.size());
-        String untouchedQuery = "&keep=a%20b&id=2&tail=x%2By&literal=a+b"
+        String untouchedQuery = "&keep=a%20b&keyboard=2&tail=x%2By&literal=a+b"
                 + "&encoded=a%2Bb&space=a%20b&&flag&flag=";
-        assertEquals("id=1" + untouchedQuery, rawQueries.get(0));
+        assertEquals("keyboard=1" + untouchedQuery, rawQueries.get(0));
         assertTrue(rawQueries.subList(1, 4).stream()
-                .allMatch(query -> query.startsWith("id=")
+                .allMatch(query -> query.startsWith("keyboard=")
                         && query.endsWith(untouchedQuery)));
         assertTrue(rawQueries.subList(4, 7).stream()
-                .allMatch(query -> query.startsWith("id=1&keep=")
-                        && query.endsWith("&id=2&tail=x%2By&literal=a+b"
+                .allMatch(query -> query.startsWith("keyboard=1&keep=")
+                        && query.endsWith("&keyboard=2&tail=x%2By&literal=a+b"
                                 + "&encoded=a%2Bb&space=a%20b&&flag&flag=")));
         assertTrue(rawQueries.subList(7, 10).stream()
-                .allMatch(query -> query.startsWith("id=1&keep=a%20b&id=")
+                .allMatch(query -> query.startsWith("keyboard=1&keep=a%20b&keyboard=")
                         && query.endsWith("&tail=x%2By&literal=a+b"
                                 + "&encoded=a%2Bb&space=a%20b&&flag&flag=")));
+    }
+
+    @Test
+    void ignoresGenericDatabaseErrorsAndReflectionsInsideTextarea() throws Exception {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            String decoded = URLDecoder.decode(
+                    exchange.getRequestURI().getRawQuery(), StandardCharsets.UTF_8);
+            String body;
+            int status = 200;
+            if (decoded.contains("' OR '1'='1") || decoded.contains("' OR '1'='2")) {
+                body = "PostgreSQL server temporarily unavailable";
+                status = 500;
+            } else if (decoded.contains("vscanxss")) {
+                body = "<html><textarea>"
+                        + decoded.substring(decoded.indexOf('=') + 1)
+                        + "</textarea></html>";
+            } else {
+                body = "<html>baseline</html>";
+            }
+            byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "text/html");
+            exchange.sendResponseHeaders(status, bytes.length);
+            exchange.getResponseBody().write(bytes);
+            exchange.close();
+        });
+        server.start();
+
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        ScanFindingRepository findings = mock(ScanFindingRepository.class);
+        Organization organization = approvedOrganization(27L);
+        Target target = approvedTarget(organization,
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/?id=1");
+        ScanJob job = approvedJob(organization, target);
+        ReflectionTestUtils.setField(job, "scanType", ScanType.ZAP_ACTIVE);
+        when(jobs.findByIdForExecutionUpdate(anyLong())).thenReturn(Optional.of(job));
+
+        ScanExecutionService service = new ScanExecutionService(jobs, findings, true, null);
+        permitTestTarget(service, job);
+        service.runClaimed(27L);
+
+        verify(findings, never()).save(argThat(finding ->
+                "SQL_INJECTION_SUSPECTED".equals(finding.getCheckType())
+                        || "REFLECTED_XSS_POTENTIAL".equals(finding.getCheckType())));
     }
 
     @Test
@@ -1527,7 +1842,7 @@ class ScanExecutionServiceTest {
         server.createContext("/", exchange -> {
             getRequests.incrementAndGet();
             byte[] body = ("<html>"
-                    + "<form method=\"POST\" action=\"/search\"><input type=\"search\" name=\"q\" value=\"start\"></form>"
+                    + "<form method=\"POST\" action=\"/submit\"><input type=\"search\" name=\"entry_42\" value=\"start\"></form>"
                     + "<form method=\"POST\" action=\"/delete\"><input name=\"q\" value=\"ignored\"></form>"
                     + "<form method=\"POST\" action=\"/secret\"><input type=\"hidden\" name=\"csrf\" value=\"secret\">"
                     + "<input name=\"q\" value=\"ignored\"></form>"
@@ -1548,7 +1863,7 @@ class ScanExecutionServiceTest {
             exchange.getResponseBody().write(body);
             exchange.close();
         });
-        server.createContext("/search", exchange -> {
+        server.createContext("/submit", exchange -> {
             postRequests.incrementAndGet();
             postedPaths.add(exchange.getRequestURI().getPath());
             String decoded = URLDecoder.decode(
@@ -1556,7 +1871,7 @@ class ScanExecutionServiceTest {
                     StandardCharsets.UTF_8);
             String body;
             int status = 200;
-            if (decoded.contains("' OR '1'='1") || decoded.contains("' OR '1'='2")) {
+            if (decoded.contains("' OR '1'='1")) {
                 body = "Database error: SQL syntax near query";
                 status = 500;
             } else if (decoded.contains("vscanxss")) {
@@ -1639,7 +1954,7 @@ class ScanExecutionServiceTest {
                 null, null, null, null);
         permitTestTarget(service, job);
         ReflectionTestUtils.setField(service, "activePostFormAllowlist",
-                "http://127.0.0.1:" + server.getAddress().getPort() + "/search\n"
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/submit\n"
                         + "http://127.0.0.1:" + server.getAddress().getPort() + "/delete\n"
                         + "http://127.0.0.1:" + server.getAddress().getPort() + "/secret\n"
                         + "http://127.0.0.1:" + server.getAddress().getPort() + "/password\n"
@@ -1653,11 +1968,12 @@ class ScanExecutionServiceTest {
 
         assertEquals(ScanStatus.COMPLETED, job.getStatus(), job.getStatusMessage());
         assertEquals(1, getRequests.get());
-        assertEquals(12, postRequests.get());
+        assertEquals(11, postRequests.get(), postedPaths.toString());
         assertEquals(0, externalRequests.get());
-        assertEquals(4, postedPaths.stream().filter("/search"::equals).count());
+        assertEquals(4, postedPaths.stream().filter("/submit"::equals).count());
         assertEquals(4, postedPaths.stream().filter("/safe-search"::equals).count());
-        assertEquals(4, postedPaths.stream().filter("/redirect"::equals).count());
+        assertEquals(3, postedPaths.stream().filter("/redirect"::equals).count(),
+                "Non-HTML redirect responses should not receive reflected-XSS probes.");
         ArgumentCaptor<ScanFinding> captor = ArgumentCaptor.forClass(ScanFinding.class);
         verify(findings, atLeastOnce()).save(captor.capture());
         assertFalse(captor.getAllValues().stream().anyMatch(finding ->
@@ -1667,14 +1983,14 @@ class ScanExecutionServiceTest {
         assertTrue(captor.getAllValues().stream().anyMatch(finding ->
                 "SQL_INJECTION_SUSPECTED".equals(finding.getCheckType())
                         && "ACTIVE_POST_FORM".equals(finding.getDetectionSource())
-                        && finding.getAffectedComponent().contains("/search [q]")));
+                        && finding.getAffectedComponent().contains("/submit [entry_42]")));
         assertTrue(captor.getAllValues().stream().anyMatch(finding ->
                 "REFLECTED_XSS_POTENTIAL".equals(finding.getCheckType())
                         && "ACTIVE_POST_FORM".equals(finding.getDetectionSource())
-                        && finding.getAffectedComponent().contains("/search [q]")));
+                        && finding.getAffectedComponent().contains("/submit [entry_42]")));
         assertTrue(captor.getAllValues().stream().anyMatch(finding ->
                 "MISSING_CONTENT_SECURITY_POLICY".equals(finding.getCheckType())
-                        && finding.getAffectedComponent().contains("/search [Content-Security-Policy]")));
+                        && finding.getAffectedComponent().contains("/submit [Content-Security-Policy]")));
     }
 
     @Test
@@ -1786,8 +2102,12 @@ class ScanExecutionServiceTest {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/", exchange -> {
             exchange.getResponseHeaders().add("Content-Type", "text/html");
-            exchange.getResponseHeaders().add("Set-Cookie", "owasp-locale=en; Path=/");
-            exchange.getResponseHeaders().add("Set-Cookie", "owasp-locale=en; Path=/");
+            exchange.getResponseHeaders().add("Set-Cookie",
+                    "owasp-locale=en; Path=/prefs; Expires=Sun, 06 Nov 1994 08:49:37 GMT; "
+                            + "Max-Age=3600; Domain=example.test");
+            exchange.getResponseHeaders().add("Set-Cookie",
+                    "owasp-locale=en; Path=/prefs; Expires=Sun, 06 Nov 1994 08:49:37 GMT; "
+                            + "Max-Age=3600; Domain=example.test");
             byte[] body = "<a href=\"/child\">child</a>".getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(200, body.length);
             exchange.getResponseBody().write(body);
@@ -1795,7 +2115,9 @@ class ScanExecutionServiceTest {
         });
         server.createContext("/child", exchange -> {
             exchange.getResponseHeaders().add("Content-Type", "text/html");
-            exchange.getResponseHeaders().add("Set-Cookie", "owasp-locale=en; Path=/");
+            exchange.getResponseHeaders().add("Set-Cookie",
+                    "owasp-locale=en; Path=/prefs; Expires=Sun, 06 Nov 1994 08:49:37 GMT; "
+                            + "Max-Age=3600; Domain=example.test");
             byte[] body = "<html><body>child</body></html>".getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(200, body.length);
             exchange.getResponseBody().write(body);
@@ -1828,16 +2150,149 @@ class ScanExecutionServiceTest {
         assertTrue(cookieFindings.stream().allMatch(finding -> "LOW".equals(finding.getSeverity())
                 && "OBSERVED".equals(finding.getVerificationStatus())
                 && finding.getRationale().contains("exploitability was not verified")
-                && !finding.getEvidence().contains("owasp-locale=en")));
+                && !finding.getEvidence().contains("owasp-locale=en")
+                && finding.getEvidence().contains("Expires=past date observed")
+                && finding.getEvidence().contains("Max-Age=positive numeric value observed")
+                && finding.getEvidence().contains("Domain scope=DOMAIN_SCOPE_MISMATCH")
+                && finding.getEvidence().contains("Path scope=EXPLICIT_PATH")
+                && finding.getEvidence().contains("lifetime classification=MAX_AGE_POSITIVE")
+                && finding.getEvidence().contains("session semantics were not inferred")),
+                cookieFindings.stream().map(ScanFinding::getEvidence).toList().toString());
         assertEquals(2, cookieFindings.stream().map(ScanFinding::getAffectedComponent).distinct().count());
         assertFalse(cookieFindings.stream()
                 .anyMatch(finding -> "COOKIE_MISSING_SECURE".equals(finding.getCheckType())),
                 "Secure absence is not reported for an HTTP response.");
+        List<ScanFinding> insecureTransportFindings = captor.getAllValues().stream()
+                .filter(finding -> "COOKIE_SET_OVER_HTTP".equals(finding.getCheckType()))
+                .toList();
+        assertEquals(2, insecureTransportFindings.size());
+        assertTrue(insecureTransportFindings.stream().allMatch(finding ->
+                "LOW".equals(finding.getSeverity())
+                        && "OBSERVED".equals(finding.getVerificationStatus())
+                        && finding.getEvidence().contains("received over HTTP")
+                        && !finding.getEvidence().contains("owasp-locale=en")
+                        && finding.getEvidence().contains("Expires=past date observed")));
         assertEquals(2, job.getDiscoveredPageCount());
         assertEquals(2, job.getVisitedPageCount());
         assertEquals(2, job.getTestedPassivePageCount());
         assertEquals("COMPLETED", job.getNativeEngineStatus());
         assertEquals("NOT_CONFIGURED", job.getZapEngineStatus());
+    }
+
+    @Test
+    void cookieObservationsTreatConflictingScopeAndInvalidLifetimeAsAmbiguous() throws Exception {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            exchange.getResponseHeaders().add("Content-Type", "text/html");
+            exchange.getResponseHeaders().add("Set-Cookie",
+                    "preference=do-not-retain; Domain=first.example; Domain=second.example; "
+                            + "Path=/; Path=/private; Max-Age=invalid; Expires=not-a-date");
+            exchange.getResponseHeaders().add("Set-Cookie", "expired=private-value; Max-Age=0; Path=/");
+            exchange.getResponseHeaders().add("Set-Cookie", "deleted=private-value; Max-Age=-1; Path=/");
+            byte[] body = "<html><body>fixture</body></html>".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.start();
+
+        Organization organization = approvedOrganization(109L);
+        Target target = approvedTarget(organization,
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/");
+        ScanJob job = approvedJob(organization, target);
+        setId(job, 109L);
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        ScanFindingRepository findings = mock(ScanFindingRepository.class);
+        when(jobs.findByIdForExecutionUpdate(109L)).thenReturn(Optional.of(job));
+
+        ScanExecutionService service = new ScanExecutionService(jobs, findings, false, null);
+        permitTestTarget(service, job);
+        service.runClaimed(109L);
+
+        ArgumentCaptor<ScanFinding> captor = ArgumentCaptor.forClass(ScanFinding.class);
+        verify(findings, atLeastOnce()).save(captor.capture());
+        ScanFinding observation = captor.getAllValues().stream()
+                .filter(finding -> "COOKIE_SET_OVER_HTTP".equals(finding.getCheckType()))
+                .findFirst().orElseThrow();
+        assertTrue(observation.getEvidence().contains(
+                "lifetime classification=UNKNOWN_INVALID_LIFETIME_ATTRIBUTE"));
+        assertTrue(observation.getEvidence().contains("Domain scope=AMBIGUOUS"), observation.getEvidence());
+        assertTrue(observation.getEvidence().contains("Path scope=AMBIGUOUS"));
+        assertTrue(observation.getEvidence().contains("Expires=invalid date"));
+        assertTrue(observation.getEvidence().contains("Max-Age=invalid numeric value"));
+        assertFalse(observation.getEvidence().contains("do-not-retain"));
+        assertFalse(observation.getEvidence().contains("first.example"));
+        assertFalse(observation.getEvidence().contains("/private"));
+        assertTrue(observation.getEvidence().contains("duplicate attributes=true"));
+        List<ScanFinding> expiredCookieObservations = captor.getAllValues().stream()
+                .filter(finding -> "COOKIE_SET_OVER_HTTP".equals(finding.getCheckType()))
+                .filter(finding -> finding.getAffectedComponent().contains("Set-Cookie:expired")
+                        || finding.getAffectedComponent().contains("Set-Cookie:deleted"))
+                .toList();
+        assertEquals(2, expiredCookieObservations.size());
+        assertTrue(expiredCookieObservations.stream().allMatch(finding ->
+                finding.getEvidence().contains("lifetime classification=MAX_AGE_EXPIRED_OR_DELETION")));
+        assertTrue(captor.getAllValues().stream()
+                .filter(finding -> finding.getCheckType().startsWith("COOKIE_"))
+                .noneMatch(finding -> finding.getEvidence().contains("private-value")));
+    }
+
+    @Test
+    void cookieAssessmentClassifiesSameSiteAndMalformedSecurityAttributesWithoutValues() throws Exception {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            exchange.getResponseHeaders().add("Content-Type", "text/html");
+            exchange.getResponseHeaders().add("Set-Cookie",
+                    "cross-site=never-store; SameSite=None; Path=/");
+            exchange.getResponseHeaders().add("Set-Cookie",
+                    "invalid-site=never-store; SameSite=Unexpected; Path=/");
+            exchange.getResponseHeaders().add("Set-Cookie",
+                    "ambiguous=never-store; Secure=yes; HttpOnly=yes; SameSite=Lax; SameSite=Strict; Path=bad");
+            exchange.getResponseHeaders().add("Set-Cookie",
+                    "valid=never-store; Secure; HttpOnly; SameSite=Strict; Path=/");
+            byte[] body = "<html><body>cookie fixture</body></html>".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.start();
+
+        Organization organization = approvedOrganization(111L);
+        Target target = approvedTarget(organization,
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/");
+        ScanJob job = approvedJob(organization, target);
+        setId(job, 111L);
+        ScanJobRepository jobs = mock(ScanJobRepository.class);
+        ScanFindingRepository findings = mock(ScanFindingRepository.class);
+        when(jobs.findByIdForExecutionUpdate(111L)).thenReturn(Optional.of(job));
+        ScanExecutionService service = new ScanExecutionService(jobs, findings, false, null);
+        permitTestTarget(service, job);
+
+        service.runClaimed(111L);
+
+        ArgumentCaptor<ScanFinding> captor = ArgumentCaptor.forClass(ScanFinding.class);
+        verify(findings, atLeastOnce()).save(captor.capture());
+        List<ScanFinding> persisted = captor.getAllValues();
+        assertTrue(persisted.stream().anyMatch(finding ->
+                "COOKIE_SAMESITE_NONE_WITHOUT_SECURE".equals(finding.getCheckType())));
+        assertTrue(persisted.stream().anyMatch(finding ->
+                "COOKIE_INVALID_SAMESITE".equals(finding.getCheckType())));
+        assertTrue(persisted.stream().anyMatch(finding ->
+                "COOKIE_ATTRIBUTE_AMBIGUOUS".equals(finding.getCheckType())));
+        assertFalse(persisted.stream().anyMatch(finding ->
+                "COOKIE_MISSING_HTTP_ONLY".equals(finding.getCheckType())
+                        && finding.getAffectedComponent().contains("Set-Cookie:valid]")));
+        assertFalse(persisted.stream().anyMatch(finding ->
+                finding.getCheckType().startsWith("COOKIE_")
+                        && finding.getEvidence().contains("never-store")),
+                persisted.stream().map(finding -> finding.getCheckType() + ": " + finding.getEvidence()).toList()
+                        .toString());
+        ScanFinding observed = persisted.stream()
+                .filter(finding -> "COOKIE_SECURITY_OBSERVED".equals(finding.getCheckType())
+                        && finding.getAffectedComponent().contains("Set-Cookie:valid"))
+                .findFirst().orElseThrow();
+        assertTrue(observed.getEvidence().contains("SameSite=Strict"));
+        assertTrue(observed.getEvidence().contains("session-like cookie name=false"));
     }
 
     @Test
@@ -1850,7 +2305,7 @@ class ScanExecutionServiceTest {
         assertTrue(summary.zapRequested());
         assertEquals("NOT_STARTED", summary.zapEngineStatus());
         assertEquals(NvdLookupStatus.NOT_REQUESTED, summary.nvdLookupStatus());
-        assertTrue(summary.checksInScope().contains("Set-Cookie attribute observations (Secure assessed only for HTTPS responses)"));
+        assertTrue(summary.checksInScope().contains("Set-Cookie attribute and HTTP transport observations"));
         assertTrue(summary.checksOutOfScope().contains("SQL injection and reflected XSS active probes"));
         assertTrue(summary.checksInScope().contains("OWASP ZAP spider and passive analysis"));
         assertFalse(summary.checksOutOfScope().contains("OWASP ZAP spider or passive analysis"));

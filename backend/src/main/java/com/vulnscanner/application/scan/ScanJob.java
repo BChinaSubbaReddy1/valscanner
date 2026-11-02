@@ -125,6 +125,18 @@ public class ScanJob {
     @Column(name = "tested_passive_page_count")
     private Integer testedPassivePageCount;
 
+    @Column(name = "adaptive_check_summary", columnDefinition = "TEXT")
+    private String adaptiveCheckSummary;
+
+    @Column(name = "zap_rule_inventory_status", nullable = false, length = 24)
+    private String zapRuleInventoryStatus = "NOT_CAPTURED";
+
+    @Column(name = "zap_passive_enabled_rules", columnDefinition = "TEXT")
+    private String zapPassiveEnabledRules;
+
+    @Column(name = "zap_active_enabled_rules", columnDefinition = "TEXT")
+    private String zapActiveEnabledRules;
+
     protected ScanJob() {
     }
 
@@ -241,6 +253,10 @@ public class ScanJob {
         discoveredPageCount = source.discoveredPageCount;
         visitedPageCount = source.visitedPageCount;
         testedPassivePageCount = source.testedPassivePageCount;
+        adaptiveCheckSummary = source.adaptiveCheckSummary;
+        zapRuleInventoryStatus = source.zapRuleInventoryStatus;
+        zapPassiveEnabledRules = source.zapPassiveEnabledRules;
+        zapActiveEnabledRules = source.zapActiveEnabledRules;
     }
 
     public void updateNativeEngineStatus(String nextStatus) {
@@ -300,6 +316,52 @@ public class ScanJob {
         discoveredPageCount = discovered;
         visitedPageCount = visited;
         testedPassivePageCount = passiveTested;
+    }
+
+    public void recordAdaptiveCheckSelection(String endpoint, String inputType, int parameterCount,
+                                             String selectedChecks, String rationale) {
+        if (inputType == null || inputType.isBlank() || parameterCount < 1
+                || selectedChecks == null || rationale == null) {
+            throw new IllegalArgumentException("Adaptive selection evidence is incomplete");
+        }
+        String safeEndpoint = endpoint == null || endpoint.isBlank() ? "endpoint unavailable" : endpoint;
+        String line = inputType + " " + safeEndpoint + " (observed inputs=" + parameterCount
+                + ") -> " + (selectedChecks.isBlank() ? "no active checks" : selectedChecks)
+                + "; " + rationale.replace('\r', ' ').replace('\n', ' ');
+        if (adaptiveCheckSummary != null && adaptiveCheckSummary.contains(inputType + " " + safeEndpoint + " (")) {
+            return;
+        }
+        String next = adaptiveCheckSummary == null || adaptiveCheckSummary.isBlank()
+                ? line : adaptiveCheckSummary + "\n" + line;
+        adaptiveCheckSummary = next.length() <= 8000 ? next : next.substring(0, 8000);
+    }
+
+    public void recordZapRuleInventory(String inventoryStatus, java.util.List<String> passiveRules,
+                                       java.util.List<String> activeRules) {
+        if (!java.util.Set.of("AVAILABLE", "UNAVAILABLE").contains(inventoryStatus)) {
+            throw new IllegalArgumentException("Invalid ZAP rule inventory status");
+        }
+        zapRuleInventoryStatus = inventoryStatus;
+        zapPassiveEnabledRules = inventoryStatus.equals("AVAILABLE")
+                ? formatRuleInventory(passiveRules) : null;
+        zapActiveEnabledRules = inventoryStatus.equals("AVAILABLE")
+                ? formatRuleInventory(activeRules) : null;
+    }
+
+    private String formatRuleInventory(java.util.List<String> rules) {
+        if (rules == null || rules.size() > 200) {
+            throw new IllegalArgumentException("ZAP rule inventory exceeds its storage limit");
+        }
+        String inventory = rules.stream()
+                .filter(java.util.Objects::nonNull)
+                .map(rule -> rule.replace('\r', ' ').replace('\n', ' ').trim())
+                .filter(rule -> !rule.isBlank())
+                .map(rule -> rule.length() <= 120 ? rule : rule.substring(0, 120))
+                .collect(java.util.stream.Collectors.joining("\n"));
+        if (inventory.length() > 24000) {
+            throw new IllegalArgumentException("ZAP rule inventory exceeds its storage limit");
+        }
+        return inventory;
     }
 
     private String requireEngineStatus(String value) {
@@ -389,4 +451,12 @@ public class ScanJob {
     public Integer getDiscoveredPageCount() { return discoveredPageCount; }
     public Integer getVisitedPageCount() { return visitedPageCount; }
     public Integer getTestedPassivePageCount() { return testedPassivePageCount; }
+    public String getAdaptiveCheckSummary() { return adaptiveCheckSummary; }
+    public String getZapRuleInventoryStatus() { return zapRuleInventoryStatus; }
+    public java.util.List<String> getZapPassiveEnabledRules() { return ruleLines(zapPassiveEnabledRules); }
+    public java.util.List<String> getZapActiveEnabledRules() { return ruleLines(zapActiveEnabledRules); }
+
+    private java.util.List<String> ruleLines(String value) {
+        return value == null || value.isBlank() ? java.util.List.of() : value.lines().toList();
+    }
 }

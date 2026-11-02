@@ -88,8 +88,9 @@ public class ZapClientService {
                     httpClient, request, MAX_API_RESPONSE_BYTES, readTimeout);
             if (response.statusCode() == 401 || response.statusCode() == 403) {
                 log.warn("OWASP ZAP health check authentication failed (HTTP {})", response.statusCode());
-                return AvailabilityStatus.UNAVAILABLE;
+                return AvailabilityStatus.AUTHENTICATION_FAILED;
             }
+
             if (response.statusCode() != 200) {
                 log.warn("OWASP ZAP health check returned HTTP {}", response.statusCode());
                 return AvailabilityStatus.UNAVAILABLE;
@@ -112,6 +113,35 @@ public class ZapClientService {
             log.warn("OWASP ZAP health check was interrupted");
             return AvailabilityStatus.UNAVAILABLE;
         }
+    }
+
+    public List<String> getEnabledScannerRules(boolean active) throws IOException, InterruptedException {
+        String endpoint = active ? "/JSON/ascan/view/scanners/" : "/JSON/pscan/view/scanners/";
+        JsonNode response = executeRequest(endpoint);
+        JsonNode scanners = response.get("scanners");
+        if (scanners == null || !scanners.isArray() || scanners.size() > 200) {
+            throw new IOException("ZAP scanner rule inventory response is invalid");
+        }
+        List<String> rules = new ArrayList<>();
+        for (JsonNode scanner : scanners) {
+            JsonNode enabled = scanner.get("enabled");
+            boolean isEnabled = enabled != null
+                    && (enabled.asBoolean(false) || "true".equalsIgnoreCase(enabled.asText()));
+            if (!isEnabled) {
+                continue;
+            }
+            String id = scanner.path("id").asText("");
+            String name = scanner.path("name").asText("");
+            if (!id.matches("\\d{1,8}") || name.isBlank()) {
+                throw new IOException("ZAP scanner rule inventory contains an invalid enabled rule");
+            }
+            String safeName = name.replace('\r', ' ').replace('\n', ' ').trim();
+            if (safeName.length() > 100) {
+                safeName = safeName.substring(0, 100);
+            }
+            rules.add(id + ": " + safeName);
+        }
+        return List.copyOf(rules);
     }
 
     public String startSpider(String targetUrl) throws IOException, InterruptedException {
@@ -281,7 +311,8 @@ public class ZapClientService {
                         node.path("reference").asText(""),
                         node.path("cweid").asText(""),
                         node.path("wascid").asText(""),
-                        alertId
+                        alertId,
+                        node.path("method").asText("")
                 ));
             }
             if (alertsNode.size() < ALERT_PAGE_SIZE) {
@@ -356,6 +387,7 @@ public class ZapClientService {
     public enum AvailabilityStatus {
         AVAILABLE,
         UNAVAILABLE,
+        AUTHENTICATION_FAILED,
         TIMED_OUT
     }
 }

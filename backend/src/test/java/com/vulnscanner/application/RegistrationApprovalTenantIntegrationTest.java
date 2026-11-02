@@ -3,6 +3,7 @@ package com.vulnscanner.application;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.vulnscanner.application.audit.AuditEventRepository;
+import com.vulnscanner.application.auth.PasswordResetEmailService;
 import com.vulnscanner.application.organization.*;
 import com.vulnscanner.application.role.*;
 import com.vulnscanner.application.user.*;
@@ -11,6 +12,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.http.MediaType;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.context.ActiveProfiles;
@@ -24,6 +26,7 @@ import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.nullValue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
+import static org.mockito.Mockito.when;
 
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -39,9 +42,11 @@ class RegistrationApprovalTenantIntegrationTest {
     @Autowired private OrganizationRepository organizationRepository;
     @Autowired private PasswordEncoder passwordEncoder;
     @Autowired private AuditEventRepository auditEventRepository;
+    @MockBean private PasswordResetEmailService passwordResetEmailService;
 
     @BeforeEach
     void initializeRoles() {
+        when(passwordResetEmailService.isConfigured()).thenReturn(true);
         for (RoleName name : new RoleName[]{
                 RoleName.SUPER_ADMIN, RoleName.ADMIN, RoleName.SECURITY_ANALYST}) {
             roleRepository.findByName(name).orElseGet(() -> roleRepository.save(new Role(name)));
@@ -89,6 +94,31 @@ class RegistrationApprovalTenantIntegrationTest {
     }
 
     @Test
+    void registrationEnforcesEightCharacterMinimumAndAcceptsEightAndLongerPasswords() throws Exception {
+        mockMvc.perform(post("/api/auth/register").contentType(MediaType.APPLICATION_JSON)
+                        .content(registrationJson("short-password@example.com", "ADMIN", null,
+                                "Short Password Org", "Pass123")))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.message").value(
+                        "Validation failed: Password must be at least 8 characters long."));
+        assertFalse(userRepository.existsByEmail("short-password@example.com"));
+
+        mockMvc.perform(post("/api/auth/register").contentType(MediaType.APPLICATION_JSON)
+                        .content(registrationJson("eight-password@example.com", "ADMIN", null,
+                                "Eight Password Org", "Pass1234")))
+                .andExpect(status().isCreated());
+        User eightCharacterUser = userRepository.findByEmail("eight-password@example.com").orElseThrow();
+        assertTrue(passwordEncoder.matches("Pass1234", eightCharacterUser.getPassword()));
+
+        mockMvc.perform(post("/api/auth/register").contentType(MediaType.APPLICATION_JSON)
+                        .content(registrationJson("long-password@example.com", "ADMIN", null,
+                                "Long Password Org", "Password123!")))
+                .andExpect(status().isCreated());
+        User longerPasswordUser = userRepository.findByEmail("long-password@example.com").orElseThrow();
+        assertTrue(passwordEncoder.matches("Password123!", longerPasswordUser.getPassword()));
+    }
+
+    @Test
     void onlySuperAdminCanApproveAndApprovalActivatesOnlyTheSubmittedAdministrator() throws Exception {
         mockMvc.perform(post("/api/auth/register").contentType(MediaType.APPLICATION_JSON)
                         .content(registrationJson("ada@example.com", "ADMIN", null, "Acme")))
@@ -129,7 +159,7 @@ class RegistrationApprovalTenantIntegrationTest {
         assertEquals(OrganizationStatus.APPROVED, org.getStatus());
         assertEquals(UserStatus.ACTIVE, applicant.getStatus());
         assertEquals(UserStatus.ACTIVE, otherAdmin.getStatus());
-        assertEquals(200, loginStatus("ada@example.com"));
+        assertEquals(202, loginStatus("ada@example.com"));
         assertNull(superAdmin.getOrganization());
         mockMvc.perform(get("/api/organizations/{id}/members", org.getId())
                         .header("Authorization", "Bearer " + superToken))
@@ -221,7 +251,6 @@ class RegistrationApprovalTenantIntegrationTest {
         assertEquals(UserStatus.ACTIVE, analyst.getStatus());
         assertTrue(analyst.getRoles().stream().anyMatch(role -> role.getName() == RoleName.SECURITY_ANALYST));
         String analystToken = login(analyst.getEmail());
-        assertEquals(200, loginStatus(analyst.getEmail()));
         mockMvc.perform(get("/api/users/me").header("Authorization", "Bearer " + analystToken))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.accountStatus").value("ACTIVE"))
@@ -412,24 +441,24 @@ class RegistrationApprovalTenantIntegrationTest {
     }
 
     private int loginStatus(String email) throws Exception {
-        return mockMvc.perform(post("/api/auth/login").contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"email\":\"" + email + "\",\"password\":\"" + PASSWORD + "\"}"))
-                .andReturn().getResponse().getStatus();
+        return LoginOtpTestSupport.loginStatus(mockMvc, email, PASSWORD);
     }
 
     private String login(String email) throws Exception {
-        String body = mockMvc.perform(post("/api/auth/login").contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"email\":\"" + email + "\",\"password\":\"" + PASSWORD + "\"}"))
-                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
-        JsonNode response = objectMapper.readTree(body);
-        return response.path("data").path("token").asText();
+        return LoginOtpTestSupport.completeLogin(
+                mockMvc, objectMapper, passwordResetEmailService, email, PASSWORD);
     }
 
     private String registrationJson(String email, String role, Long organizationId, String organizationName) {
+        return registrationJson(email, role, organizationId, organizationName, PASSWORD);
+    }
+
+    private String registrationJson(String email, String role, Long organizationId, String organizationName,
+                                    String password) {
         String orgId = organizationId == null ? "" : ",\"organizationId\":" + organizationId;
         String orgName = organizationName == null ? "" : ",\"organizationName\":\"" + organizationName + "\"";
         return "{\"firstName\":\"Test\",\"lastName\":\"User\",\"email\":\"" + email
-                + "\",\"password\":\"" + PASSWORD + "\",\"role\":\"" + role + "\"" + orgId + orgName + "}";
+                + "\",\"password\":\"" + password + "\",\"role\":\"" + role + "\"" + orgId + orgName + "}";
     }
 
     private Organization approvedOrganization(String name) {

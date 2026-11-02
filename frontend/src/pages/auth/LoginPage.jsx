@@ -19,7 +19,7 @@ export default function LoginPage() {
     event.preventDefault();
 
     if (!form.identifier.trim() || !form.password.trim()) {
-      setError('Both email or username and password are required.');
+      setError('Both email and password are required.');
       return;
     }
 
@@ -27,12 +27,21 @@ export default function LoginPage() {
     setError('');
 
     try {
-      await login({
+      const response = await login({
         email: form.identifier.trim(),
         password: form.password,
       });
-      const redirectTo = location.state?.from || '/';
-      navigate(redirectTo, { replace: true });
+      const challenge = response?.data;
+      if (!challenge?.challengeToken || !challenge?.expiresAt) {
+        throw new Error('Login verification could not be started. Please try again.');
+      }
+      navigate('/verify-login-otp', {
+        replace: true,
+        state: {
+          ...challenge,
+          redirectTo: location.state?.from || '/',
+        },
+      });
     } catch (requestError) {
       setError(requestError.message || 'Unable to sign in. Please verify your credentials.');
     } finally {
@@ -49,14 +58,14 @@ export default function LoginPage() {
 
         <form onSubmit={handleSubmit} className="form-grid" noValidate>
           <label>
-            Email or username
+            Email
             <input
               type="text"
               name="identifier"
               value={form.identifier}
               onChange={handleChange}
               placeholder="name@company.com"
-              aria-label="Email or username"
+              aria-label="Email"
             />
           </label>
 

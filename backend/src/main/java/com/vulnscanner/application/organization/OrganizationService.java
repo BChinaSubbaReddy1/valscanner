@@ -2,6 +2,8 @@ package com.vulnscanner.application.organization;
 
 import com.vulnscanner.application.audit.AuditEvent;
 import com.vulnscanner.application.audit.AuditEventRepository;
+import com.vulnscanner.application.dashboard.DashboardAnalyticsResponse;
+import com.vulnscanner.application.dashboard.DashboardAnalyticsService;
 import com.vulnscanner.application.role.RoleName;
 import com.vulnscanner.application.user.User;
 import com.vulnscanner.application.user.UserRepository;
@@ -38,19 +40,22 @@ public class OrganizationService {
     private final TargetRepository targetRepository;
     private final ScanJobRepository scanJobRepository;
     private final ScanFindingRepository scanFindingRepository;
+    private final DashboardAnalyticsService dashboardAnalyticsService;
 
     public OrganizationService(OrganizationRepository organizationRepository,
                                UserRepository userRepository,
                                AuditEventRepository auditEventRepository,
                                TargetRepository targetRepository,
                                ScanJobRepository scanJobRepository,
-                               ScanFindingRepository scanFindingRepository) {
+                               ScanFindingRepository scanFindingRepository,
+                               DashboardAnalyticsService dashboardAnalyticsService) {
         this.organizationRepository = organizationRepository;
         this.userRepository = userRepository;
         this.auditEventRepository = auditEventRepository;
         this.targetRepository = targetRepository;
         this.scanJobRepository = scanJobRepository;
         this.scanFindingRepository = scanFindingRepository;
+        this.dashboardAnalyticsService = dashboardAnalyticsService;
     }
 
     @Transactional
@@ -249,6 +254,18 @@ public class OrganizationService {
                 organizationRepository.countByStatus(OrganizationStatus.APPROVED),
                 organizationRepository.countByStatus(OrganizationStatus.REJECTED),
                 organizationRepository.countByStatus(OrganizationStatus.SUSPENDED));
+    }
+
+    @Transactional(readOnly = true)
+    public DashboardAnalyticsResponse getDashboardAnalytics(int days) {
+        Organization organization = requireOrganizationAdmin();
+        return dashboardAnalyticsService.organization(organization.getId(), days);
+    }
+
+    @Transactional(readOnly = true)
+    public DashboardAnalyticsResponse getPlatformDashboardAnalytics(int days) {
+        requireSuperAdmin();
+        return dashboardAnalyticsService.platform(days);
     }
 
     @Transactional(readOnly = true)

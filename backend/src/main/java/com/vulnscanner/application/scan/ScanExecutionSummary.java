@@ -16,8 +16,13 @@ public record ScanExecutionSummary(
         Integer discoveredPageCount,
         Integer visitedPageCount,
         Integer testedPassivePageCount,
+        List<String> adaptiveCheckSelections,
         List<String> checksInScope,
-        List<String> checksOutOfScope
+        List<String> checksOutOfScope,
+        String resultCompleteness,
+        String zapRuleInventoryStatus,
+        List<String> zapPassiveEnabledRules,
+        List<String> zapActiveEnabledRules
 ) {
     public static ScanExecutionSummary from(ScanJob job) {
         List<String> included;
@@ -26,7 +31,7 @@ public record ScanExecutionSummary(
             case PASSIVE_HEADERS -> {
                 included = List.of(
                         "Native response security-header checks",
-                        "Set-Cookie attribute observations (Secure assessed only for HTTPS responses)",
+                        "Set-Cookie attribute and HTTP transport observations",
                         "Server and X-Powered-By disclosure checks",
                         "NVD keyword-candidate enrichment when configured and version metadata is detected",
                         "OWASP ZAP spider and passive analysis"
@@ -75,8 +80,25 @@ public record ScanExecutionSummary(
                 job.getDiscoveredPageCount(),
                 job.getVisitedPageCount(),
                 job.getTestedPassivePageCount(),
+                job.getAdaptiveCheckSummary() == null || job.getAdaptiveCheckSummary().isBlank()
+                        ? List.of() : job.getAdaptiveCheckSummary().lines().toList(),
                 included,
-                excluded
+                excluded,
+                resultCompleteness(job),
+                job.getZapRuleInventoryStatus(),
+                job.getZapPassiveEnabledRules(),
+                job.getZapActiveEnabledRules()
         );
+    }
+
+    private static String resultCompleteness(ScanJob job) {
+        if (job.getStatus() != ScanStatus.COMPLETED) {
+            return "INCOMPLETE";
+        }
+        if (!"COMPLETED".equals(job.getNativeEngineStatus())
+                || (job.isZapRequested() && !"COMPLETED".equals(job.getZapEngineStatus()))) {
+            return "PARTIAL";
+        }
+        return "FULL";
     }
 }

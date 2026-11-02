@@ -4,53 +4,68 @@ import com.vulnscanner.application.audit.AuditEventRepository;
 import com.vulnscanner.application.organization.OrganizationRepository;
 import com.vulnscanner.application.role.RoleRepository;
 import com.vulnscanner.application.security.JwtService;
+import com.vulnscanner.application.user.PasswordResetChallengeRepository;
+import com.vulnscanner.application.user.PasswordResetTokenRepository;
 import com.vulnscanner.application.user.UserRepository;
 import org.junit.jupiter.api.Test;
-import org.springframework.http.HttpStatus;
-import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.crypto.password.PasswordEncoder;
-import org.springframework.web.server.ResponseStatusException;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.Mockito.*;
 
 class AuthPasswordResetTest {
 
     @Test
-    void resetRequestsFailClearlyWhenNoDeliveryServiceExists() {
+    void resetRequestsFailSafelyAndDoNotLookUpAccountsWhenDeliveryIsDisabled() {
         UserRepository users = mock(UserRepository.class);
         PasswordEncoder encoder = mock(PasswordEncoder.class);
-        AuthService service = service(users, encoder);
+        PasswordResetEmailService emailService = mock(PasswordResetEmailService.class);
+        when(emailService.isConfigured()).thenReturn(false);
+        AuthService service = service(users, encoder, emailService);
 
-        ResponseStatusException failure = assertThrows(ResponseStatusException.class,
-                () -> service.requestPasswordReset(new ForgotPasswordRequest("user@example.invalid")));
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> service.requestPasswordReset(
+                        new ForgotPasswordRequest("user@example.invalid"), "192.0.2.1"));
 
-        assertEquals(HttpStatus.SERVICE_UNAVAILABLE, failure.getStatusCode());
+        assertEquals("Password reset email is temporarily unavailable; contact support.", failure.getMessage());
         verifyNoInteractions(users, encoder);
     }
 
     @Test
-    void resetTokensAreNotAcceptedOrPersistedWithoutDeliverySupport() {
+    void passwordResetRequiresAValidVerifiedResetCapability() {
         UserRepository users = mock(UserRepository.class);
         PasswordEncoder encoder = mock(PasswordEncoder.class);
-        AuthService service = service(users, encoder);
+        PasswordResetChallengeRepository challenges = mock(PasswordResetChallengeRepository.class);
+        when(challenges.findByResetTokenHash(anyString())).thenReturn(java.util.Optional.empty());
+        AuthService service = service(users, encoder, mock(PasswordResetEmailService.class), challenges);
 
-        ResponseStatusException failure = assertThrows(ResponseStatusException.class,
+        assertThrows(IllegalArgumentException.class,
                 () -> service.resetPassword(new ResetPasswordRequest("raw-token", "long-enough-password")));
 
-        assertEquals(HttpStatus.SERVICE_UNAVAILABLE, failure.getStatusCode());
-        verifyNoInteractions(users, encoder);
+        verify(users, never()).save(any());
+        verify(encoder, never()).encode(anyString());
     }
 
-    private AuthService service(UserRepository users, PasswordEncoder encoder) {
+    private AuthService service(UserRepository users, PasswordEncoder encoder,
+                                PasswordResetEmailService emailService) {
+        return service(users, encoder, emailService, mock(PasswordResetChallengeRepository.class));
+    }
+
+    private AuthService service(UserRepository users, PasswordEncoder encoder,
+                                PasswordResetEmailService emailService,
+                                PasswordResetChallengeRepository challenges) {
         return new AuthService(
-                mock(AuthenticationManager.class),
                 users,
                 encoder,
                 mock(RoleRepository.class),
                 mock(OrganizationRepository.class),
                 mock(AuditEventRepository.class),
-                mock(JwtService.class));
+                mock(JwtService.class),
+                challenges,
+                mock(PasswordResetTokenRepository.class),
+                emailService,
+                new PasswordResetRateLimiter(),
+                java.time.Clock.systemUTC());
     }
 }

@@ -1,5 +1,6 @@
 package com.vulnscanner.application.common;
 
+import com.vulnscanner.application.auth.RateLimitExceededException;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.http.HttpStatus;
@@ -53,6 +54,12 @@ public class ApiExceptionHandler {
     public ResponseEntity<ErrorResponse> handleAccessDenied(
             AccessDeniedException exception, HttpServletRequest request) {
         return response(HttpStatus.FORBIDDEN, "Access is denied", request);
+    }
+
+    @ExceptionHandler(RateLimitExceededException.class)
+    public ResponseEntity<ErrorResponse> handleRateLimitExceeded(
+            RateLimitExceededException exception, HttpServletRequest request) {
+        return response(HttpStatus.TOO_MANY_REQUESTS, RateLimitExceededException.MESSAGE, request);
     }
 
     @ExceptionHandler(IllegalArgumentException.class)

@@ -1,6 +1,17 @@
-import { NavLink, Outlet, useNavigate } from 'react-router-dom';
+import { useEffect } from 'react';
+import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../auth/useAuth';
 import { getRoleLabel, hasRole } from '../utils/permissions';
+
+function isNavLinkActive(link, location) {
+  if (link.hash) {
+    return location.pathname === '/analyst/workspace' && location.hash === link.hash;
+  }
+  if (link.exact) {
+    return location.pathname === link.to && !location.hash;
+  }
+  return location.pathname === link.to || location.pathname.startsWith(`${link.to}/`);
+}
 
 function displayName(user) {
   return user?.displayName || user?.fullName || user?.name ||
@@ -9,6 +20,7 @@ function displayName(user) {
 
 export default function AppLayout() {
   const { user, logout } = useAuth();
+  const location = useLocation();
   const navigate = useNavigate();
 
   const navLinks = [
@@ -27,11 +39,16 @@ export default function AppLayout() {
 
   if (hasRole(user, 'SECURITY_ANALYST')) {
     navLinks.push({ label: 'Analyst workspace', to: '/analyst/workspace', exact: true });
-    navLinks.push({ label: 'Approved targets', to: '/analyst/workspace#targets' });
-    navLinks.push({ label: 'Request scan', to: '/analyst/workspace#request-scan' });
-    navLinks.push({ label: 'Scan history', to: '/analyst/workspace#history' });
-    navLinks.push({ label: 'Findings', to: '/analyst/workspace#findings' });
+    navLinks.push({ label: 'Approved targets', to: '/analyst/workspace#targets', hash: '#targets' });
+    navLinks.push({ label: 'Request scan', to: '/analyst/workspace#request-scan', hash: '#request-scan' });
+    navLinks.push({ label: 'Scan history', to: '/analyst/workspace#history', hash: '#history' });
+    navLinks.push({ label: 'Findings', to: '/analyst/workspace#findings', hash: '#findings' });
   }
+
+  useEffect(() => {
+    if (!location.hash) return;
+    document.getElementById(location.hash.slice(1))?.scrollIntoView?.({ block: 'start' });
+  }, [location.hash, location.pathname]);
 
   const handleLogout = async () => {
     try {
@@ -57,16 +74,19 @@ export default function AppLayout() {
         </div>
 
         <nav className="sidebar-nav" aria-label="Main navigation">
-          {navLinks.map((link) => (
-            <NavLink
-              key={link.to}
-              to={link.to}
-              end={link.exact}
-              className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`}
-            >
-              {link.label}
-            </NavLink>
-          ))}
+          {navLinks.map((link) => {
+            const active = isNavLinkActive(link, location);
+            return (
+              <Link
+                key={link.to}
+                to={link.to}
+                className={`nav-link ${active ? 'active' : ''}`}
+                aria-current={active ? 'page' : undefined}
+              >
+                {link.label}
+              </Link>
+            );
+          })}
         </nav>
       </aside>
 

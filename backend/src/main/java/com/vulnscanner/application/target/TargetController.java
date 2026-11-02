@@ -30,6 +30,37 @@ public class TargetController {
         return ResponseEntity.ok(ApiResponse.success("Target retrieved", targetService.getTarget(targetId)));
     }
 
+    @GetMapping("/assignment-analysts")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<ApiResponse<List<AnalystAssignmentCandidateResponse>>> eligibleAnalysts() {
+        return ResponseEntity.ok(ApiResponse.success(
+                "Eligible Security Analysts retrieved", targetService.eligibleAnalysts()));
+    }
+
+    @GetMapping("/{targetId}/assignments")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<ApiResponse<List<TargetAnalystAssignmentResponse>>> assignments(
+            @PathVariable Long targetId) {
+        return ResponseEntity.ok(ApiResponse.success(
+                "Target assignments retrieved", targetService.assignments(targetId)));
+    }
+
+    @PutMapping("/{targetId}/assignments/{analystId}")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<ApiResponse<TargetAnalystAssignmentResponse>> assignAnalyst(
+            @PathVariable Long targetId, @PathVariable Long analystId) {
+        return ResponseEntity.ok(ApiResponse.success(
+                "Security Analyst assigned to target", targetService.assignAnalyst(targetId, analystId)));
+    }
+
+    @DeleteMapping("/{targetId}/assignments/{analystId}")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<ApiResponse<Void>> revokeAnalystAssignment(
+            @PathVariable Long targetId, @PathVariable Long analystId) {
+        targetService.revokeAnalystAssignment(targetId, analystId);
+        return ResponseEntity.ok(ApiResponse.success("Target assignment revoked", null));
+    }
+
     @PostMapping
     @PreAuthorize("hasRole('ADMIN')")
     public ResponseEntity<ApiResponse<TargetResponse>> createTarget(

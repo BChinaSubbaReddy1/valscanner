@@ -6,5 +6,7 @@ import java.util.List;
 
 public interface ScanCrawlPageRepository extends JpaRepository<ScanCrawlPage, Long> {
     List<ScanCrawlPage> findByScanJob_IdOrderByDepthAscUrlAsc(Long scanId);
+    List<ScanCrawlPage> findByScanJob_IdAndScanJob_Organization_IdOrderByDepthAscUrlAsc(
+            Long scanId, Long organizationId);
     long countByScanJob_Id(Long scanId);
 }

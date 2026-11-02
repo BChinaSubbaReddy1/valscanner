@@ -6,6 +6,7 @@ import org.springframework.data.jpa.repository.JpaRepository;
 
 import java.util.Optional;
 import java.util.List;
+import java.time.Instant;
 
 public interface ScanJobRepository extends JpaRepository<ScanJob, Long> {
     Page<ScanJob> findByOrganization_IdOrderByCreatedAtDesc(Long organizationId, Pageable pageable);
@@ -39,11 +40,46 @@ public interface ScanJobRepository extends JpaRepository<ScanJob, Long> {
     Page<ScanJob> findByOrganization_IdAndStatusOrderByCreatedAtAsc(
             Long organizationId, ScanStatus status, Pageable pageable);
 
-    Page<ScanJob> findByRequestedBy_IdOrderByCreatedAtDesc(Long userId, Pageable pageable);
+    Page<ScanJob> findByTarget_IdInAndOrganization_IdOrderByCreatedAtDesc(
+            List<Long> targetIds, Long organizationId, Pageable pageable);
+
+    Page<ScanJob> findByTarget_IdAndOrganization_IdAndScanTypeOrderByCreatedAtDesc(
+            Long targetId, Long organizationId, ScanType scanType, Pageable pageable);
+
+    long countByTarget_IdInAndOrganization_IdAndStatus(
+            List<Long> targetIds, Long organizationId, ScanStatus status);
+
+    long countByRequestedBy_IdAndTarget_IdInAndOrganization_IdAndStatus(
+            Long requestedById, List<Long> targetIds, Long organizationId, ScanStatus status);
 
     long countByOrganization_IdAndStatus(Long organizationId, ScanStatus status);
 
     long countByRequestedBy_IdAndStatus(Long userId, ScanStatus status);
+
+    @org.springframework.data.jpa.repository.Query("""
+            SELECT FUNCTION('DATE', s.createdAt), s.status, COUNT(s)
+            FROM ScanJob s
+            WHERE s.organization.id = :organizationId
+              AND s.createdAt >= :start AND s.createdAt < :end
+            GROUP BY FUNCTION('DATE', s.createdAt), s.status
+            """)
+    List<Object[]> countDailyByOrganization(
+            @org.springframework.data.repository.query.Param("organizationId") Long organizationId,
+            @org.springframework.data.repository.query.Param("start") Instant start,
+            @org.springframework.data.repository.query.Param("end") Instant end);
+
+    @org.springframework.data.jpa.repository.Query("""
+            SELECT FUNCTION('DATE', s.createdAt), s.status, COUNT(s)
+            FROM ScanJob s
+            WHERE s.organization.id = :organizationId AND s.target.id IN :targetIds
+              AND s.createdAt >= :start AND s.createdAt < :end
+            GROUP BY FUNCTION('DATE', s.createdAt), s.status
+            """)
+    List<Object[]> countDailyByAssignedTargets(
+            @org.springframework.data.repository.query.Param("organizationId") Long organizationId,
+            @org.springframework.data.repository.query.Param("targetIds") List<Long> targetIds,
+            @org.springframework.data.repository.query.Param("start") Instant start,
+            @org.springframework.data.repository.query.Param("end") Instant end);
 
     List<ScanJob> findByStatusIn(java.util.Collection<ScanStatus> statuses);
 }

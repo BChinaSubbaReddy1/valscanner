@@ -1,5 +1,6 @@
 package com.vulnscanner.application.scan;
 
+import com.vulnscanner.application.common.UrlSanitizer;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.vulnscanner.application.organization.Organization;
 import com.vulnscanner.application.organization.OrganizationStatus;
@@ -7,6 +8,8 @@ import com.vulnscanner.application.role.RoleName;
 import com.vulnscanner.application.user.User;
 import com.vulnscanner.application.user.UserRepository;
 import com.vulnscanner.application.user.UserStatus;
+import com.vulnscanner.application.target.TargetAnalystAssignmentRepository;
+import com.vulnscanner.application.target.TargetStatus;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.core.Authentication;
@@ -21,7 +24,12 @@ import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
 
 @Service
 public class ScanReportService {
@@ -30,18 +38,24 @@ public class ScanReportService {
     private final ScanFindingRepository scanFindingRepository;
     private final ScanCrawlPageRepository scanCrawlPageRepository;
     private final UserRepository userRepository;
+    private final TargetAnalystAssignmentRepository assignmentRepository;
     private final ObjectMapper objectMapper;
+    private final ScanAnalyticsService scanAnalyticsService;
 
     public ScanReportService(ScanJobRepository scanJobRepository,
                              ScanFindingRepository scanFindingRepository,
                              ScanCrawlPageRepository scanCrawlPageRepository,
                              UserRepository userRepository,
-                             ObjectMapper objectMapper) {
+                             TargetAnalystAssignmentRepository assignmentRepository,
+                             ObjectMapper objectMapper,
+                             ScanAnalyticsService scanAnalyticsService) {
         this.scanJobRepository = scanJobRepository;
         this.scanFindingRepository = scanFindingRepository;
         this.scanCrawlPageRepository = scanCrawlPageRepository;
         this.userRepository = userRepository;
+        this.assignmentRepository = assignmentRepository;
         this.objectMapper = objectMapper;
+        this.scanAnalyticsService = scanAnalyticsService;
     }
 
     @Transactional(readOnly = true)
@@ -71,7 +85,7 @@ public class ScanReportService {
                 job.getId(),
                 job.getTarget().getId(),
                 job.getTarget().getName(),
-                job.getTarget().getUrl(),
+                UrlSanitizer.safeTargetUrl(job.getTarget().getUrl()),
                 job.getScanType(),
                 job.getStatus(),
                 job.getProgress(),
@@ -87,8 +101,123 @@ public class ScanReportService {
                 (int) total,
                 crawlPagesCount,
                 ScanExecutionSummary.from(job),
-                sanitizedFindings
+                sanitizedFindings,
+                correlateFindings(sanitizedFindings),
+                scanAnalyticsService.analyze(scanId)
         );
+    }
+
+    @Transactional(readOnly = true)
+    public List<ScanFindingCorrelationResponse> correlateFindings(Long scanId) {
+        return generateReport(scanId).correlations();
+    }
+
+    private List<ScanFindingCorrelationResponse> correlateFindings(List<ScanFindingResponse> findings) {
+        Map<ExactCorrelationKey, List<ScanFindingResponse>> exactGroups = new LinkedHashMap<>();
+        Map<String, List<ScanFindingResponse>> endpointGroups = new LinkedHashMap<>();
+        for (ScanFindingResponse finding : findings) {
+            String endpoint = normalizeEndpoint(finding.endpointUrl() == null
+                    ? finding.affectedComponent() : finding.endpointUrl());
+            String component = normalize(finding.affectedComponent());
+            String category = normalize(finding.checkType());
+            String parameter = normalize(finding.parameterName());
+            String evidence = normalize(finding.evidence());
+            if (category != null && evidence != null && (endpoint != null || component != null)) {
+                ExactCorrelationKey key = new ExactCorrelationKey(category,
+                        endpoint == null ? component : endpoint, parameter,
+                        endpoint == null ? component : normalize(finding.affectedComponent()), evidence);
+                exactGroups.computeIfAbsent(key, ignored -> new ArrayList<>()).add(finding);
+            }
+            if (endpoint != null) {
+                endpointGroups.computeIfAbsent(endpoint, ignored -> new ArrayList<>()).add(finding);
+            }
+        }
+
+        List<ScanFindingCorrelationResponse> correlations = new ArrayList<>();
+        Set<Long> relatedFindingIds = new LinkedHashSet<>();
+        for (Map.Entry<ExactCorrelationKey, List<ScanFindingResponse>> entry : exactGroups.entrySet()) {
+            List<ScanFindingResponse> group = entry.getValue();
+            if (group.size() < 2) {
+                continue;
+            }
+            correlations.add(new ScanFindingCorrelationResponse(
+                    entry.getKey().category().toUpperCase(Locale.ROOT),
+                    group.getFirst().endpointUrl() == null
+                            ? group.getFirst().affectedComponent() : group.getFirst().endpointUrl(),
+                    group.stream().map(ScanFindingResponse::id).toList(),
+                    detectionEngines(group),
+                    "Finding evidence and location fields match exactly. Duplicate classification does not confirm exploitability.",
+                    "EXACT_DUPLICATE",
+                    "Normalized category, endpoint, parameter, affected component, and evidence matched.",
+                    "HIGH"
+            ));
+            group.stream().map(ScanFindingResponse::id).forEach(relatedFindingIds::add);
+        }
+        for (Map.Entry<String, List<ScanFindingResponse>> entry : endpointGroups.entrySet()) {
+            List<ScanFindingResponse> group = entry.getValue();
+            Set<ExactCorrelationKey> signatures = group.stream()
+                    .map(finding -> new ExactCorrelationKey(normalize(finding.checkType()),
+                            entry.getKey(), normalize(finding.parameterName()),
+                            normalize(finding.affectedComponent()), normalize(finding.evidence())))
+                    .collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new));
+            if (group.size() < 2 || signatures.size() < 2) {
+                continue;
+            }
+            correlations.add(new ScanFindingCorrelationResponse(
+                    group.stream().map(ScanFindingResponse::checkType).distinct()
+                            .collect(java.util.stream.Collectors.joining("; ")),
+                    entry.getKey(),
+                    group.stream().map(ScanFindingResponse::id).toList(),
+                    detectionEngines(group),
+                    "Findings share the same observed endpoint but differ by category, parameter, or component. "
+                            + "The shared endpoint is a relationship signal, not proof of a causal attack path.",
+                    "RELATED_FINDINGS",
+                    "Normalized endpoint matched; finding categories, parameters, or components differ.",
+                    "MEDIUM"
+            ));
+            group.stream().map(ScanFindingResponse::id).forEach(relatedFindingIds::add);
+        }
+        for (ScanFindingResponse finding : findings) {
+            if (relatedFindingIds.contains(finding.id())) {
+                continue;
+            }
+            correlations.add(new ScanFindingCorrelationResponse(
+                    finding.checkType(),
+                    finding.endpointUrl() == null
+                            ? finding.affectedComponent() : finding.endpointUrl(),
+                    List.of(finding.id()),
+                    detectionEngines(List.of(finding)),
+                    "No other persisted finding shared a defensible duplicate or same-endpoint relationship.",
+                    "INDEPENDENT",
+                    "No matching endpoint/category/component relationship was observed in this scan.",
+                    "LOW"
+            ));
+        }
+        return List.copyOf(correlations);
+    }
+
+    private List<String> detectionEngines(List<ScanFindingResponse> findings) {
+        return findings.stream().map(finding -> correlationEngine(finding.detectionSource()))
+                .filter(java.util.Objects::nonNull).distinct().sorted().toList();
+    }
+
+    private String normalizeEndpoint(String endpoint) {
+        String safe = FindingSanitizer.safeEndpoint(endpoint);
+        if (safe == null) {
+            return null;
+        }
+        try {
+            java.net.URI uri = java.net.URI.create(safe);
+            String path = uri.getRawPath() == null || uri.getRawPath().isEmpty() ? "/" : uri.getRawPath();
+            return uri.getScheme().toLowerCase(Locale.ROOT) + "://"
+                    + uri.getRawAuthority().toLowerCase(Locale.ROOT) + path;
+        } catch (IllegalArgumentException exception) {
+            return null;
+        }
+    }
+
+    private String normalize(String value) {
+        return value == null || value.isBlank() ? null : value.trim().toLowerCase(Locale.ROOT);
     }
 
     @Transactional(readOnly = true)
@@ -139,19 +268,56 @@ public class ScanReportService {
             writer.println("# Persisted HTML Crawl Records," + report.totalCrawlPages());
             writer.println("# Checks In Scope," + escapeCsv(String.join("; ", report.executionSummary().checksInScope())));
             writer.println("# Checks Out Of Scope," + escapeCsv(String.join("; ", report.executionSummary().checksOutOfScope())));
+            writer.println("# Adaptive Check Selections,"
+                    + escapeCsv(String.join(" | ", report.executionSummary().adaptiveCheckSelections())));
+            writer.println("# ZAP Rule Inventory Status,"
+                    + escapeCsv(report.executionSummary().zapRuleInventoryStatus()));
+            writer.println("# ZAP Passive Rules Enabled,"
+                    + escapeCsv(String.join(" | ", report.executionSummary().zapPassiveEnabledRules())));
+            writer.println("# ZAP Active Rules Enabled,"
+                    + escapeCsv(String.join(" | ", report.executionSummary().zapActiveEnabledRules())));
+            writer.println("# Rule Execution Evidence,"
+                    + escapeCsv(report.analytics().ruleCoverage().executionEvidence()));
+            writer.println("# History Comparison,"
+                    + escapeCsv(report.analytics().history().explanation()));
+            writer.println("# Link-wise Endpoint Finding Counts");
+            writer.println("Endpoint,Findings,Crawled,HTTP Status");
+            for (ScanAnalyticsResponse.EndpointMetric endpoint : report.analytics().endpoints()) {
+                writer.printf("%s,%d,%s,%s%n",
+                        escapeCsv(endpoint.url()),
+                        endpoint.findingCount(),
+                        endpoint.crawled(),
+                        endpoint.httpStatusCode() == null ? "" : endpoint.httpStatusCode());
+            }
+            appendAnalyticsMetrics(writer, "Severity Distribution", report.analytics().severities());
+            appendAnalyticsMetrics(writer, "Finding Type Distribution", report.analytics().findingTypes());
+            appendAnalyticsMetrics(writer, "OWASP Categories", report.analytics().owaspCategories());
+            appendAnalyticsMetrics(writer, "Detection Sources", report.analytics().detectionSources());
+            appendAnalyticsMetrics(writer, "Generated Finding Rules", report.analytics().findingRules());
+            writer.println("# Unmapped OWASP Findings," + report.analytics().unmappedOwaspFindings());
+            ScanAnalyticsResponse.HistoryComparison history = report.analytics().history();
+            writer.printf("# History Counts,New,%d,Resolved,%d,Persistent,%d,Severity Changed,%d%n",
+                    history.newFindings(), history.resolvedFindings(),
+                    history.persistentFindings(), history.severityChangedFindings());
             writer.println("# Created At," + report.createdAt());
             writer.println("# Completed At," + (report.completedAt() != null ? report.completedAt().toString() : ""));
             writer.println("# High," + report.severitySummary().high() + ",Medium," + report.severitySummary().medium()
                     + ",Low," + report.severitySummary().low() + ",Total," + report.totalFindings());
             writer.println();
 
-            writer.println("Finding ID,Check Type,Severity,Affected Component,Evidence,Rationale,Remediation,Detection Source,Verification Status,Detected At,Source Rule ID,Source Confidence,Source Reference,Source CWE ID,Source WASC ID");
+            writer.println("Finding ID,Check Type,Severity,Priority Score,Priority Level,Priority Explanation,Endpoint URL,HTTP Method,Parameter,Affected Component,Evidence,Rationale,Remediation,Detection Source,Verification Status,Detected At,Source Rule ID,Source Confidence,Source Reference,Source CWE ID,Source WASC ID");
 
             for (ScanFindingResponse finding : report.findings()) {
-                writer.printf("%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s%n",
+                writer.printf("%d,%s,%s,%d,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s%n",
                         finding.id(),
                         escapeCsv(finding.checkType()),
                         escapeCsv(finding.severity()),
+                        finding.priorityScore(),
+                        escapeCsv(finding.priorityLevel()),
+                        escapeCsv(finding.priorityExplanation()),
+                        escapeCsv(finding.endpointUrl()),
+                        escapeCsv(finding.httpMethod()),
+                        escapeCsv(finding.parameterName()),
                         escapeCsv(finding.affectedComponent()),
                         escapeCsv(finding.evidence()),
                         escapeCsv(finding.rationale()),
@@ -166,8 +332,32 @@ public class ScanReportService {
                         escapeCsv(finding.sourceWascId())
                 );
             }
+            writer.println();
+            writer.println("# Finding Relationships," + report.correlations().size());
+            writer.println("Categories,Endpoint or Component,Finding IDs,Detection Engines,Relationship Type,Matching Evidence,Confidence,Interpretation");
+            for (ScanFindingCorrelationResponse correlation : report.correlations()) {
+                writer.printf("%s,%s,%s,%s,%s,%s,%s,%s%n",
+                        escapeCsv(correlation.checkType()),
+                        escapeCsv(correlation.affectedComponent()),
+                        escapeCsv(correlation.findingIds().stream().map(String::valueOf)
+                                .collect(java.util.stream.Collectors.joining("; "))),
+                        escapeCsv(String.join("; ", correlation.detectionEngines())),
+                        escapeCsv(correlation.relationshipType()),
+                        escapeCsv(correlation.matchingEvidence()),
+                        escapeCsv(correlation.confidence()),
+                        escapeCsv(correlation.interpretation()));
+            }
             writer.flush();
             return out.toByteArray();
+        }
+    }
+
+    private void appendAnalyticsMetrics(PrintWriter writer, String heading,
+                                        List<ScanAnalyticsResponse.CountMetric> metrics) {
+        writer.println("# " + heading);
+        writer.println("Category,Count");
+        for (ScanAnalyticsResponse.CountMetric metric : metrics) {
+            writer.printf("%s,%d%n", escapeCsv(metric.label()), metric.count());
         }
     }
 
@@ -201,6 +391,8 @@ public class ScanReportService {
     }
 
     private ScanFindingResponse toSanitizedFindingResponse(ScanFinding finding) {
+        FindingPriorityAssessment priority = FindingPriorityAssessment.assess(
+                finding.getSeverity(), finding.getVerificationStatus(), finding.getSourceConfidence());
         return new ScanFindingResponse(
                 finding.getId(),
                 finding.getCheckType(),
@@ -216,7 +408,13 @@ public class ScanReportService {
                 finding.getSourceConfidence(),
                 finding.getSourceReference(),
                 finding.getSourceCweId(),
-                finding.getSourceWascId()
+                finding.getSourceWascId(),
+                priority.score(),
+                priority.level(),
+                priority.explanation(),
+                FindingSanitizer.safeEndpoint(finding.getEndpointUrl()),
+                finding.getHttpMethod(),
+                FindingSanitizer.sanitize(finding.getParameterName())
         );
     }
 
@@ -231,10 +429,31 @@ public class ScanReportService {
 
     private ScanJob findAccessible(Long scanId, User actor) {
         boolean isAdmin = actor.getRoles().stream().anyMatch(role -> role.getName() == RoleName.ADMIN);
-        return (isAdmin
-                ? scanJobRepository.findByIdAndOrganization_Id(scanId, actor.getOrganization().getId())
-                : scanJobRepository.findByIdAndRequestedBy_Id(scanId, actor.getId()))
+        ScanJob job = scanJobRepository.findByIdAndOrganization_Id(scanId, actor.getOrganization().getId())
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Scan not found"));
+        if (!job.getTarget().getOrganization().getId().equals(actor.getOrganization().getId())
+                || (!isAdmin && (job.getTarget().getStatus() != TargetStatus.APPROVED
+                || !assignmentRepository.existsByTarget_IdAndAnalyst_Id(
+                        job.getTarget().getId(), actor.getId())))) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Scan not found");
+        }
+        return job;
+    }
+
+    private String correlationEngine(String detectionSource) {
+        if ("OWASP_ZAP".equals(detectionSource)) {
+            return "OWASP_ZAP";
+        }
+        if ("PASSIVE_HEADERS".equals(detectionSource)
+                || "ACTIVE_QUERY_PARAMETER".equals(detectionSource)
+                || "ACTIVE_POST_FORM".equals(detectionSource)) {
+            return "NATIVE";
+        }
+        return null;
+    }
+
+    private record ExactCorrelationKey(String category, String endpoint,
+                                       String parameter, String component, String evidence) {
     }
 
     private User requireOperationalUser() {

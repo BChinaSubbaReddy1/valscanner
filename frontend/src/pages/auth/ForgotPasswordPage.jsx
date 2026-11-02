@@ -1,22 +1,21 @@
 import { useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useNavigate } from 'react-router-dom';
 import { authApi } from '../../api/client';
 
 export default function ForgotPasswordPage() {
+  const navigate = useNavigate();
   const [email, setEmail] = useState('');
   const [loading, setLoading] = useState(false);
-  const [message, setMessage] = useState('');
   const [error, setError] = useState('');
 
   const handleSubmit = async (event) => {
     event.preventDefault();
     setLoading(true);
     setError('');
-    setMessage('');
 
     try {
       await authApi.forgotPassword({ email });
-      setMessage('If that email is registered, a reset link has been sent.');
+      navigate(`/verify-otp?email=${encodeURIComponent(email.trim())}`);
     } catch (requestError) {
       setError(requestError.message || 'Password reset could not be requested.');
     } finally {
@@ -42,10 +41,9 @@ export default function ForgotPasswordPage() {
           </label>
 
           {error ? <div className="message-card error">{error}</div> : null}
-          {message ? <div className="message-card success">{message}</div> : null}
 
           <button type="submit" className="primary-button" disabled={loading || !email.trim()}>
-            {loading ? 'Sending…' : 'Send reset link'}
+            {loading ? 'Sending…' : 'Send verification code'}
           </button>
         </form>
 

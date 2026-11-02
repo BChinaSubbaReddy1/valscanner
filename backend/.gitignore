@@ -1,2 +1,4 @@
 /target/
 /.env
+!/src/main/java/com/vulnscanner/application/target/
+!/src/main/java/com/vulnscanner/application/target/*.java

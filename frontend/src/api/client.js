@@ -1,6 +1,6 @@
 const STORAGE_KEY = 'scanner-auth-session';
 
-export const BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:1080';
+export const BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8081';
 
 function readSession() {
   try {
@@ -114,6 +114,22 @@ export const authApi = {
     });
   },
 
+  async verifyLoginOtp(payload) {
+    return apiRequest('/api/auth/verify-login-otp', {
+      method: 'POST',
+      body: payload,
+      skipAuth: true,
+    });
+  },
+
+  async resendLoginOtp(payload) {
+    return apiRequest('/api/auth/resend-login-otp', {
+      method: 'POST',
+      body: payload,
+      skipAuth: true,
+    });
+  },
+
   async register(payload) {
     return apiRequest('/api/auth/register', {
       method: 'POST',
@@ -124,6 +140,14 @@ export const authApi = {
 
   async forgotPassword(payload) {
     return apiRequest('/api/auth/forgot-password', {
+      method: 'POST',
+      body: payload,
+      skipAuth: true,
+    });
+  },
+
+  async verifyPasswordResetOtp(payload) {
+    return apiRequest('/api/auth/verify-reset-otp', {
       method: 'POST',
       body: payload,
       skipAuth: true,
@@ -202,8 +226,22 @@ export const organizationApi = {
     });
   },
 
+  async getDashboardAnalytics(days = 30) {
+    const params = new URLSearchParams({ days: String(days) });
+    return apiRequest(`/api/organizations/me/dashboard/analytics?${params.toString()}`, {
+      method: 'GET',
+    });
+  },
+
   async getPlatformDashboard() {
     return apiRequest('/api/organizations/platform-dashboard', {
+      method: 'GET',
+    });
+  },
+
+  async getPlatformDashboardAnalytics(days = 30) {
+    const params = new URLSearchParams({ days: String(days) });
+    return apiRequest(`/api/organizations/platform-dashboard/analytics?${params.toString()}`, {
       method: 'GET',
     });
   },
@@ -300,6 +338,30 @@ export const targetApi = {
     });
   },
 
+  async listAssignmentAnalysts() {
+    return apiRequest('/api/targets/assignment-analysts', {
+      method: 'GET',
+    });
+  },
+
+  async listAssignments(targetId) {
+    return apiRequest(`/api/targets/${targetId}/assignments`, {
+      method: 'GET',
+    });
+  },
+
+  async assignAnalyst(targetId, analystId) {
+    return apiRequest(`/api/targets/${targetId}/assignments/${analystId}`, {
+      method: 'PUT',
+    });
+  },
+
+  async revokeAnalystAssignment(targetId, analystId) {
+    return apiRequest(`/api/targets/${targetId}/assignments/${analystId}`, {
+      method: 'DELETE',
+    });
+  },
+
   async createTarget(payload) {
     return apiRequest('/api/targets', {
       method: 'POST',
@@ -345,6 +407,13 @@ export const scanApi = {
     });
   },
 
+  async getAnalystDashboardAnalytics(days = 30) {
+    const params = new URLSearchParams({ days: String(days) });
+    return apiRequest(`/api/scans/me/dashboard/analytics?${params.toString()}`, {
+      method: 'GET',
+    });
+  },
+
   async listPendingApprovals({ page = 0, size = 20 } = {}) {
     const params = new URLSearchParams({ page: String(page), size: String(size) });
     return apiRequest(`/api/scans/pending-approval?${params.toString()}`, {
@@ -386,6 +455,12 @@ export const scanApi = {
     });
   },
 
+  async getScanAnalytics(scanId) {
+    return apiRequest(`/api/scans/${scanId}/analytics`, {
+      method: 'GET',
+    });
+  },
+
   async listCrawlPages(scanId) {
     return apiRequest(`/api/scans/${scanId}/crawl-pages`, {
       method: 'GET',
@@ -394,6 +469,12 @@ export const scanApi = {
 
   async getReport(scanId) {
     return apiRequest(`/api/scans/${scanId}/report`, {
+      method: 'GET',
+    });
+  },
+
+  async listFindingCorrelations(scanId) {
+    return apiRequest(`/api/scans/${scanId}/correlations`, {
       method: 'GET',
     });
   },

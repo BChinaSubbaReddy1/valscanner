@@ -31,7 +31,7 @@ export default function RegisterPage() {
     }
 
     if (form.password.length < 8) {
-      setError('Password must be at least 8 characters.');
+      setError('');
       return;
     }
 
@@ -124,7 +124,22 @@ export default function RegisterPage() {
 
           <label>
             Password
-            <input name="password" type="password" value={form.password} onChange={handleChange} autoComplete="new-password" />
+            <input
+              name="password"
+              type="password"
+              value={form.password}
+              onChange={handleChange}
+              autoComplete="new-password"
+              minLength={8}
+              maxLength={128}
+              aria-invalid={form.password.length > 0 && form.password.length < 8}
+              aria-describedby={form.password.length > 0 && form.password.length < 8 ? 'register-password-error' : undefined}
+            />
+            {form.password.length > 0 && form.password.length < 8 ? (
+              <div id="register-password-error" className="message-card error" role="alert">
+                Password must be at least 8 characters long.
+              </div>
+            ) : null}
           </label>
 
           <label>
@@ -165,7 +180,9 @@ export default function RegisterPage() {
             </label>
           ) : null}
 
-          {error ? <div className="message-card error">{error}</div> : null}
+          {error && error !== 'Password must be at least 8 characters long.' ? (
+            <div className="message-card error">{error}</div>
+          ) : null}
           {success ? <div className="message-card success">{success}</div> : null}
 
           <button type="submit" className="primary-button" disabled={loading || Boolean(success)}>

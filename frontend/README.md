@@ -39,5 +39,8 @@ Copy-Item .env.example .env
 Then edit the value to match your backend:
 
 ```text
-VITE_API_BASE_URL=http://localhost:8080
+VITE_API_BASE_URL=http://localhost:8081
 ```
+
+The Compose backend is published on port 8081 by default. For a standalone
+Spring Boot process, set the value to its port (8080 by default).

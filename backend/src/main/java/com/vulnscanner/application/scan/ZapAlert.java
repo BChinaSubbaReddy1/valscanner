@@ -14,7 +14,8 @@ public record ZapAlert(
         String reference,
         String cweid,
         String wascid,
-        String id
+        String id,
+        String method
 ) {
     public ZapAlert(
             String pluginId,
@@ -32,6 +33,26 @@ public record ZapAlert(
             String wascid
     ) {
         this(pluginId, alert, risk, confidence, url, param, attack, evidence,
-                description, solution, reference, cweid, wascid, null);
+                description, solution, reference, cweid, wascid, null, null);
+    }
+
+    public ZapAlert(
+            String pluginId,
+            String alert,
+            String risk,
+            String confidence,
+            String url,
+            String param,
+            String attack,
+            String evidence,
+            String description,
+            String solution,
+            String reference,
+            String cweid,
+            String wascid,
+            String id
+    ) {
+        this(pluginId, alert, risk, confidence, url, param, attack, evidence,
+                description, solution, reference, cweid, wascid, id, null);
     }
 }

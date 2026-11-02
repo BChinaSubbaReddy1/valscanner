@@ -21,6 +21,10 @@ public interface UserRepository extends JpaRepository<User, Long> {
     @Query("SELECT u FROM User u WHERE u.email = :email")
     Optional<User> findByEmailForUpdate(@Param("email") String email);
 
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT u FROM User u WHERE LOWER(u.email) = LOWER(:email)")
+    Optional<User> findByEmailIgnoreCaseForUpdate(@Param("email") String email);
+
     @Modifying(flushAutomatically = true, clearAutomatically = true)
     @Query("UPDATE User u SET u.email = :email, u.password = :password WHERE u.id = :id")
     int updateEmailAndPassword(@Param("id") Long id,
@@ -37,6 +41,17 @@ public interface UserRepository extends JpaRepository<User, Long> {
             """)
     List<User> findAnalystMemberships(@Param("organizationId") Long organizationId,
                                       @Param("status") UserStatus status);
+
+    @Query("""
+            SELECT u FROM User u JOIN u.roles r
+            WHERE u.organization.id = :organizationId
+              AND u.status = :status
+              AND SIZE(u.roles) = 1
+              AND r.name = com.vulnscanner.application.role.RoleName.SECURITY_ANALYST
+            ORDER BY u.firstName, u.lastName
+            """)
+    List<User> findEligibleSecurityAnalysts(@Param("organizationId") Long organizationId,
+                                             @Param("status") UserStatus status);
 
     Optional<User> findByIdAndOrganization_Id(Long id, Long organizationId);
 

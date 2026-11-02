@@ -1,11 +1,11 @@
 package com.vulnscanner.application.target;
 
+import com.vulnscanner.application.common.UrlSanitizer;
 import com.vulnscanner.application.audit.AuditEvent;
 import com.vulnscanner.application.audit.AuditEventRepository;
 import com.vulnscanner.application.organization.Organization;
 import com.vulnscanner.application.organization.OrganizationStatus;
 import com.vulnscanner.application.role.RoleName;
-import com.vulnscanner.application.security.UserPrincipal;
 import com.vulnscanner.application.user.User;
 import com.vulnscanner.application.user.UserRepository;
 import com.vulnscanner.application.user.UserStatus;
@@ -25,12 +25,16 @@ import java.util.Locale;
 @Service
 public class TargetService {
     private final TargetRepository targetRepository;
+    private final TargetAnalystAssignmentRepository assignmentRepository;
     private final UserRepository userRepository;
     private final AuditEventRepository auditEventRepository;
 
-    public TargetService(TargetRepository targetRepository, UserRepository userRepository,
+    public TargetService(TargetRepository targetRepository,
+                         TargetAnalystAssignmentRepository assignmentRepository,
+                         UserRepository userRepository,
                          AuditEventRepository auditEventRepository) {
         this.targetRepository = targetRepository;
+        this.assignmentRepository = assignmentRepository;
         this.userRepository = userRepository;
         this.auditEventRepository = auditEventRepository;
     }
@@ -45,8 +49,13 @@ public class TargetService {
                     .stream().map(this::response).toList();
         }
         requireRole(actor, RoleName.SECURITY_ANALYST);
-        return targetRepository.findByOrganization_IdAndStatusOrderByCreatedAtDesc(
-                        organization.getId(), TargetStatus.APPROVED)
+        List<Long> assignedTargetIds = assignmentRepository.findAssignedTargetIds(
+                actor.getId(), organization.getId(), TargetStatus.APPROVED);
+        if (assignedTargetIds.isEmpty()) {
+            return List.of();
+        }
+        return targetRepository.findByIdInAndOrganization_IdAndStatusOrderByCreatedAtDesc(
+                        assignedTargetIds, organization.getId(), TargetStatus.APPROVED)
                 .stream().map(this::response).toList();
     }
 
@@ -64,8 +73,77 @@ public class TargetService {
             target = targetRepository.findByIdAndOrganization_IdAndStatus(
                             targetId, organization.getId(), TargetStatus.APPROVED)
                     .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Target not found"));
+            if (!assignmentRepository.existsByTarget_IdAndAnalyst_Id(targetId, actor.getId())) {
+                throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Target not found");
+            }
         }
         return response(target);
+    }
+
+    @Transactional(readOnly = true)
+    public List<AnalystAssignmentCandidateResponse> eligibleAnalysts() {
+        User actor = requireAdmin();
+        Organization organization = requireOrganization(actor);
+        return userRepository.findEligibleSecurityAnalysts(organization.getId(), UserStatus.ACTIVE).stream()
+                .map(user -> new AnalystAssignmentCandidateResponse(
+                        user.getId(), displayName(user)))
+                .toList();
+    }
+
+    @Transactional(readOnly = true)
+    public List<TargetAnalystAssignmentResponse> assignments(Long targetId) {
+        User actor = requireAdmin();
+        Organization organization = requireOrganization(actor);
+        targetRepository.findByIdAndOrganization_IdAndStatus(targetId, organization.getId(), TargetStatus.APPROVED)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Target not found"));
+        return assignmentRepository.findByTarget_IdAndTarget_Organization_IdOrderByAnalyst_FirstNameAscAnalyst_LastNameAsc(
+                        targetId, organization.getId())
+                .stream().map(this::assignmentResponse).toList();
+    }
+
+    @Transactional
+    public TargetAnalystAssignmentResponse assignAnalyst(Long targetId, Long analystId) {
+        User actor = requireAdmin();
+        Organization organization = requireOrganization(actor);
+        Target target = findForUpdate(targetId, organization);
+        if (target.getStatus() != TargetStatus.APPROVED) {
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Only approved targets can be assigned");
+        }
+        User analyst = userRepository.findByIdAndOrganization_IdForUpdate(analystId, organization.getId())
+                .filter(user -> user.getStatus() == UserStatus.ACTIVE)
+                .filter(user -> user.getRoles().size() == 1 && hasRole(user, RoleName.SECURITY_ANALYST))
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Analyst not found"));
+        var existingAssignments = assignmentRepository
+                .findByTarget_IdAndTarget_Organization_IdOrderByAnalyst_FirstNameAscAnalyst_LastNameAsc(
+                        targetId, organization.getId());
+        TargetAnalystAssignment existingForAnalyst = null;
+        for (TargetAnalystAssignment existing : existingAssignments) {
+            if (existing.getAnalyst().getId().equals(analystId)) {
+                existingForAnalyst = existing;
+            } else {
+                assignmentRepository.delete(existing);
+                auditAssignment("TARGET_ANALYST_ASSIGNMENT_REVOKED", target, existing.getAnalyst(), actor);
+            }
+        }
+        if (existingForAnalyst != null) {
+            return assignmentResponse(existingForAnalyst);
+        }
+        TargetAnalystAssignment assignment = assignmentRepository.save(
+                new TargetAnalystAssignment(target, analyst, actor));
+        auditAssignment("TARGET_ANALYST_ASSIGNED", target, analyst, actor);
+        return assignmentResponse(assignment);
+    }
+
+    @Transactional
+    public void revokeAnalystAssignment(Long targetId, Long analystId) {
+        User actor = requireAdmin();
+        Organization organization = requireOrganization(actor);
+        Target target = findForUpdate(targetId, organization);
+        TargetAnalystAssignment assignment = assignmentRepository
+                .findByTarget_IdAndAnalyst_Id(targetId, analystId)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Assignment not found"));
+        assignmentRepository.delete(assignment);
+        auditAssignment("TARGET_ANALYST_ASSIGNMENT_REVOKED", target, assignment.getAnalyst(), actor);
     }
 
     @Transactional
@@ -190,9 +268,32 @@ public class TargetService {
     }
 
     private TargetResponse response(Target target) {
-        return new TargetResponse(target.getId(), target.getName(), target.getUrl(), target.getType(),
+        return new TargetResponse(target.getId(), target.getName(), UrlSanitizer.safeTargetUrl(target.getUrl()), target.getType(),
                 target.getOrganization().getId(), target.getStatus(), target.getCreatedAt(),
                 target.getUpdatedAt());
+    }
+
+    private TargetAnalystAssignmentResponse assignmentResponse(TargetAnalystAssignment assignment) {
+        User analyst = assignment.getAnalyst();
+        return new TargetAnalystAssignmentResponse(analyst.getId(), displayName(analyst),
+                assignment.getAssignedAt());
+    }
+
+    private String displayName(User user) {
+        return (user.getFirstName() + " " + user.getLastName()).trim();
+    }
+
+    private void auditAssignment(String type, Target target, User analyst, User actor) {
+        AuditEvent event = new AuditEvent();
+        event.setEventType(type);
+        event.setEventLevel("INFO");
+        event.setMessage(type.equals("TARGET_ANALYST_ASSIGNED")
+                ? "Analyst assigned to target " + target.getId()
+                : "Analyst assignment revoked for target " + target.getId());
+        event.setOrganization(target.getOrganization());
+        event.setActor(actor);
+        event.setTargetUser(analyst);
+        auditEventRepository.save(event);
     }
 
     private void audit(String type, String message, Organization organization, User actor) {

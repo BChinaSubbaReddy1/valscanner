@@ -75,6 +75,50 @@ function aggregateCount(stats, fields) {
   return fields.reduce((total, field) => total + Number(stats[field]), 0);
 }
 
+const STAT_ICONS = {
+  total: (
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M4 19V5a1 1 0 0 1 1-1h10l5 5v10a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1Z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+      <path d="M15 4v4a1 1 0 0 0 1 1h4" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+      <path d="M8 13h8M8 16.5h5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  ),
+  active: (
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <circle cx="12" cy="12" r="8" stroke="currentColor" strokeWidth="1.6" />
+      <path d="M12 7.5V12l3 2" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  ),
+  targets: (
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <circle cx="12" cy="12" r="8.5" stroke="currentColor" strokeWidth="1.6" />
+      <circle cx="12" cy="12" r="4.5" stroke="currentColor" strokeWidth="1.6" />
+      <circle cx="12" cy="12" r="1.2" fill="currentColor" />
+    </svg>
+  ),
+  findings: (
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M12 3.5 4.5 7v5.2c0 4.3 3.1 7.6 7.5 8.3 4.4-.7 7.5-4 7.5-8.3V7L12 3.5Z" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
+      <path d="M9.25 12.1 11 13.85l3.75-3.9" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  ),
+};
+
+function StatCard({ icon, tone, eyebrow, value, caption, loading }) {
+  return (
+    <article className="stat-card analyst-stat-card" data-tone={tone}>
+      <span className="analyst-stat-icon" aria-hidden="true">{icon}</span>
+      <span className="eyebrow">{eyebrow}</span>
+      {loading ? (
+        <span className="analyst-stat-skeleton" aria-hidden="true" />
+      ) : (
+        <strong>{value}</strong>
+      )}
+      <span className="muted">{caption}</span>
+    </article>
+  );
+}
+
 export default function AnalystWorkspacePage() {
   const { user, refreshUser } = useAuth();
   const [profileReady, setProfileReady] = useState(false);
@@ -227,6 +271,12 @@ export default function AnalystWorkspacePage() {
     'runningScans',
   ]);
   const selectedTarget = targets.find((target) => String(target.id) === String(selectedTargetId));
+  const criticalFindingCount = (severityCounts.CRITICAL || 0) + (severityCounts.HIGH || 0);
+  const runningScanCount = scans.content.filter((scan) => ACTIVE_SCAN_STATUSES.includes(scan.status)).length;
+  const heroSummary = !canUseScanner ? '' : [
+    runningScanCount > 0 ? `${runningScanCount} scan${runningScanCount === 1 ? '' : 's'} in progress` : 'No scans currently running',
+    criticalFindingCount > 0 ? `${criticalFindingCount} critical/high finding${criticalFindingCount === 1 ? '' : 's'} to review` : 'No critical or high findings outstanding',
+  ].join(' · ');
   useEffect(() => {
     if (!canUseScanner || !hasActiveScans) return undefined;
     if (pollingAttempts.current >= MAX_POLL_ATTEMPTS) {
@@ -306,15 +356,43 @@ export default function AnalystWorkspacePage() {
           <p className="eyebrow">Security operations overview</p>
           <h1>Good to see you, {displayName(user)}</h1>
           <p className="muted">Monitor approved targets, request authorized scans, and review persisted findings.</p>
+          {heroSummary ? <p className="analyst-hero-summary">{heroSummary}</p> : null}
         </div>
         <a className="primary-button" href="#targets">Start a scan</a>
       </div>
 
       <div className="analyst-stat-grid" aria-label="Scan overview">
-        <article className="stat-card analyst-stat-card"><span className="eyebrow">Total scans</span><strong>{scans.totalElements}</strong><span className="muted">Returned by the backend</span></article>
-        <article className="stat-card analyst-stat-card"><span className="eyebrow">Active jobs</span><strong>{dashboardLoading ? '—' : activeJobCount ?? 'Unavailable'}</strong><span className="muted">Backend aggregate</span></article>
-        <article className="stat-card analyst-stat-card"><span className="eyebrow">Approved targets</span><strong>{dashboardLoading ? '—' : dashboardStats?.approvedTargets ?? 'Unavailable'}</strong><span className="muted">Backend aggregate</span></article>
-        <article className="stat-card analyst-stat-card"><span className="eyebrow">Findings loaded</span><strong>{findingsLoading ? '—' : dashboardFindings.length}</strong><span className="muted">From completed scans</span></article>
+        <StatCard
+          icon={STAT_ICONS.total}
+          tone="neutral"
+          eyebrow="Total scans"
+          value={scans.totalElements}
+          caption="Returned by the backend"
+        />
+        <StatCard
+          icon={STAT_ICONS.active}
+          tone={activeJobCount ? 'warning' : 'neutral'}
+          eyebrow="Active jobs"
+          loading={dashboardLoading}
+          value={activeJobCount ?? 'Unavailable'}
+          caption="Backend aggregate"
+        />
+        <StatCard
+          icon={STAT_ICONS.targets}
+          tone="success"
+          eyebrow="Approved targets"
+          loading={dashboardLoading}
+          value={dashboardStats?.approvedTargets ?? 'Unavailable'}
+          caption="Backend aggregate"
+        />
+        <StatCard
+          icon={STAT_ICONS.findings}
+          tone={criticalFindingCount ? 'danger' : 'neutral'}
+          eyebrow="Findings loaded"
+          loading={findingsLoading}
+          value={dashboardFindings.length}
+          caption="From completed scans"
+        />
       </div>
 
       {!profileReady ? <LoadingSpinner label="Verifying account and organization approval…" /> : null}
@@ -451,7 +529,7 @@ export default function AnalystWorkspacePage() {
           <>
             <div className="card-grid">
               {scans.content.map((scan) => (
-                <article className="data-card" key={scan.id}>
+                <article className="data-card scan-job-card" data-scan-status={scan.status} key={scan.id}>
                   <div className="data-card-header">
                     <div>
                       <p className="eyebrow">{scan.scanType || 'Scan type unavailable'}</p>
@@ -459,6 +537,11 @@ export default function AnalystWorkspacePage() {
                     </div>
                     <span className="status-chip" data-status={scan.status} aria-label={`Scan status: ${scan.status}`}>{scan.status || 'UNKNOWN STATUS'}</span>
                   </div>
+                  {ACTIVE_SCAN_STATUSES.includes(scan.status) && Number.isFinite(scan.progress) ? (
+                    <div className="scan-progress" role="progressbar" aria-valuenow={scan.progress} aria-valuemin="0" aria-valuemax="100">
+                      <span className="scan-progress-fill" style={{ width: `${Math.min(100, Math.max(0, scan.progress))}%` }} />
+                    </div>
+                  ) : null}
                   <dl className="meta-list">
                     {Number.isFinite(scan.progress) ? <div><dt>Progress</dt><dd>{scan.progress}%</dd></div> : null}
                     <div><dt>Created</dt><dd>{dateText(scan.createdAt)}</dd></div>
@@ -518,17 +601,24 @@ export default function AnalystWorkspacePage() {
         {findingsLoading ? <LoadingSpinner label="Loading recent findings…" /> : findingsError ? null : dashboardFindings.length === 0 ? (
           <div className="empty-state">No findings were returned by completed scans on this page.</div>
         ) : (
-          <div className="finding-list">
-            {dashboardFindings.slice(0, 5).map((finding) => (
-              <article className="finding-row" key={`${finding.scanId}-${finding.id}`}>
-                <span className="severity-dot" data-severity={finding.severity} aria-label={`${finding.severity || 'Unknown'} severity`} />
-                <div><strong>{finding.checkType || 'Finding type unavailable'}</strong><span>{finding.targetName || 'Target unavailable'}</span></div>
-                <span className="finding-severity">{finding.severity || 'Severity unavailable'}</span>
-                <time dateTime={finding.detectedAt || undefined}>{dateText(finding.detectedAt)}</time>
-                <Link className="secondary-button compact-button" to={`/analyst/scans/${finding.scanId}`}>View scan</Link>
-              </article>
-            ))}
-          </div>
+          <>
+            <div className="finding-list">
+              {dashboardFindings.slice(0, 5).map((finding) => (
+                <article className="finding-row" key={`${finding.scanId}-${finding.id}`}>
+                  <span className="severity-dot" data-severity={finding.severity} aria-label={`${finding.severity || 'Unknown'} severity`} />
+                  <div><strong>{finding.checkType || 'Finding type unavailable'}</strong><span>{finding.targetName || 'Target unavailable'}</span></div>
+                  <span className="finding-severity" data-severity={finding.severity}>{finding.severity || 'Severity unavailable'}</span>
+                  <time dateTime={finding.detectedAt || undefined}>{dateText(finding.detectedAt)}</time>
+                  <Link className="secondary-button compact-button" to={`/analyst/scans/${finding.scanId}`}>View scan</Link>
+                </article>
+              ))}
+            </div>
+            {dashboardFindings.length > 5 ? (
+              <p className="muted finding-list-footnote">
+                Showing the latest 5 of {dashboardFindings.length} findings. Open a scan&apos;s details for the full list.
+              </p>
+            ) : null}
+          </>
         )}
       </section>
     </section>

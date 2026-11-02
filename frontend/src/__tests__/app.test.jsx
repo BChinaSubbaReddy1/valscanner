@@ -42,19 +42,41 @@ describe('Authentication, Access Control and IAM Views', () => {
       data: client.readStoredSession()?.user || {},
     }));
     vi.spyOn(client.organizationApi, 'getDashboard').mockResolvedValue({ data: {} });
+    vi.spyOn(client.organizationApi, 'getDashboardAnalytics').mockResolvedValue({
+      data: { scope: 'ORGANIZATION', from: '2026-10-03', through: '2026-11-01', points: [] },
+    });
     vi.spyOn(client.organizationApi, 'getPlatformDashboard').mockResolvedValue({ data: {} });
+    vi.spyOn(client.organizationApi, 'getPlatformDashboardAnalytics').mockResolvedValue({
+      data: { scope: 'PLATFORM', from: '2026-10-03', through: '2026-11-01', points: [] },
+    });
     vi.spyOn(client.scanApi, 'getAnalystDashboard').mockResolvedValue({ data: {} });
+    vi.spyOn(client.scanApi, 'listScans').mockResolvedValue({ data: { content: [], totalPages: 0 } });
+    vi.spyOn(client.scanApi, 'getAnalystDashboardAnalytics').mockResolvedValue({
+      data: { scope: 'ANALYST', from: '2026-10-03', through: '2026-11-01', points: [] },
+    });
+    vi.spyOn(client.scanApi, 'getScanAnalytics').mockResolvedValue({ data: null });
     vi.spyOn(client.scanApi, 'getReport').mockResolvedValue({ data: null });
+    vi.spyOn(client.scanApi, 'listFindingCorrelations').mockResolvedValue({ data: [] });
+    vi.spyOn(client.targetApi, 'listAssignmentAnalysts').mockResolvedValue({ data: [] });
+    vi.spyOn(client.targetApi, 'listAssignments').mockResolvedValue({ data: [] });
   });
 
   it('validates required login inputs', async () => {
     renderApp();
     await userEvent.click(screen.getByRole('button', { name: /sign in/i }));
-    expect(screen.getByText(/both email or username and password are required/i)).toBeInTheDocument();
+    expect(screen.getByText(/both email and password are required/i)).toBeInTheDocument();
   });
 
   it('logs in with the backend contract and loads the authenticated organization context', async () => {
     const loginSpy = vi.spyOn(client.authApi, 'login').mockResolvedValue({
+      data: {
+        challengeToken: 'login-challenge-token',
+        maskedEmail: 'a***@example.com',
+        expiresAt: new Date(Date.now() + 300_000).toISOString(),
+        resendAvailableAt: new Date(Date.now() + 60_000).toISOString(),
+      },
+    });
+    const verifySpy = vi.spyOn(client.authApi, 'verifyLoginOtp').mockResolvedValue({
       data: { token: 'authenticated-token', userId: 7, email: 'admin@example.com', roles: ['ADMIN'] },
     });
     const profileSpy = vi.spyOn(client.authApi, 'currentUser').mockResolvedValue({
@@ -62,7 +84,7 @@ describe('Authentication, Access Control and IAM Views', () => {
     });
 
     renderApp('/login');
-    await userEvent.type(screen.getByLabelText(/email or username/i), 'admin@example.com');
+    await userEvent.type(screen.getByLabelText(/^email$/i), 'admin@example.com');
     await userEvent.type(screen.getByLabelText(/^password$/i), 'LongPassword123');
     await userEvent.click(screen.getByRole('button', { name: /sign in/i }));
 
@@ -70,6 +92,21 @@ describe('Authentication, Access Control and IAM Views', () => {
       expect(loginSpy).toHaveBeenCalledWith({
         email: 'admin@example.com',
         password: 'LongPassword123',
+      });
+      expect(screen.getByRole('heading', { name: /verify your sign-in/i })).toBeInTheDocument();
+      expect(screen.getByText(/a\*\*\*@example\.com/)).toBeInTheDocument();
+      expect(screen.getByText(/code expires in \d+s/i)).toBeInTheDocument();
+      expect(verifySpy).not.toHaveBeenCalled();
+      expect(client.readStoredSession()).toBeNull();
+    });
+
+    await userEvent.type(screen.getByLabelText(/login verification code/i), '012345');
+    await userEvent.click(screen.getByRole('button', { name: /verify and sign in/i }));
+
+    await waitFor(() => {
+      expect(verifySpy).toHaveBeenCalledWith({
+        challengeToken: 'login-challenge-token',
+        otp: '012345',
       });
       expect(profileSpy).toHaveBeenCalled();
       expect(screen.getByText('12')).toBeInTheDocument();
@@ -175,6 +212,37 @@ describe('Authentication, Access Control and IAM Views', () => {
     expect(fetchSpy.mock.calls[6][1].body).toBe('{}');
   });
 
+  it('uses role-scoped historical analytics API routes', async () => {
+    localStorage.setItem('scanner-auth-session', JSON.stringify({
+      token: 'analytics-bearer-token',
+      user: { roles: ['ADMIN'] },
+    }));
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      json: async () => ({ success: true, data: { points: [] } }),
+    });
+    client.organizationApi.getDashboardAnalytics.mockRestore();
+    client.organizationApi.getPlatformDashboardAnalytics.mockRestore();
+    client.scanApi.getAnalystDashboardAnalytics.mockRestore();
+
+    await client.organizationApi.getDashboardAnalytics(30);
+    await client.organizationApi.getPlatformDashboardAnalytics(90);
+    await client.scanApi.getAnalystDashboardAnalytics(7);
+
+    expect(fetchSpy.mock.calls.map(([url]) => [
+      new URL(url).pathname,
+      new URL(url).searchParams.get('days'),
+    ])).toEqual([
+      ['/api/organizations/me/dashboard/analytics', '30'],
+      ['/api/organizations/platform-dashboard/analytics', '90'],
+      ['/api/scans/me/dashboard/analytics', '7'],
+    ]);
+    expect(fetchSpy.mock.calls.every(([, options]) =>
+      options.headers.get('Authorization') === 'Bearer analytics-bearer-token')).toBe(true);
+  });
+
   it('uses the implemented target routes and backend request fields', async () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
       ok: true,
@@ -218,6 +286,7 @@ describe('Authentication, Access Control and IAM Views', () => {
       json: async () => ({ success: true, data: { id: 81 } }),
     });
     client.scanApi.getAnalystDashboard.mockRestore();
+    client.scanApi.listScans.mockRestore();
 
     await client.scanApi.createScan(71, 'PASSIVE_HEADERS');
     await client.scanApi.listScans({ page: 1, size: 10 });
@@ -226,6 +295,8 @@ describe('Authentication, Access Control and IAM Views', () => {
     await client.scanApi.listFindings(81);
     await client.scanApi.listCrawlPages(81);
     await client.scanApi.getAnalystDashboard();
+    client.scanApi.listFindingCorrelations.mockRestore();
+    await client.scanApi.listFindingCorrelations(81);
 
     expect(fetchSpy.mock.calls.map(([url]) => new URL(url).pathname)).toEqual([
       '/api/scans',
@@ -235,9 +306,10 @@ describe('Authentication, Access Control and IAM Views', () => {
       '/api/scans/81/findings',
       '/api/scans/81/crawl-pages',
       '/api/scans/me/dashboard',
+      '/api/scans/81/correlations',
     ]);
     expect(fetchSpy.mock.calls.map(([, options]) => options.method)).toEqual([
-      'POST', 'GET', 'GET', 'POST', 'GET', 'GET', 'GET',
+      'POST', 'GET', 'GET', 'POST', 'GET', 'GET', 'GET', 'GET',
     ]);
     expect(fetchSpy.mock.calls[0][1].body).toBe('{"targetId":71,"scanType":"PASSIVE_HEADERS"}');
     expect(fetchSpy.mock.calls.every(([, options]) =>
@@ -469,8 +541,29 @@ describe('Authentication, Access Control and IAM Views', () => {
     await userEvent.type(screen.getByLabelText(/confirm password/i), 'Pass123');
     await userEvent.click(screen.getByRole('button', { name: /^register$/i }));
 
-    expect(screen.getByText(/password must be at least 8 characters/i)).toBeInTheDocument();
+    expect(screen.getByText('Password must be at least 8 characters long.')).toBeInTheDocument();
     expect(registerSpy).not.toHaveBeenCalled();
+  });
+
+  it('accepts an eight-character registration password', async () => {
+    const registerSpy = vi.spyOn(client.authApi, 'register').mockResolvedValue({
+      success: true,
+      message: 'User registered',
+      data: { email: 'eight@example.com' },
+    });
+
+    renderApp('/register');
+    await userEvent.type(screen.getByLabelText(/^first name$/i), 'Taylor');
+    await userEvent.type(screen.getByLabelText(/^last name$/i), 'Security');
+    await userEvent.type(screen.getByLabelText(/^email$/i), 'eight@example.com');
+    await userEvent.type(screen.getByLabelText(/^password$/i), 'Pass1234');
+    await userEvent.type(screen.getByLabelText(/confirm password/i), 'Pass1234');
+    await userEvent.type(screen.getByLabelText(/^organization name$/i), 'Eight Password Org');
+    await userEvent.click(screen.getByRole('button', { name: /^register$/i }));
+
+    await waitFor(() => {
+      expect(registerSpy).toHaveBeenCalledWith(expect.objectContaining({ password: 'Pass1234' }));
+    });
   });
 
   it('submits Organization Admin registration with a new organization name', async () => {
@@ -616,6 +709,60 @@ describe('Authentication, Access Control and IAM Views', () => {
     });
   });
 
+  it('activates the selected analyst section and shows the empty target state without scan controls', async () => {
+    localStorage.setItem('scanner-auth-session', JSON.stringify({
+      token: 'valid-analyst-token',
+      user: {
+        roles: ['SECURITY_ANALYST'],
+        accountStatus: 'ACTIVE',
+        membershipApprovalStatus: 'APPROVED',
+        organizationStatus: 'APPROVED',
+      },
+    }));
+    let resolveProfile;
+    const profileRequest = new Promise((resolve) => {
+      resolveProfile = resolve;
+    });
+    vi.spyOn(client.authApi, 'currentUser').mockReturnValue(profileRequest);
+    vi.spyOn(client.targetApi, 'listTargets').mockResolvedValue({ data: [] });
+    vi.spyOn(client.scanApi, 'listScans').mockResolvedValue({
+      data: { content: [], totalPages: 0, totalElements: 0, number: 0 },
+    });
+
+    renderApp('/analyst/workspace#request-scan');
+
+    const requestScanLink = screen.getByRole('link', { name: 'Request scan' });
+    expect(requestScanLink).toHaveAttribute('aria-current', 'page');
+    expect(screen.getByRole('link', { name: 'Analyst workspace' })).not.toHaveAttribute('aria-current');
+    expect(screen.getByRole('link', { name: 'Approved targets' })).not.toHaveAttribute('aria-current');
+    expect(screen.getByRole('link', { name: 'Scan history' })).not.toHaveAttribute('aria-current');
+    expect(screen.getByRole('link', { name: 'Findings' })).not.toHaveAttribute('aria-current');
+    expect(screen.queryByRole('heading', { name: 'Request a scan' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Approved target')).not.toBeInTheDocument();
+
+    await act(async () => {
+      resolveProfile({
+        data: {
+          roles: ['SECURITY_ANALYST'],
+          accountStatus: 'ACTIVE',
+          membershipApprovalStatus: 'APPROVED',
+          organizationStatus: 'APPROVED',
+        },
+      });
+    });
+
+    expect(await screen.findByText(/no approved targets are currently available/i)).toBeInTheDocument();
+    expect(await screen.findByText(/no scan jobs were returned/i)).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Request a scan' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Approved target')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Start selected scan' })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('link', { name: 'Scan history' }));
+    await waitFor(() => expect(window.location.hash).toBe('#history'));
+    expect(screen.getByRole('link', { name: 'Scan history' })).toHaveAttribute('aria-current', 'page');
+    expect(screen.getByRole('link', { name: 'Request scan' })).not.toHaveAttribute('aria-current');
+  });
+
   it('renders the verified role-scoped dashboard aggregates', async () => {
     localStorage.setItem('scanner-auth-session', JSON.stringify({
       token: 'valid-admin-token',
@@ -665,6 +812,43 @@ describe('Authentication, Access Control and IAM Views', () => {
     expect(await screen.findByText('4')).toBeInTheDocument();
     expect(screen.getByText(/crawling scans/i)).toBeInTheDocument();
     expect(analystDashboardSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders historical dashboard charts from backend analytics and supports a 90-day range', async () => {
+    localStorage.setItem('scanner-auth-session', JSON.stringify({
+      token: 'valid-admin-token',
+      user: { roles: ['ADMIN'] },
+    }));
+    const analyticsSpy = vi.spyOn(client.organizationApi, 'getDashboardAnalytics').mockResolvedValue({
+      data: {
+        scope: 'ORGANIZATION',
+        from: '2026-10-02',
+        through: '2026-11-01',
+        points: [{
+          date: '2026-11-01',
+          organizationsRegistered: 0,
+          scans: 3,
+          completedScans: 2,
+          failedScans: 1,
+          highFindings: 1,
+          mediumFindings: 2,
+          lowFindings: 4,
+        }],
+      },
+    });
+
+    renderApp('/');
+
+    expect(await screen.findByRole('img', { name: /scan activity over the last 30 days/i }))
+      .toBeInTheDocument();
+    expect(screen.getByRole('img', { name: /daily findings by severity over the last 30 days/i }))
+      .toBeInTheDocument();
+    expect(screen.getByText('Dashboard analytics')).toBeInTheDocument();
+    expect(analyticsSpy).toHaveBeenCalledWith(30);
+
+    await userEvent.selectOptions(screen.getByRole('combobox', { name: 'Analytics date range' }), '90');
+
+    await waitFor(() => expect(analyticsSpy).toHaveBeenLastCalledWith(90));
   });
 
   it('shows authorized targets and scan controls only for an active approved analyst', async () => {
@@ -961,6 +1145,107 @@ describe('Authentication, Access Control and IAM Views', () => {
     expect(screen.queryByText(/CVE-/i)).not.toBeInTheDocument();
   });
 
+  it('renders persisted link-wise analytics and filters findings by endpoint and engine', async () => {
+    localStorage.setItem('scanner-auth-session', JSON.stringify({
+      token: 'valid-analyst-token',
+      user: {
+        roles: ['SECURITY_ANALYST'],
+        accountStatus: 'ACTIVE',
+        membershipApprovalStatus: 'APPROVED',
+        organizationStatus: 'APPROVED',
+      },
+    }));
+    vi.spyOn(client.scanApi, 'getScan').mockResolvedValue({
+      data: {
+        id: 98,
+        targetId: 71,
+        targetName: 'Approved portal',
+        scanType: 'ZAP_ACTIVE',
+        status: 'COMPLETED',
+        progress: 100,
+        executionSummary: { resultCompleteness: 'FULL' },
+      },
+    });
+    vi.spyOn(client.scanApi, 'listScans').mockResolvedValue({
+      data: {
+        content: [
+          { id: 96, targetId: 71, targetName: 'Approved portal', scanType: 'PASSIVE_HEADERS', status: 'COMPLETED' },
+          { id: 98, targetId: 71, targetName: 'Approved portal', scanType: 'ZAP_ACTIVE', status: 'COMPLETED' },
+          { id: 99, targetId: 72, targetName: 'Another target', scanType: 'ZAP_ACTIVE', status: 'COMPLETED' },
+        ],
+        totalPages: 1,
+      },
+    });
+    vi.spyOn(client.scanApi, 'getScanAnalytics').mockResolvedValue({
+      data: {
+        scanId: 98,
+        targetId: 71,
+        resultCompleteness: 'FULL',
+        totalFindings: 2,
+        totalCrawlPages: 2,
+        endpoints: [
+          { url: 'https://portal.example.test/account', findingCount: 1, crawled: true, httpStatusCode: 200 },
+          { url: 'https://portal.example.test/search?q', findingCount: 1, crawled: true, httpStatusCode: 200 },
+        ],
+        severities: [{ key: 'HIGH', label: 'HIGH', count: 1 }, { key: 'MEDIUM', label: 'MEDIUM', count: 1 }],
+        findingTypes: [{ key: 'REFLECTED_XSS_POTENTIAL', label: 'REFLECTED_XSS_POTENTIAL', count: 1 }],
+        owaspCategories: [{ key: 'A03:2021 Injection', label: 'A03:2021 Injection', count: 1 }],
+        unmappedOwaspFindings: 1,
+        detectionSources: [{ key: 'OWASP_ZAP', label: 'OWASP_ZAP', count: 1 }],
+        findingRules: [],
+        ruleCoverage: {
+          inventoryStatus: 'AVAILABLE',
+          activeScanRequested: true,
+          passiveEnabledRules: ['10001: Example passive rule'],
+          activeEnabledRules: ['20001: Example active rule'],
+          executionEvidence: 'Enabled-rule snapshots are configuration evidence only.',
+        },
+        history: { comparable: false, explanation: 'No prior comparable scan.' },
+      },
+    });
+    vi.spyOn(client.scanApi, 'listFindings').mockResolvedValue({
+      data: [
+        {
+          id: 1,
+          checkType: 'CONTENT_SECURITY_POLICY',
+          severity: 'MEDIUM',
+          endpointUrl: 'https://portal.example.test/account',
+          detectionSource: 'PASSIVE_HEADERS',
+          sourceCweId: 'CWE-693',
+          evidence: 'Header evidence unique to account',
+        },
+        {
+          id: 2,
+          checkType: 'REFLECTED_XSS_POTENTIAL',
+          severity: 'HIGH',
+          endpointUrl: 'https://portal.example.test/search?q',
+          detectionSource: 'OWASP_ZAP',
+          sourceCweId: 'CWE-79',
+          evidence: 'Reflection evidence unique to search',
+        },
+      ],
+    });
+    vi.spyOn(client.scanApi, 'listCrawlPages').mockResolvedValue({ data: [] });
+
+    renderApp('/analyst/scans/98');
+
+    expect(await screen.findByRole('heading', { name: /link-wise finding analytics/i })).toBeInTheDocument();
+    expect(screen.getByLabelText('Target')).toHaveValue('71');
+    expect(screen.getByLabelText('Scan')).toHaveValue('98');
+    expect(screen.getByLabelText('Scan').querySelectorAll('option')).toHaveLength(2);
+    expect(screen.getByText(/configuration evidence only/i)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: /portal\.example\.test\/search/ }));
+    expect(screen.getByLabelText('Endpoint')).toHaveValue('https://portal.example.test/search?q');
+    expect(screen.getByText('Reflection evidence unique to search')).toBeInTheDocument();
+    expect(screen.queryByText('Header evidence unique to account')).not.toBeInTheDocument();
+    await userEvent.selectOptions(screen.getByLabelText('Detection engine'), 'OWASP_ZAP');
+    await userEvent.selectOptions(screen.getByLabelText('OWASP category'), 'A03:2021 Injection');
+    await userEvent.selectOptions(screen.getByLabelText('Severity'), 'HIGH');
+    await userEvent.selectOptions(screen.getByLabelText('Finding type'), 'REFLECTED_XSS_POTENTIAL');
+    expect(screen.getByText('Reflection evidence unique to search')).toBeInTheDocument();
+    expect(screen.queryByText('Header evidence unique to account')).not.toBeInTheDocument();
+  });
+
   it('renders script-like finding values as text instead of executable HTML', async () => {
     localStorage.setItem('scanner-auth-session', JSON.stringify({
       token: 'valid-analyst-token',
@@ -1035,7 +1320,7 @@ describe('Authentication, Access Control and IAM Views', () => {
     renderApp('/analyst/scans/92');
 
     expect(await screen.findByRole('alert')).toHaveTextContent(/not authorized/i);
-    expect(screen.queryByText(/evidence/i)).not.toBeInTheDocument();
+    expect(screen.queryByText('Evidence', { exact: true })).not.toBeInTheDocument();
     expect(screen.getByText(/retry findings/i)).toBeInTheDocument();
   });
 
@@ -1092,7 +1377,7 @@ describe('Authentication, Access Control and IAM Views', () => {
     renderApp('/analyst/scans/999');
 
     expect(await screen.findByRole('alert')).toHaveTextContent(/resource was not found/i);
-    expect(screen.queryByText(/evidence/i)).not.toBeInTheDocument();
+    expect(screen.queryByText('Evidence', { exact: true })).not.toBeInTheDocument();
   });
 
   it('renders report data and triggers exports using authenticated scanApi.exportReport', async () => {
@@ -1233,9 +1518,20 @@ describe('Authentication, Access Control and IAM Views', () => {
         checkType: 'KNOWN_VULNERABILITY_CVE',
         severity: 'HIGH',
         affectedComponent: 'Server: Apache/2.4.49 [CVE-2021-41773]',
-        evidence: "Software 'Apache' version '2.4.49' disclosed in 'Server' matches CVE-2021-41773 (CVSS score: 7.5, severity: HIGH, vector: CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N): Path traversal and file disclosure defect.",
+        evidence: "NVD keyword-search candidate only: 'Apache' version '2.4.49' disclosed in 'Server' was returned with CVE-2021-41773. Product and version applicability are not verified. NVD CVSS: 7.5 (HIGH; CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N). Path traversal and file disclosure defect.",
         rationale: 'Known vulnerability in detected software version.',
         remediation: 'Upgrade Apache to a supported, patched version.',
+        detectionSource: 'NVD_CVE_LOOKUP',
+        verificationStatus: 'POTENTIAL',
+        detectedAt: '2026-10-21T10:00:00Z',
+      }, {
+        id: 402,
+        checkType: 'CVE_KEYWORD_CANDIDATE',
+        severity: 'LOW',
+        affectedComponent: 'Server: Example/1.0 [CVE-2022-12345]',
+        evidence: 'Candidate CVE-2022-12345 reported malformed NVD CVSS: 99.0 (UNKNOWN; not-a-vector).',
+        rationale: 'Malformed metric fixture.',
+        remediation: 'Verify against the vendor advisory.',
         detectionSource: 'NVD_CVE_LOOKUP',
         verificationStatus: 'POTENTIAL',
         detectedAt: '2026-10-21T10:00:00Z',
@@ -1244,13 +1540,15 @@ describe('Authentication, Access Control and IAM Views', () => {
 
     renderApp('/analyst/scans/96');
 
-    expect(await screen.findByText('Known vulnerability / NVD lookup')).toBeInTheDocument();
+    expect(await screen.findAllByText('Known vulnerability / NVD lookup')).toHaveLength(2);
     expect(screen.getByText('CVE-2021-41773')).toBeInTheDocument();
-    expect(screen.getByText(/Potential match from software version/i)).toBeInTheDocument();
+    expect(screen.getAllByText(/Potential match from software version/i)).toHaveLength(2);
     expect(screen.getByText('NVD CVSS details')).toBeInTheDocument();
     expect(screen.getByText(/Score: 7\.5/)).toBeInTheDocument();
     expect(screen.getByText(/NVD-sourced metric; local scanner severity is HIGH/i)).toBeInTheDocument();
-    expect(screen.getByText('POTENTIAL')).toBeInTheDocument();
+    expect(screen.getAllByText('POTENTIAL')).toHaveLength(2);
+    const malformedCveCard = screen.getByText('CVE-2022-12345').closest('article');
+    expect(within(malformedCveCard).queryByText('NVD CVSS details')).not.toBeInTheDocument();
   });
 
   it('renders scan engine and formats native and ZAP detection sources accurately', async () => {
@@ -1282,6 +1580,9 @@ describe('Authentication, Access Control and IAM Views', () => {
           discoveredPageCount: 2,
           visitedPageCount: 2,
           testedPassivePageCount: 2,
+          adaptiveCheckSelections: [
+            'GET_QUERY https://hybrid.example.test/search?q (observed inputs=1) -> SQL_INJECTION',
+          ],
           checksInScope: ['Cookie attribute observations', 'OWASP ZAP spider and passive analysis'],
           checksOutOfScope: ['OWASP ZAP active scanning'],
         },
@@ -1312,9 +1613,27 @@ describe('Authentication, Access Control and IAM Views', () => {
           remediation: 'Use parameterized queries',
           detectionSource: 'ZAP_ACTIVE',
           verificationStatus: 'VERIFIED',
+          priorityScore: 60,
+          priorityLevel: 'HIGH',
+          priorityExplanation: 'Technical triage heuristic based on recorded finding fields.',
+          endpointUrl: 'https://hybrid.example.test/search?q',
+          httpMethod: 'GET',
+          parameterName: 'q',
           detectedAt: '2026-10-21T10:01:00Z',
         },
       ],
+    });
+    vi.spyOn(client.scanApi, 'listFindingCorrelations').mockResolvedValue({
+      data: [{
+        checkType: 'MISSING_FRAME_PROTECTION',
+        affectedComponent: 'https://hybrid.example.test/',
+        findingIds: [503, 504],
+        detectionEngines: ['NATIVE', 'OWASP_ZAP'],
+        relationshipType: 'EXACT_DUPLICATE',
+        matchingEvidence: 'Normalized category, endpoint, parameter, affected component, and evidence matched.',
+        confidence: 'HIGH',
+        interpretation: 'Overlap signal only; exploitability is not established.',
+      }],
     });
 
     renderApp('/analyst/scans/97');
@@ -1329,6 +1648,17 @@ describe('Authentication, Access Control and IAM Views', () => {
     expect(screen.getAllByText('OWASP ZAP').length).toBeGreaterThan(0);
     expect(screen.getAllByText('X_FRAME_OPTIONS').length).toBeGreaterThan(0);
     expect(screen.getAllByText('SQL_INJECTION_ACTIVE').length).toBeGreaterThan(0);
+    expect(screen.getByText(/HIGH \(60\/100\)/)).toBeInTheDocument();
+    expect(screen.getAllByText('https://hybrid.example.test/search?q').length).toBeGreaterThan(0);
+    expect(screen.getByText('GET')).toBeInTheDocument();
+    expect(screen.getByText('q')).toBeInTheDocument();
+    expect(screen.getByText(/GET_QUERY https:\/\/hybrid.example.test\/search/)).toBeInTheDocument();
+    expect(screen.getByText(/Technical triage heuristic based on recorded finding fields/)).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Finding relationships' })).toBeInTheDocument();
+    expect(screen.getByText('https://hybrid.example.test/')).toBeInTheDocument();
+    expect(screen.getByText('EXACT DUPLICATE')).toBeInTheDocument();
+    expect(screen.getByText('Normalized category, endpoint, parameter, affected component, and evidence matched.')).toBeInTheDocument();
+    expect(screen.getByText(/Overlap signal only; exploitability is not established/i)).toBeInTheDocument();
   });
 
   it('renders Super Admin organization approvals page with real workflow and confirmation', async () => {
@@ -1590,6 +1920,66 @@ describe('Authentication, Access Control and IAM Views', () => {
     await waitFor(() => {
       expect(decideSpy).toHaveBeenCalledWith(81, 'REJECT');
       expect(screen.getByText('REJECTED')).toBeInTheDocument();
+    });
+  });
+
+  it('assigns and reassigns approved targets using organization analyst display names', async () => {
+    localStorage.setItem('scanner-auth-session', JSON.stringify({
+      token: 'valid-admin-token',
+      user: { id: 7, roles: ['ADMIN'] },
+    }));
+    const target = {
+      id: 82,
+      name: 'Juice Shop',
+      url: 'https://juice.example.test',
+      type: 'WEB_APPLICATION',
+      status: 'APPROVED',
+    };
+    const candidates = [
+      { id: 71, displayName: 'Analyst A', email: 'a@example.test' },
+      { id: 72, displayName: 'Analyst B', email: 'b@example.test' },
+    ];
+    let assignment = [];
+    vi.spyOn(client.targetApi, 'listTargets').mockResolvedValue({ data: [target] });
+    client.targetApi.listAssignmentAnalysts.mockResolvedValue({ data: candidates });
+    client.targetApi.listAssignments.mockImplementation(async () => ({ data: assignment }));
+    const assignSpy = vi.spyOn(client.targetApi, 'assignAnalyst').mockImplementation(async (_targetId, analystId) => {
+      const analyst = candidates.find((candidate) => String(candidate.id) === String(analystId));
+      assignment = [{ analystId: analyst.id, displayName: analyst.displayName }];
+      return { message: 'Security Analyst assigned to target', data: assignment[0] };
+    });
+    const revokeSpy = vi.spyOn(client.targetApi, 'revokeAnalystAssignment').mockImplementation(async () => {
+      assignment = [];
+      return { message: 'Target assignment revoked' };
+    });
+
+    renderApp('/admin/targets');
+    expect(await screen.findByText('Juice Shop')).toBeInTheDocument();
+    expect(screen.getByText('Unassigned')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: /assign analyst/i }));
+    const analystSelect = screen.getByLabelText('Security Analyst for Juice Shop');
+    expect(within(analystSelect).getByRole('option', { name: 'Analyst A' })).toBeInTheDocument();
+    expect(within(analystSelect).getByRole('option', { name: 'Analyst B' })).toBeInTheDocument();
+    expect(screen.queryByText(/@example\.test/)).not.toBeInTheDocument();
+    await userEvent.selectOptions(analystSelect, '71');
+    await userEvent.click(screen.getByRole('button', { name: /confirm assignment/i }));
+
+    await waitFor(() => {
+      expect(assignSpy).toHaveBeenCalledWith(82, '71');
+      expect(screen.getByText('Analyst A')).toBeInTheDocument();
+    });
+    await userEvent.click(screen.getByRole('button', { name: /reassign analyst/i }));
+    await userEvent.selectOptions(screen.getByLabelText('Security Analyst for Juice Shop'), '72');
+    await userEvent.click(screen.getByRole('button', { name: /confirm assignment/i }));
+
+    await waitFor(() => {
+      expect(assignSpy).toHaveBeenLastCalledWith(82, '72');
+      expect(screen.getByText('Analyst B')).toBeInTheDocument();
+    });
+    await userEvent.click(screen.getByRole('button', { name: /remove assignment/i }));
+    await waitFor(() => {
+      expect(revokeSpy).toHaveBeenCalledWith(82, 72);
+      expect(screen.getByText('Unassigned')).toBeInTheDocument();
     });
   });
 

@@ -15,6 +15,11 @@ spring:
     enabled: false
 
 app:
+  auth:
+    login-otp:
+      max-sends-per-window: 100
+  email:
+    enabled: false
   security:
     jwt:
       secret: test-secret-key-that-is-long-enough-for-jwt-1234567890

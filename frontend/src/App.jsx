@@ -4,10 +4,13 @@ import { AuthProvider } from './auth/AuthContext.jsx';
 import { useAuth } from './auth/useAuth';
 import { organizationApi, scanApi } from './api/client';
 import LoadingSpinner from './components/LoadingSpinner';
+import DashboardCharts from './components/DashboardCharts';
 import AppLayout from './layouts/AppLayout';
 import LoginPage from './pages/auth/LoginPage';
+import VerifyLoginOtpPage from './pages/auth/VerifyLoginOtpPage';
 import RegisterPage from './pages/auth/RegisterPage';
 import ForgotPasswordPage from './pages/auth/ForgotPasswordPage';
+import VerifyPasswordResetOtpPage from './pages/auth/VerifyPasswordResetOtpPage';
 import ResetPasswordPage from './pages/auth/ResetPasswordPage';
 import OrganizationApprovalPage from './pages/super-admin/OrganizationApprovalPage';
 import AnalystApprovalPage from './pages/admin/AnalystApprovalPage';
@@ -33,6 +36,10 @@ function DashboardOverview() {
   const [dashboard, setDashboard] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [analytics, setAnalytics] = useState(null);
+  const [analyticsLoading, setAnalyticsLoading] = useState(true);
+  const [analyticsError, setAnalyticsError] = useState('');
+  const [analyticsDays, setAnalyticsDays] = useState(30);
   const role = hasRole(user, 'SUPER_ADMIN')
     ? 'SUPER_ADMIN'
     : hasRole(user, 'ADMIN')
@@ -62,9 +69,42 @@ function DashboardOverview() {
     }
   }, [role]);
 
+  const loadAnalytics = useCallback(async () => {
+    if (!role) {
+      setAnalytics(null);
+      setAnalyticsError('');
+      setAnalyticsLoading(false);
+      return;
+    }
+    setAnalyticsLoading(true);
+    setAnalyticsError('');
+    try {
+      const result = role === 'SUPER_ADMIN'
+        ? await organizationApi.getPlatformDashboardAnalytics(analyticsDays)
+        : role === 'ADMIN'
+          ? await organizationApi.getDashboardAnalytics(analyticsDays)
+          : await scanApi.getAnalystDashboardAnalytics(analyticsDays);
+      setAnalytics(dataOf(result) || null);
+    } catch (requestError) {
+      setAnalytics(null);
+      setAnalyticsError(requestError.message || 'Unable to load historical analytics.');
+    } finally {
+      setAnalyticsLoading(false);
+    }
+  }, [analyticsDays, role]);
+
   useEffect(() => {
     void Promise.resolve().then(loadDashboard);
   }, [loadDashboard]);
+
+  useEffect(() => {
+    void Promise.resolve().then(loadAnalytics);
+  }, [loadAnalytics]);
+
+  const refreshDashboard = () => {
+    void loadDashboard();
+    void loadAnalytics();
+  };
 
   const metrics = role === 'SUPER_ADMIN'
     ? [
@@ -108,7 +148,7 @@ function DashboardOverview() {
           <p className="eyebrow">Overview</p>
           <h1>{role === 'SUPER_ADMIN' ? 'Platform overview' : role === 'ADMIN' ? 'Organization overview' : 'Analyst overview'}</h1>
         </div>
-        <button type="button" className="secondary-button" onClick={loadDashboard} disabled={loading}>Refresh</button>
+        <button type="button" className="secondary-button" onClick={refreshDashboard} disabled={loading || analyticsLoading}>Refresh</button>
       </div>
 
       <article className="data-card">
@@ -134,6 +174,17 @@ function DashboardOverview() {
           ))}
         </div>
       )}
+      {role ? (
+        <DashboardCharts
+          role={role}
+          data={analytics}
+          days={analyticsDays}
+          onDaysChange={setAnalyticsDays}
+          loading={analyticsLoading}
+          error={analyticsError}
+          onRetry={loadAnalytics}
+        />
+      ) : null}
     </section>
   );
 }
@@ -145,8 +196,10 @@ function AuthenticationRouter() {
     return (
       <Routes>
         <Route path="/login" element={<LoginPage />} />
+        <Route path="/verify-login-otp" element={<VerifyLoginOtpPage />} />
         <Route path="/register" element={<RegisterPage />} />
         <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+        <Route path="/verify-otp" element={<VerifyPasswordResetOtpPage />} />
         <Route path="/reset-password" element={<ResetPasswordPage />} />
         <Route path="*" element={<Navigate to="/login" replace />} />
       </Routes>

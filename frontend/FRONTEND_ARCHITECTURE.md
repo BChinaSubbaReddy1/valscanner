@@ -24,10 +24,12 @@ The effective role list is derived from API response data. The frontend does not
 Set the backend URL in a local `.env` file:
 
 ```bash
-VITE_API_BASE_URL=http://localhost:8080
+VITE_API_BASE_URL=http://localhost:8081
 ```
 
-The client uses this value as the API base and injects the bearer token from local storage when a session exists.
+The Compose backend is published on port 8081 by default; a standalone Spring
+Boot process defaults to 8080. The client uses this value as the API base and
+injects the bearer token from local storage when a session exists.
 
 ## Security patterns
 

@@ -23,7 +23,9 @@ public record ScanReportResponse(
         int totalFindings,
         int totalCrawlPages,
         ScanExecutionSummary executionSummary,
-        List<ScanFindingResponse> findings
+        List<ScanFindingResponse> findings,
+        List<ScanFindingCorrelationResponse> correlations,
+        ScanAnalyticsResponse analytics
 ) {
     public record SeveritySummary(long high, long medium, long low, long total) {}
 }

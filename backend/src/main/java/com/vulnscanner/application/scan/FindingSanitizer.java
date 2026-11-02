@@ -1,6 +1,7 @@
 package com.vulnscanner.application.scan;
 
 import java.util.regex.Pattern;
+import com.vulnscanner.application.common.UrlSanitizer;
 
 public final class FindingSanitizer {
     private static final Pattern BEARER = Pattern.compile("(?i)(bearer\\s+)[a-z0-9._~+/-]+=*");
@@ -12,6 +13,8 @@ public final class FindingSanitizer {
             Pattern.compile("(?i)(set-cookie\\s*:\\s*[^=;\\s]+)=([^;\\r\\n]*)");
     private static final Pattern COOKIE_ASSIGNMENT =
             Pattern.compile("(?i)(?<![a-z0-9-])(cookie\\s*[:=]\\s*)[^&\\s,;<>\\\"]+");
+    private static final Pattern SESSION_IDENTIFIER =
+            Pattern.compile("(?i)(\\b(?:jsessionid|phpsessid|asp\\.net_sessionid|sessionid|sid)\\s*[=:]\\s*)[^&\\s,;<>\\\"]+");
 
     private FindingSanitizer() {
     }
@@ -21,13 +24,19 @@ public final class FindingSanitizer {
             return null;
         }
         return SENSITIVE_URL_PARAMETER.matcher(
-                SENSITIVE_ASSIGNMENT.matcher(
-                        COOKIE_ASSIGNMENT.matcher(
-                                COOKIE_VALUE.matcher(BEARER.matcher(input)
-                                        .replaceAll("$1[REDACTED]"))
-                                        .replaceAll("$1=[REDACTED]"))
+                SESSION_IDENTIFIER.matcher(
+                        SENSITIVE_ASSIGNMENT.matcher(
+                                COOKIE_ASSIGNMENT.matcher(
+                                        COOKIE_VALUE.matcher(BEARER.matcher(input)
+                                .replaceAll("$1[REDACTED]"))
+                                .replaceAll("$1=[REDACTED]"))
                                 .replaceAll("$1[REDACTED]"))
                         .replaceAll("$1=[REDACTED]"))
-                .replaceAll("$1[REDACTED]");
+                .replaceAll("$1[REDACTED]"))
+        .replaceAll("$1[REDACTED]");
+    }
+
+    public static String safeEndpoint(String value) {
+        return UrlSanitizer.safeEndpoint(value);
     }
 }

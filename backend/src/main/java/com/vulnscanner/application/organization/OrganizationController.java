@@ -1,6 +1,7 @@
 package com.vulnscanner.application.organization;
 
 import com.vulnscanner.application.common.ApiResponse;
+import com.vulnscanner.application.dashboard.DashboardAnalyticsResponse;
 import com.vulnscanner.application.user.UserStatus;
 import jakarta.validation.Valid;
 import org.springframework.data.domain.Page;
@@ -120,11 +121,27 @@ public class OrganizationController {
                 organizationService.getDashboard()));
     }
 
+    @GetMapping("/me/dashboard/analytics")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<ApiResponse<DashboardAnalyticsResponse>> getDashboardAnalytics(
+            @RequestParam(defaultValue = "30") int days) {
+        return ResponseEntity.ok(ApiResponse.success("Organization dashboard analytics retrieved",
+                organizationService.getDashboardAnalytics(days)));
+    }
+
     @GetMapping("/platform-dashboard")
     @PreAuthorize("hasRole('SUPER_ADMIN')")
     public ResponseEntity<ApiResponse<PlatformDashboardResponse>> getPlatformDashboard() {
         return ResponseEntity.ok(ApiResponse.success("Platform dashboard retrieved",
                 organizationService.getPlatformDashboard()));
+    }
+
+    @GetMapping("/platform-dashboard/analytics")
+    @PreAuthorize("hasRole('SUPER_ADMIN')")
+    public ResponseEntity<ApiResponse<DashboardAnalyticsResponse>> getPlatformDashboardAnalytics(
+            @RequestParam(defaultValue = "30") int days) {
+        return ResponseEntity.ok(ApiResponse.success("Platform dashboard analytics retrieved",
+                organizationService.getPlatformDashboardAnalytics(days)));
     }
 
     @GetMapping("/me/users")

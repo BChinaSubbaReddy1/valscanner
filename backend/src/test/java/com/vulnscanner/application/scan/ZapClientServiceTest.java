@@ -99,6 +99,25 @@ class ZapClientServiceTest {
     }
 
     @Test
+    void enabledScannerRuleInventoryReturnsOnlyValidatedEnabledRuleNames() throws Exception {
+        server = startServer("/JSON/pscan/view/scanners/",
+                "{\"scanners\":[{\"id\":\"10001\",\"name\":\"Passive check\",\"enabled\":true},"
+                        + "{\"id\":\"10002\",\"name\":\"Disabled check\",\"enabled\":false}]}");
+        ZapClientService client = client();
+
+        assertEquals(java.util.List.of("10001: Passive check"), client.getEnabledScannerRules(false));
+    }
+
+    @Test
+    void malformedEnabledScannerRuleInventoryIsRejected() throws Exception {
+        server = startServer("/JSON/ascan/view/scanners/",
+                "{\"scanners\":[{\"id\":\"not-a-rule\",\"name\":\"Invalid\",\"enabled\":true}]}");
+        ZapClientService client = client();
+
+        assertThrows(IOException.class, () -> client.getEnabledScannerRules(true));
+    }
+
+    @Test
     void invalidPassiveScanQueueCountIsAnError() throws Exception {
         server = startServer("/JSON/pscan/view/recordsToScan/", "{\"recordsToScan\":\"pending\"}");
         ZapClientService client = client();
@@ -136,6 +155,8 @@ class ZapClientServiceTest {
         });
         ZapClientService unauthorizedClient = client();
         assertFalse(unauthorizedClient.isAvailable());
+        assertEquals(ZapClientService.AvailabilityStatus.AUTHENTICATION_FAILED,
+                unauthorizedClient.checkAvailability());
 
         server.stop(0);
         server = startServer("/JSON/core/view/version/", "{\"unexpected\":\"response\"}");

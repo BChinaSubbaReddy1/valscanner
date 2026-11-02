@@ -94,6 +94,33 @@ public final class PdfReportGenerator {
                 + ", Total " + report.totalFindings());
         appendField(lines, "Checks in scope", String.join("; ", scope.checksInScope()));
         appendField(lines, "Checks out of scope", String.join("; ", scope.checksOutOfScope()));
+        appendField(lines, "Adaptive check selections",
+                String.join(" | ", scope.adaptiveCheckSelections()));
+        appendField(lines, "ZAP rule inventory status", scope.zapRuleInventoryStatus());
+        appendField(lines, "ZAP passive rules enabled", String.join(" | ", scope.zapPassiveEnabledRules()));
+        appendField(lines, "ZAP active rules enabled", String.join(" | ", scope.zapActiveEnabledRules()));
+        appendField(lines, "Rule execution evidence", report.analytics().ruleCoverage().executionEvidence());
+        lines.add("Link-wise endpoint findings:");
+        if (report.analytics().endpoints().isEmpty()) {
+            lines.add("No endpoint or crawl-page analytics were available.");
+        }
+        report.analytics().endpoints().forEach(endpoint -> lines.add(
+                (endpoint.url() == null ? "Endpoint unavailable" : endpoint.url())
+                        + " | findings=" + endpoint.findingCount()
+                        + " | crawled=" + endpoint.crawled()
+                        + " | HTTP status=" + count(endpoint.httpStatusCode())));
+        appendMetrics(lines, "Severity distribution", report.analytics().severities());
+        appendMetrics(lines, "Finding type distribution", report.analytics().findingTypes());
+        appendMetrics(lines, "OWASP category distribution", report.analytics().owaspCategories());
+        appendMetrics(lines, "Detection source distribution", report.analytics().detectionSources());
+        appendMetrics(lines, "Generated finding rules", report.analytics().findingRules());
+        lines.add("Unmapped OWASP findings: " + report.analytics().unmappedOwaspFindings());
+        ScanAnalyticsResponse.HistoryComparison history = report.analytics().history();
+        lines.add("History comparison: " + (history.comparable() ? "comparable" : "not comparable")
+                + " | New " + history.newFindings() + " | Resolved " + history.resolvedFindings()
+                + " | Persistent " + history.persistentFindings()
+                + " | Severity changed " + history.severityChangedFindings());
+        appendField(lines, "History interpretation", history.explanation());
         appendField(lines, "Status details", report.statusMessage());
         lines.add("Findings:");
         if (report.findings().isEmpty()) {
@@ -102,6 +129,12 @@ public final class PdfReportGenerator {
         for (ScanFindingResponse finding : report.findings()) {
             lines.add("");
             lines.add("[" + finding.severity() + "] " + finding.checkType() + " (finding " + finding.id() + ")");
+            appendField(lines, "Technical priority",
+                    finding.priorityLevel() + " (" + finding.priorityScore() + "/100)");
+            appendField(lines, "Priority methodology", finding.priorityExplanation());
+            appendField(lines, "Endpoint", finding.endpointUrl());
+            appendField(lines, "HTTP method", finding.httpMethod());
+            appendField(lines, "Parameter", finding.parameterName());
             appendField(lines, "Affected location", finding.affectedComponent());
             appendField(lines, "Evidence", finding.evidence());
             appendField(lines, "Rationale", finding.rationale());
@@ -116,12 +149,37 @@ public final class PdfReportGenerator {
                     + " | Reference " + finding.sourceReference());
             appendField(lines, "Remediation", finding.remediation());
         }
+        lines.add("");
+        lines.add("Finding relationships:");
+        if (report.correlations().isEmpty()) {
+            lines.add("No findings were available for relationship analysis.");
+        }
+        for (ScanFindingCorrelationResponse correlation : report.correlations()) {
+            lines.add(correlation.checkType());
+            appendField(lines, "Endpoint or component", correlation.affectedComponent());
+            appendField(lines, "Finding IDs", correlation.findingIds().stream()
+                    .map(String::valueOf).collect(java.util.stream.Collectors.joining(", ")));
+            appendField(lines, "Detection engines", String.join(", ", correlation.detectionEngines()));
+            appendField(lines, "Relationship", correlation.relationshipType());
+            appendField(lines, "Matching evidence", correlation.matchingEvidence());
+            appendField(lines, "Relationship confidence", correlation.confidence());
+            appendField(lines, "Interpretation", correlation.interpretation());
+        }
         return printableLines(lines);
     }
 
     private static void appendField(List<String> lines, String label, String value) {
         String text = label + ": " + (value == null || value.isBlank() ? "Not available" : value);
         lines.add(text);
+    }
+
+    private static void appendMetrics(List<String> lines, String heading,
+                                      List<ScanAnalyticsResponse.CountMetric> metrics) {
+        lines.add(heading + ":");
+        if (metrics.isEmpty()) {
+            lines.add("No mapped results.");
+        }
+        metrics.forEach(metric -> lines.add(metric.label() + ": " + metric.count()));
     }
 
     private static String count(Integer value) {

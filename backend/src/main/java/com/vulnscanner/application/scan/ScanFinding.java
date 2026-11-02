@@ -56,6 +56,15 @@ public class ScanFinding {
     @Column(name = "source_wasc_id", length = 16)
     private String sourceWascId;
 
+    @Column(name = "endpoint_url", length = 2048)
+    private String endpointUrl;
+
+    @Column(name = "http_method", length = 10)
+    private String httpMethod;
+
+    @Column(name = "parameter_name", length = 255)
+    private String parameterName;
+
     @Column(name = "detected_at", nullable = false, updatable = false)
     private Instant detectedAt = Instant.now();
 
@@ -65,6 +74,14 @@ public class ScanFinding {
     public ScanFinding(ScanJob scanJob, String checkType, String severity, String affectedComponent,
                        String evidence, String rationale, String remediation,
                        String detectionSource, String verificationStatus) {
+        this(scanJob, checkType, severity, affectedComponent, evidence, rationale, remediation,
+                detectionSource, verificationStatus, null, null, null);
+    }
+
+    public ScanFinding(ScanJob scanJob, String checkType, String severity, String affectedComponent,
+                       String evidence, String rationale, String remediation,
+                       String detectionSource, String verificationStatus,
+                       String endpointUrl, String httpMethod, String parameterName) {
         this.scanJob = scanJob;
         this.checkType = checkType;
         this.severity = severity;
@@ -74,6 +91,7 @@ public class ScanFinding {
         this.remediation = remediation;
         this.detectionSource = detectionSource;
         this.verificationStatus = verificationStatus;
+        setObservationDetails(endpointUrl, httpMethod, parameterName);
     }
 
     void setSourceMetadata(String ruleId, String confidence, String reference, String cweId, String wascId) {
@@ -82,6 +100,12 @@ public class ScanFinding {
         this.sourceReference = reference;
         this.sourceCweId = cweId;
         this.sourceWascId = wascId;
+    }
+
+    void setObservationDetails(String endpointUrl, String httpMethod, String parameterName) {
+        this.endpointUrl = endpointUrl;
+        this.httpMethod = httpMethod;
+        this.parameterName = parameterName;
     }
 
     public Long getId() { return id; }
@@ -99,5 +123,8 @@ public class ScanFinding {
     public String getSourceReference() { return sourceReference; }
     public String getSourceCweId() { return sourceCweId; }
     public String getSourceWascId() { return sourceWascId; }
+    public String getEndpointUrl() { return endpointUrl; }
+    public String getHttpMethod() { return httpMethod; }
+    public String getParameterName() { return parameterName; }
     public Instant getDetectedAt() { return detectedAt; }
 }

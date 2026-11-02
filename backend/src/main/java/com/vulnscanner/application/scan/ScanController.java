@@ -1,6 +1,7 @@
 package com.vulnscanner.application.scan;
 
 import com.vulnscanner.application.common.ApiResponse;
+import com.vulnscanner.application.dashboard.DashboardAnalyticsResponse;
 import jakarta.validation.Valid;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -18,10 +19,13 @@ import java.util.List;
 public class ScanController {
     private final ScanService scanService;
     private final ScanReportService scanReportService;
+    private final ScanAnalyticsService scanAnalyticsService;
 
-    public ScanController(ScanService scanService, ScanReportService scanReportService) {
+    public ScanController(ScanService scanService, ScanReportService scanReportService,
+                          ScanAnalyticsService scanAnalyticsService) {
         this.scanService = scanService;
         this.scanReportService = scanReportService;
+        this.scanAnalyticsService = scanAnalyticsService;
     }
 
     @PostMapping
@@ -41,6 +45,14 @@ public class ScanController {
     public ResponseEntity<ApiResponse<AnalystDashboardResponse>> analystDashboard() {
         return ResponseEntity.ok(ApiResponse.success("Analyst dashboard retrieved",
                 scanService.analystDashboard()));
+    }
+
+    @GetMapping("/me/dashboard/analytics")
+    @PreAuthorize("hasRole('SECURITY_ANALYST')")
+    public ResponseEntity<ApiResponse<DashboardAnalyticsResponse>> analystDashboardAnalytics(
+            @RequestParam(defaultValue = "30") int days) {
+        return ResponseEntity.ok(ApiResponse.success("Analyst dashboard analytics retrieved",
+                scanService.analystDashboardAnalytics(days)));
     }
 
     @GetMapping("/pending-approval")
@@ -80,6 +92,12 @@ public class ScanController {
         return ResponseEntity.ok(ApiResponse.success("Scan findings retrieved", scanService.findings(scanId)));
     }
 
+    @GetMapping("/{scanId}/analytics")
+    public ResponseEntity<ApiResponse<ScanAnalyticsResponse>> analytics(@PathVariable Long scanId) {
+        return ResponseEntity.ok(ApiResponse.success("Scan analytics retrieved",
+                scanAnalyticsService.analyze(scanId)));
+    }
+
     @GetMapping("/{scanId}/crawl-pages")
     public ResponseEntity<ApiResponse<List<ScanCrawlPageResponse>>> crawlPages(@PathVariable Long scanId) {
         return ResponseEntity.ok(ApiResponse.success("Scan crawl pages retrieved",
@@ -90,6 +108,13 @@ public class ScanController {
     public ResponseEntity<ApiResponse<ScanReportResponse>> report(@PathVariable Long scanId) {
         return ResponseEntity.ok(ApiResponse.success("Scan report retrieved",
                 scanReportService.generateReport(scanId)));
+    }
+
+    @GetMapping("/{scanId}/correlations")
+    public ResponseEntity<ApiResponse<List<ScanFindingCorrelationResponse>>> correlations(
+            @PathVariable Long scanId) {
+        return ResponseEntity.ok(ApiResponse.success("Cross-engine finding overlaps retrieved",
+                scanReportService.correlateFindings(scanId)));
     }
 
     @GetMapping("/{scanId}/report/export")

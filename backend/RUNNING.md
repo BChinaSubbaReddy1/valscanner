@@ -18,7 +18,7 @@ docker compose up --build
 This will:
 1. Start MySQL 8 and create the `scanner` database.
 2. Build the Spring Boot app in a Maven container.
-3. Run Flyway migrations (`V1` through `V8`) against that database automatically.
+3. Run Flyway migrations against that database automatically.
 4. Optionally bootstrap a `SUPER_ADMIN` account using
    `INITIAL_SUPER_ADMIN_EMAIL` / `INITIAL_SUPER_ADMIN_PASSWORD`. Both values
    are blank by default; set them through an untracked `.env` file or a
@@ -34,25 +34,36 @@ Health check:
 curl http://localhost:8081/actuator/health
 ```
 
+Password-reset delivery and the mandatory sign-in OTP are disabled by default.
+Password-based login cannot complete until email is enabled. Configure
+`EMAIL_ENABLED=true`, `EMAIL_FROM`, and the SMTP `MAIL_HOST`, `MAIL_PORT`,
+`MAIL_USERNAME`, and `MAIL_PASSWORD` values in an untracked `.env` file or a
+deployment secret manager. Never commit SMTP credentials. Flyway applies V16
+for password-reset challenges, V17 for login challenges, and V21 for scan-time
+ZAP rule inventory snapshots. Login OTP expires
+after five minutes by default, allows five attempts, and has a 60-second resend
+cooldown; these settings can be overridden with the `LOGIN_OTP_*` variables in
+`.env`.
+
 After authenticating as an Organization Admin or Security Analyst and approving a target,
 create and verify a passive scan:
 ```bash
-curl -X POST http://localhost:8080/api/scans \
+curl -X POST http://localhost:8081/api/scans \
   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"targetId":1,"scanType":"PASSIVE_HEADERS"}'
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/scans
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/scans/1/findings
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8081/api/scans
+curl -H "Authorization: Bearer $TOKEN" http://localhost:8081/api/scans/1/findings
 ```
 Organization Admin approval:
 ```bash
 curl -H "Authorization: Bearer $ADMIN_TOKEN" \
-  http://localhost:8080/api/scans/pending-approval
+  http://localhost:8081/api/scans/pending-approval
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
-  http://localhost:8080/api/scans/1/approve
+  http://localhost:8081/api/scans/1/approve
 ```
 To reject instead:
 ```bash
-curl -X POST http://localhost:8080/api/scans/1/reject \
+curl -X POST http://localhost:8081/api/scans/1/reject \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"reason":"Target is not ready"}'
@@ -104,6 +115,16 @@ The native scanner has configured request and response limits; ZAP has separate
 spider/active scan limits.
 POST-body, authenticated-account, and browser-execution coverage is not provided by
 the native scanner.
+
+`GET /api/scans/{scanId}/analytics` returns organization- and assignment-authorized
+aggregates from persisted findings and crawl pages. It includes bounded endpoint
+counts, severity/type/engine distributions, explicitly mapped OWASP categories,
+finding-rule counts, and history comparisons only against fully completed scans of
+the same target and scan type. Failed or partial engine output is never interpreted
+as a clean comparison. JSON, CSV, and PDF reports include the same analytics.
+ZAP's enabled passive/active rules are snapshotted when available; the snapshot is
+configuration evidence and does not claim that every enabled rule executed. ZAP
+does not expose per-rule execution evidence through the integration used here.
 
 The exact-origin allowlist does not make `http://[::1]:5173/` a host target from
 inside a container: IPv6 loopback is the container itself. For a different host-run

@@ -1,5 +1,7 @@
 package com.vulnscanner.application;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.vulnscanner.application.auth.PasswordResetEmailService;
 import com.vulnscanner.application.organization.*;
 import com.vulnscanner.application.role.*;
 import com.vulnscanner.application.user.*;
@@ -10,6 +12,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.http.MediaType;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.context.ActiveProfiles;
@@ -18,6 +21,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
+import static org.mockito.Mockito.when;
 
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -40,8 +44,15 @@ class AuthSecurityIntegrationTest {
     @Autowired
     private PasswordEncoder passwordEncoder;
 
+    @Autowired
+    private ObjectMapper objectMapper;
+
+    @MockBean
+    private PasswordResetEmailService passwordResetEmailService;
+
     @BeforeEach
     void setUp() {
+        when(passwordResetEmailService.isConfigured()).thenReturn(true);
         userRepository.deleteAll();
         organizationRepository.deleteAll();
 
@@ -139,11 +150,30 @@ class AuthSecurityIntegrationTest {
     }
 
     @Test
-    void passwordResetEndpointReportsUnavailableWhenDeliveryIsNotConfigured() throws Exception {
+    void forgotPasswordReturnsSameSafeUnavailableResponseWhenEmailDeliveryIsNotConfigured() throws Exception {
+        when(passwordResetEmailService.isConfigured()).thenReturn(false);
+        createUser(RoleName.SUPER_ADMIN, "tampered-token-super@example.com");
         mockMvc.perform(post("/api/auth/forgot-password")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"email\":\"user@example.com\"}"))
-                .andExpect(status().isServiceUnavailable());
+                        .content("{\"email\":\"tampered-token-super@example.com\"}"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.message").value(
+                        "Password reset email is temporarily unavailable; contact support."));
+        mockMvc.perform(post("/api/auth/forgot-password")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"unknown-reset@example.com\"}"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.message").value(
+                        "Password reset email is temporarily unavailable; contact support."));
+    }
+
+    @Test
+    void otpVerificationIsPublicButDoesNotAcceptAnInvalidCode() throws Exception {
+        mockMvc.perform(post("/api/auth/verify-reset-otp")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"email\":\"unknown-reset@example.com\",\"otp\":\"123456\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.message").value("Invalid or expired verification code"));
     }
 
     @Test
@@ -162,13 +192,8 @@ class AuthSecurityIntegrationTest {
     }
 
     private String authenticate(String email, String password) throws Exception {
-        String json = "{\"email\":\"" + email + "\",\"password\":\"" + password + "\"}";
-        String response = mockMvc.perform(post("/api/auth/login")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(json))
-                .andExpect(status().isOk())
-                .andReturn().getResponse().getContentAsString();
-        return response.split("\"token\":\"")[1].split("\"")[0];
+        return LoginOtpTestSupport.completeLogin(
+                mockMvc, objectMapper, passwordResetEmailService, email, password);
     }
 
     private User createUser(RoleName roleName, String email) {

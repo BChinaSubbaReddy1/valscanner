@@ -11,6 +11,8 @@ import java.net.http.HttpClient;
 import java.net.http.HttpTimeoutException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -395,24 +397,44 @@ public class ScanExecutionService {
         String activeScanId = null;
         boolean spiderFinished = false;
         boolean activeFinished = false;
+        Set<String> baselineAlertIds = null;
+        boolean alertsPersisted = false;
         ZapClientService.ScopeContext context = null;
         try {
             ZapClientService.AvailabilityStatus availability = zapClientService.checkAvailability();
             if (availability != ZapClientService.AvailabilityStatus.AVAILABLE) {
                 boolean timedOut = availability == ZapClientService.AvailabilityStatus.TIMED_OUT;
+                boolean authenticationFailed =
+                        availability == ZapClientService.AvailabilityStatus.AUTHENTICATION_FAILED;
                 job.updateZapEngineStatus(timedOut ? "TIMED_OUT" : "UNAVAILABLE");
-                job.updateZapFailureReason(timedOut
-                        ? "ZAP_HEALTH_CHECK_TIMEOUT" : "ZAP_HEALTH_CHECK_FAILED");
+                job.updateZapFailureReason(timedOut ? "ZAP_HEALTH_CHECK_TIMEOUT"
+                        : authenticationFailed ? "ZAP_AUTHENTICATION_FAILED" : "ZAP_HEALTH_CHECK_FAILED");
                 persistExecutionState(job);
                 completeWithPartialZapResults(job,
                         timedOut
                                 ? "Native checks completed; OWASP ZAP health check timed out"
+                                : authenticationFailed
+                                ? "Native checks completed; OWASP ZAP API authentication failed"
                                 : "Native checks completed; OWASP ZAP is unavailable, so ZAP findings are omitted");
                 return;
             }
+            try {
+                List<String> passiveRules = zapClientService.getEnabledScannerRules(false);
+                List<String> activeRules = job.getScanType() == ScanType.ZAP_ACTIVE
+                        ? zapClientService.getEnabledScannerRules(true) : List.of();
+                if (passiveRules == null || activeRules == null) {
+                    throw new IOException("ZAP scanner rule inventory response is unavailable");
+                }
+                job.recordZapRuleInventory("AVAILABLE", passiveRules, activeRules);
+            } catch (IOException exception) {
+                LOG.warn("OWASP ZAP rule inventory unavailable for scan {} ({})",
+                        job.getId(), exception.getClass().getSimpleName());
+                job.recordZapRuleInventory("UNAVAILABLE", List.of(), List.of());
+            }
+            persistExecutionState(job);
             job.updateZapEngineStatus("RUNNING");
             persistExecutionState(job);
-            Set<String> existingAlertIds = zapClientService.getAlerts(targetUrl).stream()
+            baselineAlertIds = zapClientService.getAlerts(targetUrl).stream()
                     .map(ZapAlert::id)
                     .filter(id -> id != null && !id.isBlank())
                     .collect(java.util.stream.Collectors.toUnmodifiableSet());
@@ -544,9 +566,10 @@ public class ScanExecutionService {
             if (cancelIfRequested(job, "Scan cancelled before OWASP ZAP alert processing")) {
                 return;
             }
+            Set<String> capturedBaselineAlertIds = baselineAlertIds;
             List<ZapAlert> alerts = zapClientService.getAlerts(targetUrl).stream()
                     .filter(alert -> alert.id() != null && !alert.id().isBlank())
-                    .filter(alert -> !existingAlertIds.contains(alert.id()))
+                    .filter(alert -> !capturedBaselineAlertIds.contains(alert.id()))
                     .filter(alert -> isSameOriginZapAlert(zapOrigin, alert))
                     .map(alert -> restoreSavedTargetOrigin(alert, origin, zapOrigin))
                     .toList();
@@ -558,6 +581,7 @@ public class ScanExecutionService {
                 return;
             }
             persistZapFindings(job, alerts);
+            alertsPersisted = true;
 
             job.updateZapAlertCount(alerts.size());
             job.updateZapEngineStatus("COMPLETED");
@@ -566,6 +590,9 @@ public class ScanExecutionService {
             audit(job, "SCAN_JOB_COMPLETED", job.getStatusMessage());
         } catch (ScanExecutionException exception) {
             LOG.warn("OWASP ZAP scan {} did not complete: {}", job.getId(), exception.reason());
+            if (!alertsPersisted) {
+                retainPartialZapAlerts(job, targetUrl, origin, zapOrigin, baselineAlertIds);
+            }
             String failedStatus = exception.reason() == ScanFailureReason.TIME_BUDGET_EXCEEDED
                     ? "TIMED_OUT" : "FAILED";
             job.updateZapEngineStatus(failedStatus);
@@ -576,6 +603,9 @@ public class ScanExecutionService {
                             + " (" + exception.reason().name() + ")");
         } catch (IOException e) {
             LOG.warn("OWASP ZAP API communication failed for scan {}", job.getId());
+            if (!alertsPersisted) {
+                retainPartialZapAlerts(job, targetUrl, origin, zapOrigin, baselineAlertIds);
+            }
             boolean timedOut = e instanceof HttpTimeoutException;
             String failedStatus = timedOut ? "TIMED_OUT" : "FAILED";
             String failureReason = timedOut ? "ZAP_REQUEST_TIMEOUT" : "ZAP_COMMUNICATION_FAILED";
@@ -597,6 +627,9 @@ public class ScanExecutionService {
                 persistExecutionState(job);
                 audit(job, "SCAN_JOB_CANCELLED", job.getStatusMessage());
             } else {
+                if (!alertsPersisted) {
+                    retainPartialZapAlerts(job, targetUrl, origin, zapOrigin, baselineAlertIds);
+                }
                 job.updateZapEngineStatus("FAILED");
                 job.updateZapFailureReason("ZAP_INTERRUPTED");
                 markRunningZapStages(job, "FAILED");
@@ -612,6 +645,31 @@ public class ScanExecutionService {
             }
             zapClientService.removeContext(context);
             ZAP_EXECUTION_LOCK.unlock();
+        }
+    }
+
+    private void retainPartialZapAlerts(ScanJob job, String targetUrl, URI origin, URI zapOrigin,
+                                        Set<String> baselineAlertIds) {
+        if (baselineAlertIds == null || job.isCancellationRequested()) {
+            return;
+        }
+        try {
+            List<ZapAlert> partialAlerts = zapClientService.getAlerts(targetUrl).stream()
+                    .filter(alert -> alert.id() != null && !alert.id().isBlank())
+                    .filter(alert -> !baselineAlertIds.contains(alert.id()))
+                    .filter(alert -> isSameOriginZapAlert(zapOrigin, alert))
+                    .map(alert -> restoreSavedTargetOrigin(alert, origin, zapOrigin))
+                    .toList();
+            persistZapFindings(job, partialAlerts);
+            job.updateZapAlertCount(partialAlerts.size());
+            persistExecutionState(job);
+            LOG.info("Retained {} OWASP ZAP alerts from partial scan {}", partialAlerts.size(), job.getId());
+        } catch (IOException exception) {
+            LOG.warn("Could not retrieve partial OWASP ZAP alerts for scan {} ({})",
+                    job.getId(), exception.getClass().getSimpleName());
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            LOG.warn("Partial OWASP ZAP alert retrieval was interrupted for scan {}", job.getId());
         }
     }
 
@@ -915,49 +973,66 @@ public class ScanExecutionService {
             Set<String> keys = new HashSet<>();
             ScanResponse baseline = requestPostTarget(origin, form.action(), baselineBody, context);
             persistFindings(job, baseline, form.action(), keys);
+            AdaptiveCheckSelector.Plan plan = AdaptiveCheckSelector.select(
+                    job.getScanType(), form.action().toString(),
+                    firstHeader(baseline.headers(), "content-type"),
+                    baseline.headers(), form.parameters().stream().map(FormParameter::name).toList(),
+                    true, isConfiguredPostAction(form.action()));
+            recordAdaptiveSelection(job, form.action(), "POST_FORM",
+                    form.parameters().size(), plan);
+            LOG.info("Adaptive checks selected: scan={} endpoint={} checks={} rationale={}",
+                    job.getId(), FindingSanitizer.safeEndpoint(form.action().toString()),
+                    plan.selectedChecks(), plan.rationale());
+            if (!plan.sqlInjection() && !plan.reflectedXss()) {
+                continue;
+            }
             for (int index = 0; index < form.parameters().size(); index++) {
-                if (cancellationRequested(job) || !context.canConsumeDetectionRequests(3)) {
+                if (cancellationRequested(job)
+                        || !context.canConsumeDetectionRequests(plan.requestsPerParameter())) {
                     break;
                 }
                 FormParameter parameter = form.parameters().get(index);
-                String sqlTrue = "' OR '1'='1";
-                String sqlFalse = "' OR '1'='2";
-                byte[] sqlTrueBody = encodeForm(form.parameters(), index, sqlTrue);
-                byte[] sqlFalseBody = encodeForm(form.parameters(), index, sqlFalse);
-                if (sqlTrueBody == null || sqlFalseBody == null) {
-                    break;
+                if (plan.sqlInjection()) {
+                    String sqlTrue = "' OR '1'='1";
+                    String sqlFalse = "' OR '1'='2";
+                    byte[] sqlTrueBody = encodeForm(form.parameters(), index, sqlTrue);
+                    byte[] sqlFalseBody = encodeForm(form.parameters(), index, sqlFalse);
+                    if (sqlTrueBody == null || sqlFalseBody == null) {
+                        break;
+                    }
+                    ScanResponse sqlPositive = requestPostTarget(origin, form.action(), sqlTrueBody, context);
+                    ScanResponse sqlNegative = requestPostTarget(origin, form.action(), sqlFalseBody, context);
+                    if (isSqlError(sqlPositive.body()) && !isSqlError(baseline.body())
+                            && !isSqlError(sqlNegative.body())) {
+                        String errorSnippet = extractSqlErrorSnippet(sqlPositive.body());
+                        addFinding(job, keys, "SQL_INJECTION_SUSPECTED",
+                                form.action() + " [" + parameter.name() + "]", "HIGH",
+                                "Allowlisted POST form parameter '" + bounded(parameter.name())
+                                        + "' triggered a database error signature (" + errorSnippet
+                                        + "); manual verification is required.",
+                                "Use parameterized queries and validate input before database access.",
+                                "ACTIVE_POST_FORM", "SUSPECTED");
+                    }
                 }
-                ScanResponse sqlPositive = requestPostTarget(origin, form.action(), sqlTrueBody, context);
-                ScanResponse sqlNegative = requestPostTarget(origin, form.action(), sqlFalseBody, context);
-                if (isSqlError(sqlPositive.body()) && !isSqlError(baseline.body())
-                        && (isSqlError(sqlNegative.body())
-                        || (sqlPositive.statusCode() >= 500 && baseline.statusCode() < 500))) {
-                    String errorSnippet = extractSqlErrorSnippet(sqlPositive.body());
-                    addFinding(job, keys, "SQL_INJECTION_SUSPECTED",
-                            form.action() + " [" + parameter.name() + "]", "HIGH",
-                            "Allowlisted POST form parameter '" + bounded(parameter.name())
-                                    + "' triggered a database error signature (" + errorSnippet
-                                    + "); manual verification is required.",
-                            "Use parameterized queries and validate input before database access.",
-                            "ACTIVE_POST_FORM", "SUSPECTED");
-                }
-                String marker = "vscanxss" + Integer.toHexString(
-                        Objects.hash(form.action(), parameter.name(), index));
-                String xssPayload = "\"><svg data-vscan=\"" + marker + "\">";
-                byte[] xssBody = encodeForm(form.parameters(), index, xssPayload);
-                if (xssBody == null) {
-                    break;
-                }
-                ScanResponse xssResponse = requestPostTarget(origin, form.action(), xssBody, context);
-                if (isPotentialHtml(xssResponse) && containsRaw(xssResponse.body(), xssPayload)
-                        && appearsExecutableReflection(xssResponse.body(), marker)) {
-                    addFinding(job, keys, "REFLECTED_XSS_POTENTIAL",
-                            form.action() + " [" + parameter.name() + "]", "MEDIUM",
-                            "The unique test marker was reflected unencoded in an HTML tag context for "
-                                    + "allowlisted POST form parameter '" + bounded(parameter.name())
-                                    + "'; no script was executed and manual verification is required.",
-                            "Encode output for its HTML context and validate input.",
-                            "ACTIVE_POST_FORM", "POTENTIAL");
+                if (plan.reflectedXss()) {
+                    String marker = "vscanxss" + Integer.toHexString(
+                            Objects.hash(form.action(), parameter.name(), index));
+                    String xssPayload = "\"><svg data-vscan=\"" + marker + "\">";
+                    byte[] xssBody = encodeForm(form.parameters(), index, xssPayload);
+                    if (xssBody == null) {
+                        break;
+                    }
+                    ScanResponse xssResponse = requestPostTarget(origin, form.action(), xssBody, context);
+                    if (isPotentialHtml(xssResponse) && containsRaw(xssResponse.body(), xssPayload)
+                            && appearsExecutableReflection(xssResponse.body(), marker)) {
+                        addFinding(job, keys, "REFLECTED_XSS_POTENTIAL",
+                                form.action() + " [" + parameter.name() + "]", "MEDIUM",
+                                "The unique test marker was reflected unencoded in an HTML tag context for "
+                                        + "allowlisted POST form parameter '" + bounded(parameter.name())
+                                        + "'; no script was executed and manual verification is required.",
+                                "Encode output for its HTML context and validate input.",
+                                "ACTIVE_POST_FORM", "POTENTIAL");
+                    }
                 }
             }
         }
@@ -1248,10 +1323,15 @@ public class ScanExecutionService {
                 "LOW", "Referrer-Policy is absent", "Set an explicit Referrer-Policy appropriate for the application.", pageUri);
         addMissingHeader(job, keys, response.headers(), "MISSING_PERMISSIONS_POLICY", "Permissions-Policy",
                 "LOW", "Permissions-Policy is absent", "Restrict unnecessary browser capabilities with Permissions-Policy.", pageUri);
-        if (firstHeader(headers, "x-frame-options") == null && !containsFrameAncestors(headers)) {
+        List<String> xFrameOptionsValues = allHeaders(headers, "x-frame-options");
+        if (!hasEffectiveXFrameOptions(xFrameOptionsValues) && !containsFrameAncestors(headers)) {
+            String evidence = xFrameOptionsValues.isEmpty()
+                    ? "Neither X-Frame-Options nor CSP frame-ancestors was present"
+                    : "X-Frame-Options did not contain a recognized DENY or SAMEORIGIN directive: "
+                            + String.join(", ", xFrameOptionsValues);
             addFinding(job, keys, "MISSING_FRAME_PROTECTION",
                     pageComponent(pageUri, "X-Frame-Options/CSP frame-ancestors"), "MEDIUM",
-                    "Neither X-Frame-Options nor CSP frame-ancestors was present",
+                    evidence,
                     "Use X-Frame-Options or a CSP frame-ancestors directive to prevent framing.");
         }
         for (String cookie : allHeaders(headers, "set-cookie")) {
@@ -1259,29 +1339,77 @@ public class ScanExecutionService {
             if (observation == null) {
                 continue;
             }
-            if (!observation.secure() && "https".equalsIgnoreCase(pageUri.getScheme())) {
+            if ("http".equalsIgnoreCase(pageUri.getScheme())) {
+                addCookieFinding(job, keys, "COOKIE_SET_OVER_HTTP", observation.name(), pageUri,
+                        "A Set-Cookie header for '" + bounded(observation.name())
+                                + "' was received over HTTP. The cookie value was not retained; its purpose is "
+                                + "unknown, so exposure of session data is not established. "
+                                + cookieMetadata(observation, pageUri),
+                        "Serve the application over HTTPS and set Secure on sensitive session cookies.");
+            }
+            if (observation.duplicateAttributes().contains("secure")
+                    || observation.duplicateAttributes().contains("httponly")
+                    || observation.duplicateAttributes().contains("samesite")
+                    || observation.duplicateAttributes().contains("domain")
+                    || observation.duplicateAttributes().contains("path")
+                    || !observation.invalidAttributes().isEmpty()) {
+                addCookieFinding(job, keys, "COOKIE_ATTRIBUTE_AMBIGUOUS", observation.name(), pageUri,
+                        "Set-Cookie '" + bounded(observation.name())
+                                + "' contained duplicate or malformed attributes; no conflicting value was "
+                                + "selected. The cookie value was not retained. "
+                                + cookieMetadata(observation, pageUri),
+                        "Review the Set-Cookie attributes and emit one valid value for each attribute.");
+            }
+            if (!observation.secure() && !observation.duplicateAttributes().contains("secure")
+                    && !observation.invalidAttributes().contains("secure")
+                    && "https".equalsIgnoreCase(pageUri.getScheme())) {
                 addCookieFinding(job, keys, "COOKIE_MISSING_SECURE", observation.name(), pageUri,
                         "Set-Cookie '" + bounded(observation.name())
                                 + "' was observed on an HTTPS response without the Secure attribute. "
                                 + "The cookie value was not retained; this configuration observation does not prove "
-                                + "that the cookie is transmitted over an insecure connection.",
+                                + "that the cookie is transmitted over an insecure connection. "
+                                + cookieMetadata(observation, pageUri),
                         "Set Secure on cookies that must only travel over HTTPS.");
             }
-            if (!observation.httpOnly()) {
+            if (!observation.httpOnly() && !observation.duplicateAttributes().contains("httponly")
+                    && !observation.invalidAttributes().contains("httponly")) {
                 addCookieFinding(job, keys, "COOKIE_MISSING_HTTP_ONLY", observation.name(), pageUri,
                         "Set-Cookie '" + bounded(observation.name())
                                 + "' was observed without the HttpOnly attribute. The cookie value was not retained; "
                                 + "this observation alone does not establish exploitability, and preference cookies "
-                                + "may be intentionally JavaScript-readable.",
+                                + "may be intentionally JavaScript-readable. "
+                                + cookieMetadata(observation, pageUri),
                         "Set HttpOnly on cookies that do not need JavaScript access.");
             }
-            if (!observation.sameSite()) {
+            if (!observation.duplicateAttributes().contains("samesite")
+                    && observation.sameSite() == null) {
                 addCookieFinding(job, keys, "COOKIE_MISSING_SAMESITE", observation.name(), pageUri,
                         "Set-Cookie '" + bounded(observation.name())
                                 + "' was observed without a SameSite attribute. The cookie value was not retained; "
-                                + "impact depends on cookie purpose and request context.",
+                                + "impact depends on cookie purpose and request context. "
+                                + cookieMetadata(observation, pageUri),
                         "Set an explicit SameSite policy appropriate for the application.");
+            } else if (!observation.duplicateAttributes().contains("samesite")
+                    && !Set.of("strict", "lax", "none")
+                    .contains(observation.sameSite().trim().toLowerCase(Locale.ROOT))) {
+                addCookieFinding(job, keys, "COOKIE_INVALID_SAMESITE", observation.name(), pageUri,
+                        "Set-Cookie '" + bounded(observation.name())
+                                + "' had an unrecognized SameSite value. The cookie value was not retained; "
+                                + cookieMetadata(observation, pageUri),
+                        "Use SameSite=Strict, Lax, or None as appropriate for the application.");
+            } else if (!observation.duplicateAttributes().contains("samesite")
+                    && "none".equalsIgnoreCase(observation.sameSite()) && !observation.secure()) {
+                addCookieFinding(job, keys, "COOKIE_SAMESITE_NONE_WITHOUT_SECURE",
+                        observation.name(), pageUri,
+                        "Set-Cookie '" + bounded(observation.name())
+                                + "' used SameSite=None without Secure. Browser handling may reject or weaken "
+                                + "cross-site cookie behavior; the cookie value was not retained. "
+                                + cookieMetadata(observation, pageUri),
+                        "Use Secure with SameSite=None and serve the application over HTTPS.");
             }
+            addCookieFinding(job, keys, "COOKIE_SECURITY_OBSERVED", observation.name(), pageUri,
+                    cookieObservationText(observation, pageUri),
+                    "Review these observed attributes against the cookie's documented purpose and session requirements.");
         }
         addDisclosureFinding(job, keys, headers, "Server", pageUri);
         addDisclosureFinding(job, keys, headers, "X-Powered-By", pageUri);
@@ -1293,6 +1421,18 @@ public class ScanExecutionService {
         if (parameters.isEmpty()) {
             return;
         }
+        AdaptiveCheckSelector.Plan plan = AdaptiveCheckSelector.select(
+                job.getScanType(), uri.toString(),
+                firstHeader(baseline.headers(), "content-type"),
+                baseline.headers(), parameters.stream().map(QueryParameter::name).toList(), false, false);
+        recordAdaptiveSelection(job, uri, "GET_QUERY", parameters.size(), plan);
+        LOG.info("Adaptive checks selected: scan={} endpoint={} checks={} rationale={}",
+                job.getId(), FindingSanitizer.safeEndpoint(uri.toString()),
+                plan.selectedChecks(), plan.rationale());
+        if (!plan.sqlInjection() && !plan.reflectedXss()) {
+            return;
+        }
+
         Set<String> keys = new HashSet<>();
         int tested = 0;
         for (QueryParameter parameter : parameters) {
@@ -1302,36 +1442,49 @@ public class ScanExecutionService {
             if (isSensitiveParameter(parameter.name())) {
                 continue;
             }
-            if (!context.canConsumeDetectionRequests(3)) {
+            if (!context.canConsumeDetectionRequests(plan.requestsPerParameter())) {
                 break;
             }
-            String sqlTrue = "' OR '1'='1";
-            String sqlFalse = "' OR '1'='2";
-            ScanResponse sqlPositive = requestParameter(uri, parameter, sqlTrue, context);
-            ScanResponse sqlNegative = requestParameter(uri, parameter, sqlFalse, context);
-            if (isSqlError(sqlPositive.body()) && !isSqlError(baseline.body())
-                    && (isSqlError(sqlNegative.body()) || (sqlPositive.statusCode() >= 500 && baseline.statusCode() < 500))) {
-                String errorSnippet = extractSqlErrorSnippet(sqlPositive.body());
-                addFinding(job, keys, "SQL_INJECTION_SUSPECTED",
-                        uri + " [" + parameter.name() + "]", "HIGH",
-                        "Parameter '" + bounded(parameter.name())
-                                + "' triggered a database error signature (" + errorSnippet + "); manual verification is required.",
-                        "Use parameterized queries and validate input before database access.",
-                        "ACTIVE_QUERY_PARAMETER", "SUSPECTED");
+            if (plan.sqlInjection()) {
+                String sqlTrue = "' OR '1'='1";
+                String sqlFalse = "' OR '1'='2";
+                ScanResponse sqlPositive = requestParameter(uri, parameter, sqlTrue, context);
+                ScanResponse sqlNegative = requestParameter(uri, parameter, sqlFalse, context);
+                if (isSqlError(sqlPositive.body()) && !isSqlError(baseline.body())
+                        && !isSqlError(sqlNegative.body())) {
+                    String errorSnippet = extractSqlErrorSnippet(sqlPositive.body());
+                    addFinding(job, keys, "SQL_INJECTION_SUSPECTED",
+                            uri + " [" + parameter.name() + "]", "HIGH",
+                            "Parameter '" + bounded(parameter.name())
+                                    + "' triggered a database error signature (" + errorSnippet + "); manual verification is required.",
+                            "Use parameterized queries and validate input before database access.",
+                            "ACTIVE_QUERY_PARAMETER", "SUSPECTED");
+                }
             }
-            String marker = "vscanxss" + Integer.toHexString(Objects.hash(uri, parameter.name()));
-            String xssPayload = "\"><svg data-vscan=\"" + marker + "\">";
-            ScanResponse xssResponse = requestParameter(uri, parameter, xssPayload, context);
-            if (isPotentialHtml(xssResponse) && containsRaw(xssResponse.body(), xssPayload)
-                    && appearsExecutableReflection(xssResponse.body(), marker)) {
-                addFinding(job, keys, "REFLECTED_XSS_POTENTIAL",
-                        uri + " [" + parameter.name() + "]", "MEDIUM",
-                        "The unique test marker was reflected unencoded in an HTML tag context for parameter '"
-                                + bounded(parameter.name()) + "'; no script was executed and manual verification is required.",
-                        "Encode output for its HTML context and validate input.",
-                        "ACTIVE_QUERY_PARAMETER", "POTENTIAL");
+            if (plan.reflectedXss()) {
+                String marker = "vscanxss" + Integer.toHexString(Objects.hash(uri, parameter.name()));
+                String xssPayload = "\"><svg data-vscan=\"" + marker + "\">";
+                ScanResponse xssResponse = requestParameter(uri, parameter, xssPayload, context);
+                if (isPotentialHtml(xssResponse) && containsRaw(xssResponse.body(), xssPayload)
+                        && appearsExecutableReflection(xssResponse.body(), marker)) {
+                    addFinding(job, keys, "REFLECTED_XSS_POTENTIAL",
+                            uri + " [" + parameter.name() + "]", "MEDIUM",
+                            "The unique test marker was reflected unencoded in an HTML tag context for parameter '"
+                                    + bounded(parameter.name()) + "'; no script was executed and manual verification is required.",
+                            "Encode output for its HTML context and validate input.",
+                            "ACTIVE_QUERY_PARAMETER", "POTENTIAL");
+                }
             }
         }
+    }
+
+    private void recordAdaptiveSelection(ScanJob job, URI endpoint, String inputType,
+                                         int parameterCount, AdaptiveCheckSelector.Plan plan) {
+        job.recordAdaptiveCheckSelection(
+                FindingSanitizer.safeEndpoint(endpoint.toString()), inputType, parameterCount,
+                String.join(", ", plan.selectedChecks()), plan.observedDatabaseTechnology().isEmpty()
+                        ? "No database technology banner observed. " + plan.rationale()
+                        : plan.rationale());
     }
 
     private ScanResponse requestParameter(URI uri, QueryParameter parameter, String value,
@@ -1378,17 +1531,15 @@ public class ScanExecutionService {
     }
 
     private boolean isSensitiveParameter(String name) {
-        String lower = name.toLowerCase(Locale.ROOT);
-        return lower.contains("password") || lower.contains("passwd") || lower.contains("secret")
-                || lower.contains("token") || lower.contains("session") || lower.contains("cookie")
-                || lower.contains("auth") || lower.contains("key");
+        return ParameterSensitivity.isSensitive(name);
     }
 
     private boolean isSqlError(byte[] body) {
         String lower = new String(body, StandardCharsets.UTF_8).toLowerCase(Locale.ROOT);
         return lower.contains("sql syntax") || lower.contains("sqlstate")
-                || lower.contains("mysql_fetch") || lower.contains("ora-")
-                || lower.contains("sqlite error") || lower.contains("postgresql")
+                || lower.contains("mysql_fetch") || lower.matches("(?s).*ora-\\d{5}.*")
+                || lower.contains("sqlite error") || lower.contains("postgresql error")
+                || lower.contains("syntax error at or near")
                 || lower.contains("odbc sql");
     }
 
@@ -1398,7 +1549,9 @@ public class ScanExecutionService {
 
     private boolean appearsExecutableReflection(byte[] body, String marker) {
         String html = new String(body, StandardCharsets.UTF_8);
-        return html.matches("(?s).*<svg\\s+data-vscan=\"" + java.util.regex.Pattern.quote(marker) + "\"[^>]*>.*");
+        Document document = Jsoup.parseBodyFragment(html);
+        return document.select("svg[data-vscan]").stream()
+                .anyMatch(element -> marker.equals(element.attr("data-vscan")));
     }
 
     private void addMissingHeader(ScanJob job, Set<String> keys, Map<String, List<String>> headers, String type,
@@ -1414,7 +1567,15 @@ public class ScanExecutionService {
 
     private boolean containsFrameAncestors(Map<String, List<String>> headers) {
         return allHeaders(headers, "content-security-policy").stream()
-                .anyMatch(value -> value.toLowerCase(Locale.ROOT).contains("frame-ancestors"));
+                .flatMap(value -> Arrays.stream(value.split("[;,]")))
+                .map(String::trim)
+                .map(directive -> directive.split("\\s+", 2)[0])
+                .anyMatch("frame-ancestors"::equalsIgnoreCase);
+    }
+
+    private boolean hasEffectiveXFrameOptions(List<String> values) {
+        return !values.isEmpty() && values.stream().allMatch(value ->
+                "DENY".equalsIgnoreCase(value.trim()) || "SAMEORIGIN".equalsIgnoreCase(value.trim()));
     }
 
     private void addDisclosureFinding(ScanJob job, Set<String> keys, Map<String, List<String>> headers, String header,
@@ -1488,12 +1649,50 @@ public class ScanExecutionService {
                             String evidence, String remediation, String source, String verificationStatus) {
         String key = type + "|" + component;
         if (keys.add(key)) {
-            findingRepository.save(new ScanFinding(job, type, severity,
-                    bounded(FindingSanitizer.sanitize(component)),
+            ScanFinding finding = new ScanFinding(job, type, severity,
+                    bounded(FindingSanitizer.sanitize(safeFindingComponent(component))),
                     bounded(FindingSanitizer.sanitize(evidence)),
                     "Observed in the target HTTP response",
-                    bounded(FindingSanitizer.sanitize(remediation)), source, verificationStatus));
+                    bounded(FindingSanitizer.sanitize(remediation)), source, verificationStatus);
+            finding.setObservationDetails(findingEndpoint(component), findingMethod(source),
+                    findingParameter(source, component));
+            findingRepository.save(finding);
         }
+    }
+
+    private String safeFindingComponent(String component) {
+        int detailStart = component.indexOf(" [");
+        String endpointCandidate = detailStart < 0 ? component : component.substring(0, detailStart);
+        String safeEndpoint = FindingSanitizer.safeEndpoint(endpointCandidate);
+        return safeEndpoint == null ? component : safeEndpoint
+                + (detailStart < 0 ? "" : component.substring(detailStart));
+    }
+
+    private String findingEndpoint(String component) {
+        int detailStart = component.indexOf(" [");
+        String endpointCandidate = detailStart < 0 ? component : component.substring(0, detailStart);
+        return FindingSanitizer.safeEndpoint(endpointCandidate);
+    }
+
+    private String findingMethod(String source) {
+        return switch (source) {
+            case "PASSIVE_HEADERS", "ACTIVE_QUERY_PARAMETER", "NVD_CVE_LOOKUP" -> "GET";
+            case "ACTIVE_POST_FORM" -> "POST";
+            default -> null;
+        };
+    }
+
+    private String findingParameter(String source, String component) {
+        if (!"ACTIVE_QUERY_PARAMETER".equals(source) && !"ACTIVE_POST_FORM".equals(source)) {
+            return null;
+        }
+        int start = component.lastIndexOf('[');
+        int end = component.lastIndexOf(']');
+        if (start < 0 || end <= start) {
+            return null;
+        }
+        String parameter = FindingSanitizer.sanitize(component.substring(start + 1, end));
+        return parameter.length() <= 255 ? parameter : parameter.substring(0, 252) + "...";
     }
 
     private boolean cancellationRequested(ScanJob job) {
@@ -1588,12 +1787,14 @@ public class ScanExecutionService {
         String component = pageComponent(pageUri, "Set-Cookie:" + bounded(cookieName));
         String key = type + "|" + component;
         if (keys.add(key)) {
-            findingRepository.save(new ScanFinding(job, type, "LOW",
-                    bounded(FindingSanitizer.sanitize(component)),
+            ScanFinding finding = new ScanFinding(job, type, "LOW",
+                    bounded(FindingSanitizer.sanitize(safeFindingComponent(component))),
                     bounded(FindingSanitizer.sanitize(evidence)),
-                    "Observed cookie-attribute configuration only; risk depends on cookie purpose and context, "
-                            + "and exploitability was not verified.",
-                    bounded(FindingSanitizer.sanitize(remediation)), "PASSIVE_HEADERS", "OBSERVED"));
+                    "Observed cookie-attribute configuration or HTTP transport only; risk depends on cookie purpose "
+                            + "and context, and exploitability was not verified.",
+                    bounded(FindingSanitizer.sanitize(remediation)), "PASSIVE_HEADERS", "OBSERVED");
+            finding.setObservationDetails(findingEndpoint(component), "GET", null);
+            findingRepository.save(finding);
         }
     }
 
@@ -1608,21 +1809,158 @@ public class ScanExecutionService {
         }
         boolean secure = false;
         boolean httpOnly = false;
-        boolean sameSite = false;
+        String sameSite = null;
+        String expires = null;
+        String maxAge = null;
+        String domain = null;
+        String path = null;
+        Set<String> seenAttributes = new LinkedHashSet<>();
+        Set<String> duplicateAttributes = new LinkedHashSet<>();
+        Set<String> invalidAttributes = new LinkedHashSet<>();
         for (int index = 1; index < parts.length; index++) {
             String attribute = parts[index].trim();
             int equals = attribute.indexOf('=');
             String attributeName = (equals < 0 ? attribute : attribute.substring(0, equals))
                     .trim().toLowerCase(Locale.ROOT);
+            String attributeValue = equals < 0 ? null : attribute.substring(equals + 1).trim();
+            if (attributeName.isBlank()) {
+                continue;
+            }
+            if (!seenAttributes.add(attributeName)) {
+                duplicateAttributes.add(attributeName);
+            }
             if ("secure".equals(attributeName)) {
-                secure = true;
+                if (attributeValue == null) {
+                    secure = true;
+                } else {
+                    invalidAttributes.add("secure");
+                }
             } else if ("httponly".equals(attributeName)) {
-                httpOnly = true;
+                if (attributeValue == null) {
+                    httpOnly = true;
+                } else {
+                    invalidAttributes.add("httponly");
+                }
             } else if ("samesite".equals(attributeName)) {
-                sameSite = true;
+                sameSite = attributeValue == null ? "" : attributeValue;
+            } else if ("expires".equals(attributeName)) {
+                expires = attributeValue;
+            } else if ("max-age".equals(attributeName)) {
+                maxAge = attributeValue;
+            } else if ("domain".equals(attributeName)) {
+                domain = attributeValue;
+            } else if ("path".equals(attributeName)) {
+                path = attributeValue;
             }
         }
-        return new CookieObservation(nameValue[0].trim(), secure, httpOnly, sameSite);
+        return new CookieObservation(nameValue[0].trim(), secure, httpOnly, sameSite,
+                expires, maxAge, domain, path, Set.copyOf(duplicateAttributes),
+                Set.copyOf(invalidAttributes));
+    }
+
+    private String cookieMetadata(CookieObservation observation, URI pageUri) {
+        boolean duplicateLifetime = observation.duplicateAttributes().contains("expires")
+                || observation.duplicateAttributes().contains("max-age");
+        String lifetime = duplicateLifetime ? "AMBIGUOUS" : lifetimeClassification(observation);
+        String secure = observation.duplicateAttributes().contains("secure")
+                || observation.invalidAttributes().contains("secure")
+                ? "ambiguous" : Boolean.toString(observation.secure());
+        String httpOnly = observation.duplicateAttributes().contains("httponly")
+                || observation.invalidAttributes().contains("httponly")
+                ? "ambiguous" : Boolean.toString(observation.httpOnly());
+        String sameSite = observation.duplicateAttributes().contains("samesite")
+                ? "ambiguous" : classifySameSite(observation.sameSite());
+        String domainScope = observation.duplicateAttributes().contains("domain") ? "AMBIGUOUS"
+                : observation.domain() == null || observation.domain().isBlank() ? "HOST_ONLY"
+                : domainMatchesHost(observation.domain(), pageUri.getHost())
+                ? "DOMAIN_SCOPED" : "DOMAIN_SCOPE_MISMATCH";
+        String pathScope = observation.duplicateAttributes().contains("path") ? "AMBIGUOUS"
+                : observation.path() == null ? "DEFAULT_PATH"
+                : observation.path().isBlank() ? "INVALID_PATH"
+                : observation.path().startsWith("/") ? "EXPLICIT_PATH" : "INVALID_PATH";
+        return "Observed attributes (cookie value omitted): Secure=" + secure
+                + ", HttpOnly=" + httpOnly
+                + ", SameSite=" + sameSite
+                + ", Expires=" + (observation.duplicateAttributes().contains("expires")
+                        ? "ambiguous duplicate values" : lifetimeAttribute(observation.expires(), true))
+                + ", Max-Age=" + (observation.duplicateAttributes().contains("max-age")
+                        ? "ambiguous duplicate values" : lifetimeAttribute(observation.maxAge(), false))
+                + ", Domain scope=" + domainScope
+                + ", Path scope=" + pathScope
+                + ", lifetime classification=" + lifetime
+                + ", duplicate attributes=" + !observation.duplicateAttributes().isEmpty()
+                + ", invalid attributes=" + String.join("|", observation.invalidAttributes().stream().sorted().toList())
+                + ", session-like cookie name="
+                + observation.name().matches("(?i).*(session|sid|jsessionid|phpsessid).*")
+                + ". Cookie purpose and server-side session semantics were not inferred.";
+    }
+
+    private String classifySameSite(String value) {
+        if (value == null) {
+            return "not set";
+        }
+        return switch (value.trim().toLowerCase(Locale.ROOT)) {
+            case "strict" -> "Strict";
+            case "lax" -> "Lax";
+            case "none" -> "None";
+            default -> "invalid value observed";
+        };
+    }
+
+    private String lifetimeAttribute(String value, boolean date) {
+        if (value == null) {
+            return "not set";
+        }
+        if (date) {
+            try {
+                ZonedDateTime expiry = ZonedDateTime.parse(value, DateTimeFormatter.RFC_1123_DATE_TIME);
+                return expiry.toInstant().isAfter(java.time.Instant.now())
+                        ? "future date observed" : "past date observed";
+            } catch (java.time.format.DateTimeParseException ignored) {
+                return "invalid date";
+            }
+        }
+        try {
+            long seconds = Long.parseLong(value);
+            return seconds > 0 ? "positive numeric value observed" : "zero-or-negative numeric value observed";
+        } catch (NumberFormatException ignored) {
+            return "invalid numeric value";
+        }
+    }
+
+    private String lifetimeClassification(CookieObservation observation) {
+        if (observation.maxAge() != null && !observation.maxAge().isBlank()) {
+            try {
+                return Long.parseLong(observation.maxAge()) > 0
+                        ? "MAX_AGE_POSITIVE" : "MAX_AGE_EXPIRED_OR_DELETION";
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        if (observation.expires() != null && !observation.expires().isBlank()) {
+            try {
+                ZonedDateTime expiry = ZonedDateTime.parse(
+                        observation.expires(), DateTimeFormatter.RFC_1123_DATE_TIME);
+                return expiry.toInstant().isAfter(java.time.Instant.now())
+                        ? "EXPIRES_FUTURE" : "EXPIRES_PAST";
+            } catch (java.time.format.DateTimeParseException ignored) {
+            }
+        }
+        return observation.expires() != null || observation.maxAge() != null
+                ? "UNKNOWN_INVALID_LIFETIME_ATTRIBUTE" : "SESSION_LIFETIME_ATTRIBUTES_ONLY";
+    }
+
+    private boolean domainMatchesHost(String domainAttribute, String host) {
+        String domain = domainAttribute == null ? "" : domainAttribute.trim().toLowerCase(Locale.ROOT);
+        while (domain.startsWith(".")) {
+            domain = domain.substring(1);
+        }
+        String normalizedHost = host == null ? "" : host.toLowerCase(Locale.ROOT);
+        return !domain.isBlank() && (normalizedHost.equals(domain) || normalizedHost.endsWith("." + domain));
+    }
+
+    private String cookieObservationText(CookieObservation observation, URI pageUri) {
+        return "Set-Cookie attributes were observed without retaining the cookie value. "
+                + cookieMetadata(observation, pageUri);
     }
 
     private boolean isHtmlDocument(ScanResponse response) {
@@ -1949,7 +2287,9 @@ public class ScanExecutionService {
                                            String affectedComponent, String evidence, String severity,
                                            String verificationStatus, String sourceConfidence, String sourceReference,
                                            String sourceCweId, String sourceWascId) {}
-    private record CookieObservation(String name, boolean secure, boolean httpOnly, boolean sameSite) {}
+    private record CookieObservation(String name, boolean secure, boolean httpOnly, String sameSite,
+                                     String expires, String maxAge, String domain, String path,
+                                     Set<String> duplicateAttributes, Set<String> invalidAttributes) {}
 
     private static final class ScanContext {
         private final Map<String, Set<String>> resolvedAddressesByHost = new HashMap<>();

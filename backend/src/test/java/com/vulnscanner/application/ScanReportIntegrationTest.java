@@ -2,6 +2,7 @@ package com.vulnscanner.application;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.vulnscanner.application.auth.PasswordResetEmailService;
 import com.vulnscanner.application.organization.Organization;
 import com.vulnscanner.application.organization.OrganizationRepository;
 import com.vulnscanner.application.organization.OrganizationStatus;
@@ -11,6 +12,8 @@ import com.vulnscanner.application.role.RoleRepository;
 import com.vulnscanner.application.scan.*;
 import com.vulnscanner.application.target.Target;
 import com.vulnscanner.application.target.TargetRepository;
+import com.vulnscanner.application.target.TargetAnalystAssignment;
+import com.vulnscanner.application.target.TargetAnalystAssignmentRepository;
 import com.vulnscanner.application.target.TargetStatus;
 import com.vulnscanner.application.target.TargetType;
 import com.vulnscanner.application.user.User;
@@ -21,6 +24,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.http.MediaType;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.context.ActiveProfiles;
@@ -35,6 +39,7 @@ import java.util.Set;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
+import static org.mockito.Mockito.when;
 
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -49,13 +54,16 @@ class ScanReportIntegrationTest {
     @Autowired private RoleRepository roleRepository;
     @Autowired private OrganizationRepository organizationRepository;
     @Autowired private TargetRepository targetRepository;
+    @Autowired private TargetAnalystAssignmentRepository assignmentRepository;
     @Autowired private ScanJobRepository scanJobRepository;
     @Autowired private ScanFindingRepository scanFindingRepository;
     @Autowired private ScanCrawlPageRepository scanCrawlPageRepository;
     @Autowired private PasswordEncoder passwordEncoder;
+    @MockBean private PasswordResetEmailService passwordResetEmailService;
 
     @BeforeEach
     void initializeRoles() {
+        when(passwordResetEmailService.isConfigured()).thenReturn(true);
         for (RoleName name : new RoleName[]{RoleName.SUPER_ADMIN, RoleName.ADMIN, RoleName.SECURITY_ANALYST}) {
             roleRepository.findByName(name).orElseGet(() -> roleRepository.save(new Role(name)));
         }
@@ -66,6 +74,7 @@ class ScanReportIntegrationTest {
         Organization organization = approvedOrganization("Report Tenant");
         User analyst = createUser(RoleName.SECURITY_ANALYST, "report-analyst@example.com", organization);
         Target target = createTarget(organization, analyst, TargetStatus.APPROVED);
+        assignTarget(target, analyst);
 
         ScanJob job = scanJobRepository.save(new ScanJob(target, organization, analyst, ScanType.PASSIVE_HEADERS));
         job.transitionTo(ScanStatus.PENDING_APPROVAL, 0, "Pending", null);
@@ -155,10 +164,139 @@ class ScanReportIntegrationTest {
     }
 
     @Test
+    void distinguishesExactDuplicatesRelatedFindingsAndIndependentSignals() throws Exception {
+        Organization organization = approvedOrganization("Correlation Tenant");
+        User analyst = createUser(RoleName.SECURITY_ANALYST, "correlation-analyst@example.com", organization);
+        User unassigned = createUser(RoleName.SECURITY_ANALYST, "correlation-unassigned@example.com", organization);
+        Target target = createTarget(organization, analyst, TargetStatus.APPROVED);
+        assignTarget(target, analyst);
+        ScanJob job = completedScan(target, organization, analyst);
+        job.recordAdaptiveCheckSelection("https://example.test/search?q", "GET_QUERY", 1,
+                "SQL_INJECTION", "Observed data-oriented route and input.");
+        scanJobRepository.saveAndFlush(job);
+
+        ScanFinding nativeFinding = scanFindingRepository.saveAndFlush(new ScanFinding(job,
+                "MISSING_CONTENT_SECURITY_POLICY", "MEDIUM", "https://example.test/",
+                "matching response evidence", "reason", "fix", "ACTIVE_POST_FORM", "OBSERVED",
+                "https://example.test/?token=do-not-retain&q=private-value", "GET", "q"));
+        ScanFinding zapFinding = scanFindingRepository.saveAndFlush(new ScanFinding(job,
+                "MISSING_CONTENT_SECURITY_POLICY", "MEDIUM", "https://example.test/",
+                "matching response evidence", "reason", "fix", "OWASP_ZAP", "OBSERVED",
+                "https://example.test/?token=do-not-retain&q=private-value", "GET", "q"));
+        scanFindingRepository.saveAndFlush(new ScanFinding(job,
+                "MISSING_CONTENT_TYPE_OPTIONS", "LOW", "https://example.test/",
+                "different category on same endpoint", "reason", "fix", "PASSIVE_HEADERS", "OBSERVED"));
+        scanFindingRepository.saveAndFlush(new ScanFinding(job,
+                "CVE_KEYWORD_CANDIDATE", "LOW", "https://example.test/",
+                "NVD enrichment is not an independent scanner engine", "reason", "fix",
+                "NVD_CVE_LOOKUP", "POTENTIAL"));
+        scanFindingRepository.saveAndFlush(new ScanFinding(job,
+                "INDEPENDENT_FIXTURE", "LOW", "https://other.example.test/",
+                "different endpoint evidence", "reason", "fix", "OWASP_ZAP", "OBSERVED"));
+        String analystToken = login(analyst.getEmail());
+
+        mockMvc.perform(get("/api/scans/{scanId}/correlations", job.getId())
+                        .header("Authorization", "Bearer " + analystToken))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.length()").value(3))
+                .andExpect(jsonPath("$.data[0].checkType").value("MISSING_CONTENT_SECURITY_POLICY"))
+                .andExpect(jsonPath("$.data[0].findingIds",
+                        org.hamcrest.Matchers.containsInAnyOrder(
+                                nativeFinding.getId().intValue(), zapFinding.getId().intValue())))
+                .andExpect(jsonPath("$.data[0].detectionEngines[0]").value("NATIVE"))
+                .andExpect(jsonPath("$.data[0].detectionEngines[1]").value("OWASP_ZAP"))
+                .andExpect(jsonPath("$.data[0].relationshipType").value("EXACT_DUPLICATE"))
+                .andExpect(jsonPath("$.data[0].confidence").value("HIGH"))
+                .andExpect(jsonPath("$.data[0].matchingEvidence",
+                        org.hamcrest.Matchers.containsString("evidence matched")))
+                .andExpect(jsonPath("$.data[0].interpretation",
+                        org.hamcrest.Matchers.containsString("does not confirm exploitability")))
+                .andExpect(jsonPath("$.data[1].relationshipType").value("RELATED_FINDINGS"))
+                .andExpect(jsonPath("$.data[1].findingIds.length()").value(4))
+                .andExpect(jsonPath("$.data[2].relationshipType").value("INDEPENDENT"));
+
+        mockMvc.perform(get("/api/scans/{scanId}/findings", job.getId())
+                        .header("Authorization", "Bearer " + analystToken))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[?(@.checkType == 'MISSING_CONTENT_SECURITY_POLICY')].endpointUrl")
+                        .value(org.hamcrest.Matchers.hasItem("https://example.test/?token&q")))
+                .andExpect(jsonPath("$.data[?(@.checkType == 'MISSING_CONTENT_SECURITY_POLICY')].httpMethod")
+                        .value(org.hamcrest.Matchers.hasItem("GET")))
+                .andExpect(jsonPath("$.data[?(@.checkType == 'MISSING_CONTENT_SECURITY_POLICY')].parameterName")
+                        .value(org.hamcrest.Matchers.hasItem("q")))
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString("do-not-retain"))))
+                .andExpect(content().string(org.hamcrest.Matchers.not(
+                        org.hamcrest.Matchers.containsString("private-value"))));
+
+        mockMvc.perform(get("/api/scans/{scanId}/report", job.getId())
+                        .header("Authorization", "Bearer " + analystToken))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.correlations.length()").value(3))
+                .andExpect(jsonPath("$.data.executionSummary.adaptiveCheckSelections[0]",
+                        org.hamcrest.Matchers.containsString("GET_QUERY")))
+                .andExpect(jsonPath("$.data.findings[?(@.checkType == 'MISSING_CONTENT_SECURITY_POLICY')].priorityScore")
+                        .value(org.hamcrest.Matchers.hasItem(35)))
+                .andExpect(jsonPath("$.data.correlations[0].findingIds",
+                        org.hamcrest.Matchers.containsInAnyOrder(
+                                nativeFinding.getId().intValue(), zapFinding.getId().intValue())));
+
+        JsonNode jsonExport = objectMapper.readTree(mockMvc.perform(
+                        get("/api/scans/{scanId}/report/export", job.getId())
+                                .param("format", "json")
+                                .header("Authorization", "Bearer " + analystToken))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString());
+        assertEquals(3, jsonExport.path("correlations").size());
+        JsonNode mediumPriorityFinding = java.util.stream.StreamSupport
+                .stream(jsonExport.path("findings").spliterator(), false)
+                .filter(finding -> "MISSING_CONTENT_SECURITY_POLICY".equals(
+                        finding.path("checkType").asText()))
+                .findFirst()
+                .orElseThrow();
+        assertEquals(35, mediumPriorityFinding.path("priorityScore").asInt());
+        assertEquals("MEDIUM", mediumPriorityFinding.path("priorityLevel").asText());
+
+        String csv = mockMvc.perform(get("/api/scans/{scanId}/report/export", job.getId())
+                        .param("format", "csv")
+                        .header("Authorization", "Bearer " + analystToken))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        assertTrue(csv.contains("# Finding Relationships,3"));
+        assertTrue(csv.contains("NATIVE; OWASP_ZAP"));
+        assertTrue(csv.contains("EXACT_DUPLICATE"));
+        assertTrue(csv.contains("RELATED_FINDINGS"));
+        assertTrue(csv.contains("INDEPENDENT"));
+        assertTrue(csv.contains("Priority Score,Priority Level,Priority Explanation"));
+        assertTrue(csv.contains("Endpoint URL,HTTP Method,Parameter"));
+        assertFalse(csv.contains("do-not-retain"));
+        assertFalse(csv.contains("private-value"));
+
+        String pdf = new String(mockMvc.perform(get("/api/scans/{scanId}/report/export", job.getId())
+                        .param("format", "pdf")
+                        .header("Authorization", "Bearer " + analystToken))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsByteArray(), StandardCharsets.ISO_8859_1);
+        assertTrue(pdf.contains("Finding relationships:"));
+        assertTrue(pdf.contains("NATIVE, OWASP_ZAP"));
+        assertTrue(pdf.contains("Endpoint: https://example.test/?token&q"));
+        assertFalse(pdf.contains("do-not-retain"));
+        assertFalse(pdf.contains("private-value"));
+        assertTrue(pdf.contains("Technical priority: MEDIUM \\(35/100\\)"));
+
+        mockMvc.perform(get("/api/scans/{scanId}/correlations", job.getId())
+                        .header("Authorization", "Bearer " + login(unassigned.getEmail())))
+                .andExpect(status().isNotFound());
+    }
+
+    @Test
     void exportsPdfCsvAndJsonCorrectly() throws Exception {
         Organization organization = approvedOrganization("Export Tenant");
         User analyst = createUser(RoleName.SECURITY_ANALYST, "export-analyst@example.com", organization);
         Target target = createTarget(organization, analyst, TargetStatus.APPROVED);
+        target.setUrl("https://example.org/app?token=report-secret&q=search-term");
+        targetRepository.saveAndFlush(target);
+        assignTarget(target, analyst);
 
         ScanJob job = scanJobRepository.save(new ScanJob(target, organization, analyst, ScanType.PASSIVE_HEADERS));
         job.transitionTo(ScanStatus.PENDING_APPROVAL, 0, "Pending", null);
@@ -206,6 +344,7 @@ class ScanReportIntegrationTest {
         String jsonBody = jsonResult.getResponse().getContentAsString();
         JsonNode jsonReport = objectMapper.readTree(jsonBody);
         assertEquals(job.getId(), jsonReport.path("scanId").asLong());
+        assertEquals("https://example.org/app?token&q", jsonReport.path("targetUrl").asText());
         assertEquals(32, jsonReport.path("totalFindings").asInt());
         assertEquals("UNAVAILABLE",
                 jsonReport.path("executionSummary").path("zapEngineStatus").asText());
@@ -226,6 +365,8 @@ class ScanReportIntegrationTest {
         assertTrue(jsonBody.contains("😀") || jsonBody.contains("\\uD83D\\uDE00"));
         // Check redaction
         assertFalse(jsonBody.contains("secret-123456"));
+        assertFalse(jsonBody.contains("report-secret"));
+        assertFalse(jsonBody.contains("search-term"));
         assertTrue(jsonBody.contains("[REDACTED]"));
 
         // CSV export
@@ -237,6 +378,9 @@ class ScanReportIntegrationTest {
                 .andExpect(header().string("Content-Disposition", "attachment; filename=\"scan-report-" + job.getId() + ".csv\""))
                 .andReturn();
         String csvBody = csvResult.getResponse().getContentAsString();
+        assertTrue(csvBody.contains("https://example.org/app?token&q"));
+        assertFalse(csvBody.contains("report-secret"));
+        assertFalse(csvBody.contains("search-term"));
         List<List<String>> csvRows = parseCsvRows(csvBody);
         List<String> csvHeader = csvRows.stream()
                 .filter(row -> !row.isEmpty() && "Finding ID".equals(row.getFirst()))
@@ -244,12 +388,12 @@ class ScanReportIntegrationTest {
         List<String> formulaRow = csvRows.stream()
                 .filter(row -> row.size() > 1 && "FORMULA_FIXTURE".equals(row.get(1)))
                 .findFirst().orElseThrow();
-        assertEquals(15, csvHeader.size());
-        assertEquals(15, formulaRow.size());
-        assertEquals("'=HYPERLINK(\"https://attacker.invalid\")", formulaRow.get(3));
-        assertTrue(formulaRow.get(4).contains("café 東京 😀"));
-        assertTrue(formulaRow.get(4).contains("next"));
-        assertFalse(formulaRow.get(4).contains("\n"));
+        assertEquals(21, csvHeader.size());
+        assertEquals(21, formulaRow.size());
+        assertEquals("'=HYPERLINK(\"https://attacker.invalid\")", formulaRow.get(9));
+        assertTrue(formulaRow.get(10).contains("café 東京 😀"));
+        assertTrue(formulaRow.get(10).contains("next"));
+        assertFalse(formulaRow.get(10).contains("\n"));
         assertTrue(csvBody.startsWith("# Scan ID,"));
         assertTrue(csvBody.contains("Finding ID,Check Type,Severity"));
         assertTrue(csvBody.contains("MISSING_CONTENT_SECURITY_POLICY"));
@@ -267,11 +411,11 @@ class ScanReportIntegrationTest {
         assertTrue(csvBody.contains("'=HYPERLINK("));
         assertTrue(csvBody.contains("東京"));
         assertTrue(csvBody.contains("😀"));
-        assertTrue(csvBody.contains("LOW,'+1,"));
-        assertTrue(csvBody.contains("LOW,'-1,"));
-        assertTrue(csvBody.contains("LOW,'@SUM,"));
-        assertTrue(csvBody.contains("LOW,'  =1,"));
-        assertTrue(csvBody.contains("LOW,component-4,"));
+        assertTrue(csvBody.contains(",'+1,"));
+        assertTrue(csvBody.contains(",'-1,"));
+        assertTrue(csvBody.contains(",'@SUM,"));
+        assertTrue(csvBody.contains(",'  =1,"));
+        assertTrue(csvBody.contains(",component-4,"));
         assertFalse(csvBody.contains("secret-123456"));
 
         // PDF export
@@ -290,6 +434,8 @@ class ScanReportIntegrationTest {
         String pdfTail = new String(pdfBytes, pdfBytes.length - 10, 10, StandardCharsets.ISO_8859_1);
         assertTrue(pdfTail.contains("%%EOF"));
         String pdfBody = new String(pdfBytes, StandardCharsets.ISO_8859_1);
+        assertFalse(pdfBody.contains("report-secret"));
+        assertFalse(pdfBody.contains("search-term"));
         assertTrue(pdfBody.contains("OWASP ZAP: UNAVAILABLE"));
         assertTrue(pdfBody.contains("OWASP ZAP requested: true"));
         assertTrue(pdfBody.contains("ZAP_HEALTH_CHECK_FAILED"));
@@ -346,6 +492,7 @@ class ScanReportIntegrationTest {
         Organization organization = approvedOrganization("Failed Scan Tenant");
         User analyst = createUser(RoleName.SECURITY_ANALYST, "failed-analyst@example.com", organization);
         Target target = createTarget(organization, analyst, TargetStatus.APPROVED);
+        assignTarget(target, analyst);
 
         ScanJob failedJob = scanJobRepository.save(new ScanJob(target, organization, analyst, ScanType.PASSIVE_HEADERS));
         failedJob.transitionTo(ScanStatus.PENDING_APPROVAL, 0, "Pending", null);
@@ -371,6 +518,7 @@ class ScanReportIntegrationTest {
         User analystA = createUser(RoleName.SECURITY_ANALYST, "alpha-analyst@example.com", organizationA);
         User analystB = createUser(RoleName.SECURITY_ANALYST, "beta-analyst@example.com", organizationB);
         Target targetA = createTarget(organizationA, analystA, TargetStatus.APPROVED);
+        assignTarget(targetA, analystA);
 
         ScanJob jobA = scanJobRepository.save(new ScanJob(targetA, organizationA, analystA, ScanType.PASSIVE_HEADERS));
         jobA.transitionTo(ScanStatus.PENDING_APPROVAL, 0, "Pending", null);
@@ -494,6 +642,7 @@ class ScanReportIntegrationTest {
     }
 
     private ScanJob completedScan(Target target, Organization organization, User analyst) {
+        assignTarget(target, analyst);
         ScanJob job = new ScanJob(target, organization, analyst, ScanType.PASSIVE_HEADERS);
         job.transitionTo(ScanStatus.PENDING_APPROVAL, 0, "Pending", null);
         job.transitionTo(ScanStatus.QUEUED, 0, "Queued", null);
@@ -503,12 +652,14 @@ class ScanReportIntegrationTest {
         return scanJobRepository.saveAndFlush(job);
     }
 
+    private void assignTarget(Target target, User analyst) {
+        if (!assignmentRepository.existsByTarget_IdAndAnalyst_Id(target.getId(), analyst.getId())) {
+            assignmentRepository.saveAndFlush(new TargetAnalystAssignment(target, analyst, target.getCreatedBy()));
+        }
+    }
+
     private String login(String email) throws Exception {
-        String response = mockMvc.perform(post("/api/auth/login")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"email\":\"" + email + "\",\"password\":\"" + PASSWORD + "\"}"))
-                .andExpect(status().isOk())
-                .andReturn().getResponse().getContentAsString();
-        return objectMapper.readTree(response).path("data").path("token").asText();
+        return LoginOtpTestSupport.completeLogin(
+                mockMvc, objectMapper, passwordResetEmailService, email, PASSWORD);
     }
 }
