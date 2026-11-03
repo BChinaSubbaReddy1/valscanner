@@ -1,0 +1,14 @@
+id	name	target_url	type	status	organization_id	created_at	updated_at
+1	OWASP Juice Shop Project	https://owasp.org/projects/juice-shop	WEB_APPLICATION	APPROVED	1	2026-10-25 12:41:13	2026-10-25 12:41:16
+2	OWASP Juice Shop Project	http://vulnscanner-juice-shop:3000/	WEB_APPLICATION	DELETED	1	2026-10-25 12:43:54	2026-10-28 09:43:16
+3	OWASP Juice Shop Project	http://juice-shop:3000	WEB_APPLICATION	APPROVED	1	2026-10-25 12:47:17	2026-10-25 12:47:20
+4	LocalHost	http://[::1]:5173/	WEB_APPLICATION	DELETED	2	2026-10-27 04:31:46	2026-10-28 17:51:39
+5	LocalHost	http://host.docker.internal:5173/	WEB_APPLICATION	APPROVED	2	2026-10-28 17:51:33	2026-10-28 17:51:37
+6	Google	https://google-gruyere.appspot.com/	WEB_APPLICATION	APPROVED	2	2026-10-28 18:35:48	2026-10-28 18:35:53
+7	TESTAPP	http://testaspnet.vulnweb.com/	WEB_APPLICATION	APPROVED	2	2026-10-28 18:38:07	2026-10-28 18:38:10
+8	LocalHost	http://localhost:5173/	WEB_APPLICATION	DELETED	2	2026-10-28 18:40:17	2026-10-30 17:33:13
+9	testapp	http://testasp.vulnweb.com/	WEB_APPLICATION	APPROVED	2	2026-10-28 18:46:07	2026-10-28 18:46:10
+10	OWASP Juice Shop Project	https://demo.owasp-juice.shop/	WEB_APPLICATION	APPROVED	2	2026-10-28 18:46:55	2026-10-28 18:46:59
+11	SQL Injection	https://portswigger.net/web-security/sql-injection	WEB_APPLICATION	DELETED	1	2026-10-29 06:17:41	2026-10-31 06:07:46
+12	LocalHost	http://localhost:5173/	WEB_APPLICATION	APPROVED	2	2026-10-30 17:33:03	2026-10-30 17:33:07
+13	LocalHost	http://localhost:5173/	WEB_APPLICATION	APPROVED	2	2026-10-30 18:07:25	2026-10-30 18:07:29
